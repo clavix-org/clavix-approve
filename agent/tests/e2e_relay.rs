@@ -16,7 +16,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
-use common::{current_user, free_port, openssh_available, ssh, start_sshd, wait_for_port, Kill};
+use common::{
+    current_user, free_port, openssh_available, skip_unless, ssh, start_sshd, wait_for_port, Kill,
+};
 use serde_json::Value;
 
 const AGENT: &str = env!("CARGO_BIN_EXE_clavix-agent");
@@ -31,11 +33,11 @@ fn repo() -> PathBuf {
 
 fn available() -> bool {
     let has = |program: &str| Command::new(program).arg("--version").output().is_ok();
-    let ok = openssh_available() && has("python3") && has("node");
-    if !ok {
-        eprintln!("skipped: python3 or node not installed");
-    }
-    ok
+    openssh_available()
+        && skip_unless(
+            has("python3") && has("node"),
+            "python3 or node not installed",
+        )
 }
 
 /// A child whose standard output is read line by line, with a timeout.

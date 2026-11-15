@@ -1,0 +1,52 @@
+# Every test of the repository, end-to-end ones included: a scratch sshd,
+# the stock ssh client, the relay, the fake phone and the real page in
+# headless Chrome. One job, to keep hosted minutes low.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # A missing tool must fail the job, not skip the end-to-end tests.
+      CLAVIX_REQUIRE_E2E: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+      - name: Install sshd and the relay's dependency
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server python3-cryptography
+          sudo mkdir -p /run/sshd
+      - name: Agent — format, lint, tests (with ssh end to end)
+        working-directory: agent
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+      - name: Relay — tests
+        run: python3 -m unittest discover -s relay
+      - name: Page modules — tests
+        run: npm test
+      - name: Page — end to end in headless Chrome
+        run: node tools/page-e2e.mjs

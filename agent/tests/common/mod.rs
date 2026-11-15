@@ -149,8 +149,18 @@ pub fn ssh(agent_socket: &Path, port: u16) -> (bool, String, String) {
 
 pub fn openssh_available() -> bool {
     let ok = Path::new(SSHD).exists() && Command::new("ssh").arg("-V").output().is_ok();
-    if !ok {
-        eprintln!("skipped: sshd or ssh not installed");
+    skip_unless(ok, "sshd or ssh not installed")
+}
+
+/// Report a skipped test — or fail, where skipping would hide a broken
+/// set-up (`CLAVIX_REQUIRE_E2E` is set in CI).
+pub fn skip_unless(available: bool, why: &str) -> bool {
+    if !available {
+        assert!(
+            std::env::var_os("CLAVIX_REQUIRE_E2E").is_none(),
+            "end-to-end test cannot run: {why}"
+        );
+        eprintln!("skipped: {why}");
     }
-    ok
+    available
 }
