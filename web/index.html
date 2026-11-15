@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1f3a5f">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Approve">
+  <title>Clavix Approve</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.png">
+  <link rel="apple-touch-icon" href="/icon.png">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Clavix Approve</h1>
+    <p id="status" class="status" role="status">Chargement…</p>
+  </header>
+
+  <main>
+    <section id="requests" hidden>
+      <h2>Demandes de signature</h2>
+      <p id="no-request" class="muted">Aucune demande en attente.</p>
+      <div id="request-list"></div>
+    </section>
+
+    <section id="setup" hidden>
+      <h2>Mise en place</h2>
+
+      <article id="step-install" class="step">
+        <h3>1. Écran d’accueil</h3>
+        <p id="install-text"></p>
+      </article>
+
+      <article id="step-key" class="step">
+        <h3>2. Clé de signature</h3>
+        <p>Une passkey verrouille la clé SSH : chaque signature demande sa validation
+          (biométrie, ou code et contact pour une clé de sécurité).</p>
+        <button id="create-key" type="button">Créer la passkey et la clé</button>
+        <button id="protect-key" type="button" hidden>Protéger la clé avec la passkey</button>
+        <p id="key-result" class="result"></p>
+      </article>
+
+      <article id="step-pair" class="step">
+        <h3>3. Appairage</h3>
+        <p>Sur la machine, lancez <code>clavix-agent pair</code> puis collez ici le code affiché.</p>
+        <label for="pair-code">Code d’appairage</label>
+        <input id="pair-code" type="text" autocomplete="off" autocapitalize="off" autocorrect="off"
+               spellcheck="false" placeholder="cva1-…">
+        <button id="pair" type="button">Appairer</button>
+        <p id="pair-result" class="result"></p>
+      </article>
+
+      <article id="step-notify" class="step">
+        <h3>4. Notifications</h3>
+        <p>Pour être prévenu d’une demande, téléphone verrouillé.</p>
+        <button id="notify" type="button">Activer les notifications</button>
+        <p id="notify-result" class="result"></p>
+      </article>
+    </section>
+
+    <section id="details" hidden>
+      <h2>Cet appareil</h2>
+      <h3>Clé publique SSH</h3>
+      <p class="muted">À installer dans <code>authorized_keys</code> sur les serveurs.</p>
+      <pre id="public-key" class="wrap"></pre>
+      <button id="copy-key" type="button" class="secondary">Copier la clé publique</button>
+
+      <h3>Appairage</h3>
+      <p id="pairing-info" class="muted"></p>
+      <p class="muted">Appairer à nouveau remplace l’appairage actuel et garde la même clé SSH : rien à changer
+        sur les serveurs.</p>
+      <button id="pair-again" type="button" class="secondary">Appairer à nouveau</button>
+
+      <h3>Hôtes connus</h3>
+      <p id="no-pin" class="muted">Aucun hôte encore approuvé.</p>
+      <ul id="pins" class="list"></ul>
+
+      <h3>Journal</h3>
+      <ul id="journal" class="list small"></ul>
+
+      <h3>Diagnostic</h3>
+      <button id="diagnose" type="button" class="secondary">Vérifier cet appareil</button>
+      <pre id="diagnostic" class="wrap"></pre>
+
+      <h3>Réinitialiser</h3>
+      <p class="muted">Efface la clé, l’appairage et les hôtes connus de cet appareil. La clé publique
+        devra être retirée des serveurs.</p>
+      <button id="reset" type="button" class="danger">Tout effacer</button>
+    </section>
+  </main>
+</body>
+</html>

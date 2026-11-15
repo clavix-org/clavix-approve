@@ -1,0 +1,31 @@
+[package]
+name = "clavix-agent"
+version = "0.0.1"
+description = "Key-less SSH agent: every signature is produced by a remote signer after approval"
+edition = "2021"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# Public keys and signatures only: the agent never holds a private key.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "rsa", "p256", "p384", "p521"] }
+signature = "2"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "sync", "signal"] }
+# Relay client.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+# End-to-end channel with the signer.
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "nistp", "aes"] }
+ed25519-dalek = "2"
+hmac = "0.12"
+
+[dev-dependencies]
+# Tests play the roles the agent does not have: server host key and signer.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "rsa", "p256", "p384", "p521", "rand_core"] }
+tempfile = "3"
