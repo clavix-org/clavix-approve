@@ -342,6 +342,10 @@ class HttpTest(unittest.TestCase):
         key = json.loads(self.call("GET", "/api/vapid-public-key")[2])["key"]
         self.assertEqual(len(R.unb64u(key)), 65)
 
+    def test_version_is_announced(self):
+        self.assertEqual(json.loads(self.call("GET", "/api/version")[2]), {"version": R.VERSION})
+        self.assertRegex(R.VERSION, r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,6 +81,12 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+# What the page shows as its version: the release tag, set when the image is
+# built. Anything else (a checkout, a local build) says "dev".
+VERSION = os.environ.get("RELAY_VERSION", "")
+if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,31}", VERSION):
+    VERSION = "dev"
+
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -554,6 +560,8 @@ def make_handler(relay, static, vapid_public):
                 return self.reply(200, data, ctype, cache="max-age=86400")
             if url.path == "/healthz":
                 return self.reply(200, {"ok": True})
+            if url.path == "/api/version":
+                return self.reply(200, {"version": VERSION})
             if url.path == "/api/vapid-public-key":
                 return self.reply(200, {"key": vapid_public})
             m = ROUTE.match(url.path)
