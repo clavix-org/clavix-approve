@@ -108,6 +108,8 @@ input {
 .request .facts { margin: 10px 0 0; padding: 0; list-style: none; }
 .request .facts li { padding: 4px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
 .request .unverified { color: var(--muted); font-size: 0.9rem; }
+.request .suggestion { color: inherit; overflow-wrap: anywhere; }
+.request .suggestion button { width: auto; min-height: 40px; margin: 6px 0 0; padding: 6px 14px; }
 .request .countdown { float: right; color: var(--muted); font-variant-numeric: tabular-nums; }
 .request .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .request .progress { color: var(--muted); min-height: 1.2em; }

@@ -8,10 +8,10 @@ use std::time::Duration;
 use clavix_agent::channel::{Identity, Peer};
 use clavix_agent::pairing::{pairing_url, terminal_qr, Offer, PAIRING_WINDOW};
 use clavix_agent::relay::{
-    b64u, known_host_name, unb64u, RelayClient, RelaySigner, DEFAULT_TIMEOUT,
+    b64u, host_candidates, known_host_name, unb64u, RelayClient, RelaySigner, DEFAULT_TIMEOUT,
 };
 use clavix_agent::state::{self, State};
-use clavix_agent::unix::start_agent;
+use clavix_agent::unix::{process_args, start_agent};
 
 const USAGE: &str = "\
 clavix-agent — SSH agent without a key; signatures are approved on a paired device
@@ -181,9 +181,12 @@ async fn run(args: &[String]) -> Result<(), String> {
         timeout,
     )?
     // Read at each request: the file changes as the user accepts hosts.
-    .with_hints(move |key_blob| {
+    // Hashed entries are named from what the calling `ssh` was asked to
+    // reach, when that hashes to the entry.
+    .with_hints(move |key_blob, caller| {
         let content = std::fs::read_to_string(known_hosts.as_ref()?).ok()?;
-        known_host_name(&content, key_blob)
+        let args = caller.map(|c| process_args(c.pid)).unwrap_or_default();
+        known_host_name(&content, key_blob, &host_candidates(&args))
     });
 
     let agent = start_agent(socket.clone(), Arc::new(signer))

@@ -319,8 +319,6 @@ function drawRequest(card) {
     warning.append(el('strong', '', 'Ce téléphone n’a jamais approuvé ce serveur.'));
     warning.append(el('p', '', 'Vérifiez l’empreinte ci-dessus avant de continuer. '
       + 'Si vous approuvez, ce serveur sera retenu sous le nom que vous lui donnez.'));
-    const hint = view.hints[dest.fingerprint];
-    if (hint) warning.append(el('p', 'unverified', `Nom indiqué par la machine (non vérifié) : ${hint}`));
     const label = el('label', '', 'Nom à retenir pour ce serveur');
     nameInput = el('input');
     nameInput.type = 'text';
@@ -328,6 +326,16 @@ function drawRequest(card) {
     nameInput.autocapitalize = 'off';
     nameInput.autocomplete = 'off';
     nameInput.spellcheck = false;
+    const hint = view.hints[dest.fingerprint];
+    if (hint) {
+      // Offered, never filled in: taking the machine's word stays a gesture.
+      const suggestion = el('p', 'unverified suggestion', `Nom indiqué par la machine (non vérifié) : ${hint}`);
+      const use = el('button', 'secondary', 'Utiliser ce nom');
+      use.type = 'button';
+      use.addEventListener('click', () => { nameInput.value = hint.slice(0, 64); });
+      suggestion.append(use);
+      warning.append(suggestion);
+    }
     label.append(nameInput);
     warning.append(label);
     box.append(warning);
