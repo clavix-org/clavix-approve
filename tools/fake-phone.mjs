@@ -94,12 +94,18 @@ async function run({ state: file, deny: denyAll, once }) {
   const relay = new RelayClient(state.relay, state.ch, state.token);
   say({ event: 'ready' });
 
+  // Requests left unanswered (unauthentic ones) stay pending at the relay:
+  // name them so the long-poll does not return them in a loop.
+  const ignored = new Set();
   for (;;) {
-    for (const entry of await relay.requests(20)) {
+    for (const entry of await relay.requests(20, undefined, [...ignored])) {
       const { id } = entry;
+      if (ignored.has(id)) continue;
       const view = await readRequest(ctx, entry, Date.now() / 1000);
       if (!view.ok) {
-        say({ event: 'refused', id, reason: view.reason, state: await deny(ctx, relay, entry, view.reason) });
+        const state = await deny(ctx, relay, entry, view.reason);
+        if (state === 'ignored') ignored.add(id);
+        say({ event: 'refused', id, reason: view.reason, state });
       } else if (denyAll) {
         await deny(ctx, relay, entry, 'user');
         say({ event: 'denied', id });

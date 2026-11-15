@@ -71,6 +71,7 @@ class Browser {
     browser.socket = new WebSocket(url);
     browser.pending = new Map();
     browser.console = [];
+    browser.requests = [];
     browser.next = 1;
     await new Promise((resolve, reject) => {
       browser.socket.onopen = resolve;
@@ -83,6 +84,8 @@ class Browser {
         browser.pending.delete(msg.id);
         if (msg.error) reject(new Error(`${msg.error.message}`));
         else resolve(msg.result);
+      } else if (msg.method === 'Network.requestWillBeSent') {
+        browser.requests.push({ at: Date.now(), url: msg.params.request.url });
       } else if (msg.method === 'Runtime.consoleAPICalled' && ['error', 'warning'].includes(msg.params.type)) {
         browser.console.push(msg.params.args.map((a) => a.value ?? a.description).join(' '));
       } else if (msg.method === 'Runtime.exceptionThrown') {
@@ -105,6 +108,7 @@ class Browser {
     this.session = (await this.send('Target.attachToTarget', { targetId, flatten: true })).sessionId;
     await this.send('Runtime.enable');
     await this.send('Log.enable');
+    await this.send('Network.enable');
     await this.send('Page.enable');
     await this.send('WebAuthn.enable');
     await this.send('WebAuthn.addVirtualAuthenticator', {
@@ -216,6 +220,13 @@ async function main() {
   check((await browser.text('.request .facts')).includes('ssh') && (await browser.text('.request .facts')).includes('banc-de-test'),
     'caller and machine are shown, labelled unverified');
 
+  // A request left on screen must not make the page hammer the relay
+  // (a proxy in front would throttle it, then ban the phone).
+  const since = Date.now();
+  await sleep(4000);
+  const polls = browser.requests.filter((r) => r.at >= since && r.url.includes('/requests')).length;
+  check(polls <= 2, `the page stays quiet while a request waits (${polls} polls in 4 s)`);
+
   // Approving an unknown host requires naming it.
   await browser.click('.request .actions button:last-child');
   await until('the refusal to approve unnamed', async () => (await browser.text('.request .progress'))?.includes('donnez un nom'));
@@ -261,6 +272,12 @@ async function main() {
   await until('the second pairing', () => again.output.includes('Paired.'));
   check(again.output.includes(publicKey), 'pairing again keeps the same SSH public key');
   await until('the page after pairing again', async () => (await browser.text('#status'))?.startsWith('Prêt'));
+
+  const api = browser.requests.filter((r) => r.url.includes('/api/'));
+  const windows = api.map((r) => api.filter((o) => o.at >= r.at && o.at < r.at + 1000));
+  const peak = windows.reduce((a, b) => (b.length > a.length ? b : a), []);
+  check(peak.length <= 4, `never more than 4 API calls in any second (peak ${peak.length}${
+    peak.length > 4 ? `: ${peak.map((r) => `${r.at - peak[0].at}ms ${new URL(r.url).pathname.replace(/[0-9a-f]{32}/g, '…')}`).join(', ')}` : ''})`);
 
   const noise = browser.console.filter((line) => !/apple-mobile-web-app-capable/.test(line));
   check(noise.length === 0, `no console error or CSP violation${noise.length ? `: ${noise.join(' | ')}` : ''}`);

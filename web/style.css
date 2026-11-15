@@ -5,7 +5,7 @@
   --text: #16202c;
   --muted: #5d6b7c;
   --line: #d9dee5;
-  --accent: #1f3a5f;
+  --accent: #0b5c5e;
   --accent-text: #ffffff;
   --ok: #17663a;
   --warn-bg: #fff4d6;
@@ -21,8 +21,8 @@
     --text: #e8edf3;
     --muted: #9aa8b8;
     --line: #2c3948;
-    --accent: #7fb0ea;
-    --accent-text: #0c1622;
+    --accent: #6fd0cb;
+    --accent-text: #062a2b;
     --ok: #6fd39a;
     --warn-bg: #3a2e0c;
     --warn-line: #d9a520;
@@ -44,6 +44,8 @@ body {
 
 header, main { max-width: 34rem; margin: 0 auto; }
 header { padding: 20px 0 4px; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand img { border-radius: 10px; }
 h1 { margin: 0; font-size: 1.5rem; }
 h2 { margin: 28px 0 10px; font-size: 1.15rem; }
 h3 { margin: 18px 0 6px; font-size: 1rem; }

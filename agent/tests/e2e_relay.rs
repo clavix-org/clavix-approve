@@ -268,6 +268,12 @@ fn ssh_logs_in_through_the_relay_and_the_phone_sees_the_real_destination() {
     assert!(ok, "second ssh failed:\n{stderr}");
     assert_eq!(phone.event("signed")["known"], true);
     assert!(phone.nothing_more(), "one approval per signature, no more");
+
+    // The agent's log has one line per request, with the time it took.
+    let log = bench.agent_log();
+    let signed: Vec<&str> = log.lines().filter(|l| l.contains("signed for")).collect();
+    assert_eq!(signed.len(), 2, "agent log:\n{log}");
+    assert!(signed[0].contains(&bench.sshd.host_fingerprint) && signed[0].ends_with(" s"));
 }
 
 #[test]
