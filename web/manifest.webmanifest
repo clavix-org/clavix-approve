@@ -1,6 +1,6 @@
 {
   "name": "Clavix Approve",
-  "short_name": "Approve",
+  "short_name": "Clavix",
   "description": "Approve SSH signatures on this device.",
   "start_url": "/",
   "scope": "/",
