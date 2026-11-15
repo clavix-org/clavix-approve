@@ -161,7 +161,6 @@ Same origin as the page. JSON bodies, bearer tokens in `Authorization`.
 | `POST /api/ch/{ch}/responses/{id}` | signer | answer a request |
 | `GET /api/ch/{ch}/responses/{id}?wait=` | agent | fetch the answer |
 | `GET /api/vapid-public-key`, `GET /healthz` | none | |
-| `GET /api/version` | none | `{"version": "v0.1.4"}`: the release the relay was built from, `dev` otherwise |
 
 `wait` is a long-poll in seconds, capped at 25 and at the request's
 expiry. `known` is the comma-separated list of request ids the signer

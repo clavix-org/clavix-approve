@@ -82,10 +82,13 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
 }
 # What the page shows as its version: the release tag, set when the image is
-# built. Anything else (a checkout, a local build) says "dev".
+# built. Anything else (a checkout, a local build) says "dev". It is written
+# into the page when it is loaded, so showing it costs no request.
 VERSION = os.environ.get("RELAY_VERSION", "")
 if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,31}", VERSION):
     VERSION = "dev"
+
+VERSION_MARK = b"@VERSION@"
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -475,6 +478,8 @@ def load_static(web_dir):
                 with open(path, "rb") as f:
                     files["/" + (sub + "/" if sub else "") + name] = (ctype, f.read())
     if "/index.html" in files:
+        ctype, page = files["/index.html"]
+        files["/index.html"] = (ctype, page.replace(VERSION_MARK, VERSION.encode()))
         files["/"] = files["/index.html"]
     return files
 
@@ -560,8 +565,6 @@ def make_handler(relay, static, vapid_public):
                 return self.reply(200, data, ctype, cache="max-age=86400")
             if url.path == "/healthz":
                 return self.reply(200, {"ok": True})
-            if url.path == "/api/version":
-                return self.reply(200, {"version": VERSION})
             if url.path == "/api/vapid-public-key":
                 return self.reply(200, {"key": vapid_public})
             m = ROUTE.match(url.path)

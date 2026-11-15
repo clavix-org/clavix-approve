@@ -565,18 +565,7 @@ function offerCode(code) {
   }
 }
 
-// The version of the relay that served this page, i.e. of the page itself.
-async function showVersion() {
-  try {
-    const { version } = await (await fetch('/api/version', { cache: 'no-store' })).json();
-    $('version').textContent = `Version ${version}`;
-  } catch {
-    // Not worth an error: the line simply stays empty.
-  }
-}
-
 async function start() {
-  showVersion();
   state.identity = (await store.get('identity')) ?? null;
   state.credentialId = (await store.get('credentialId')) ?? null;
   state.sshKey = (await store.get('sshKey')) ?? null;
