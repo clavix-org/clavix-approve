@@ -42,7 +42,8 @@ body {
   -webkit-text-size-adjust: 100%;
 }
 
-header, main { max-width: 34rem; margin: 0 auto; }
+header, main, footer { max-width: 34rem; margin: 0 auto; }
+footer { padding: 28px 0 8px; text-align: center; }
 header { padding: 20px 0 4px; }
 .brand { display: flex; align-items: center; gap: 12px; }
 .brand img { border-radius: 10px; }

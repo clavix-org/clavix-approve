@@ -188,6 +188,7 @@ async function main() {
   const browser = await Browser.launch();
   await browser.open(origin);
   await until('the page', async () => (await browser.text('#status'))?.startsWith('Commencez'));
+  await until('the version', async () => (await browser.text('#version')) === 'Version dev');
   check(true, 'the page loads and asks for a key first');
 
   // 1. Key: one click, the virtual passkey answers both ceremonies.

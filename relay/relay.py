@@ -81,6 +81,15 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+# What the page shows as its version: the release tag, set when the image is
+# built. Anything else (a checkout, a local build) says "dev". It is written
+# into the page when it is loaded, so showing it costs no request.
+VERSION = os.environ.get("RELAY_VERSION", "")
+if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,31}", VERSION):
+    VERSION = "dev"
+
+VERSION_MARK = b"@VERSION@"
+
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -469,6 +478,8 @@ def load_static(web_dir):
                 with open(path, "rb") as f:
                     files["/" + (sub + "/" if sub else "") + name] = (ctype, f.read())
     if "/index.html" in files:
+        ctype, page = files["/index.html"]
+        files["/index.html"] = (ctype, page.replace(VERSION_MARK, VERSION.encode()))
         files["/"] = files["/index.html"]
     return files
 

@@ -342,6 +342,16 @@ class HttpTest(unittest.TestCase):
         key = json.loads(self.call("GET", "/api/vapid-public-key")[2])["key"]
         self.assertEqual(len(R.unb64u(key)), 65)
 
+    def test_the_page_carries_the_version(self):
+        self.assertRegex(R.VERSION, r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
+        with tempfile.TemporaryDirectory() as web:
+            with open(os.path.join(web, "index.html"), "wb") as f:
+                f.write(b"<p>Version @VERSION@</p>")
+            static = R.load_static(web)
+        expected = b"<p>Version " + R.VERSION.encode() + b"</p>"
+        self.assertEqual(static["/"][1], expected)
+        self.assertEqual(static["/index.html"][1], expected)
+
 
 if __name__ == "__main__":
     unittest.main()
