@@ -117,8 +117,13 @@ and a short `ControlPersist` on the server side are outside this project.
   DESIGN.md, open questions).
 - **Host pinning is trust on first use**, decided by a human reading a
   fingerprint on a phone.
-- **Storage may be evicted** by the browser. The key would be lost, not
-  leaked; servers must always have another way in.
+- **Storage may be evicted** by the browser, and is erased when the web
+  app is removed from the home screen (observed). The key is then lost,
+  not leaked; servers must always have another way in.
+- **The pairing code travels in a URL fragment** when the QR code is
+  used. It is not sent to the server and is removed from the address, but
+  it passes through the phone's camera and browser. It works once, for 15
+  minutes, and the verification digits still have to match.
 - **Metadata**: the relay and the push service learn when the user
   authenticates, and how often.
 - **No revocation path** other than removing the public key from servers

@@ -88,16 +88,30 @@ allow a 25-second response time, leave the service's own
 `Content-Security-Policy` and `Permissions-Policy` headers in place, do
 not cache.
 
+## Things to know before relying on it
+
+- **Removing the web app from the home screen erases its storage**: the
+  encrypted SSH key and the pairing are gone (observed on iOS 18.7). A
+  new key must then be created and installed on every server. Changing
+  the icon or the label also requires removing it. Keep another way into
+  your servers.
+- **A request left unanswered expires** after 90 seconds and `ssh` fails
+  with `agent refused operation`.
+- **Pairing with a QR code**: `clavix-agent pair` prints the code and a QR
+  code of it. The phone's camera opens the page in the browser, which
+  only offers to copy the code; it must then be pasted in the installed
+  app, whose storage is separate.
+
 ## Needs the iPhone
 
-What no local test can show, and phase 0 exists to find out:
+A first trial (iOS 18.7, installed web app, synced passkey) showed that
+passkey PRF, Ed25519, non-extractable keys in IndexedDB and Web Push to a
+locked phone all work: 29 seconds from `ssh` to login, phone locked at
+the start, unknown host to pin. Still open, and what phase 0 is for:
 
-- passkey PRF and non-extractable keys in IndexedDB, in the installed web
-  app (the page has a "Diagnostic" button for this);
-- Web Push delivery to a locked phone, over days, in Focus and Low Power
-  modes;
-- whether the page's storage survives long idle periods;
-- the time from notification to signature against the 90-second expiry;
+- Web Push delivery over days, in Focus and Low Power modes;
+- whether the page's storage survives long idle periods (iOS reports it
+  as not guaranteed persistent);
 - a security key instead of a synced passkey.
 
 Companion to [Clavix](https://github.com/clavix-org/clavix). Licensed

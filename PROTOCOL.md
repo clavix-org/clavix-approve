@@ -66,6 +66,11 @@ In person, once. The agent shows a **pairing code**:
 "cva1-" || b64u( channel id(16) || pairing secret(16) )
 ```
 
+The agent also prints it as a QR code of `<relay URL>/#<code>`. The page
+takes a code found in its address fragment, removes it from the address,
+and fills the pairing field — or, when opened where no key exists (the
+browser rather than the installed app), only offers to copy it.
+
 Two values are derived from the secret with HKDF-SHA256 (no salt):
 `info = "clavix-approve/v1/relay-pair"` gives the token the relay sees;
 `info = "clavix-approve/v1/pair-mac"` gives a MAC key the relay never

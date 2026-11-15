@@ -266,8 +266,11 @@ async function main() {
   //    again keeps the SSH key, so servers need no change.
   const again = start(AGENT, ['pair', '--yes', '--relay', `http://127.0.0.1:${relayPort}`], { env: agentEnv });
   const secondCode = await until('a second pairing code', () => /cva1-\S+/.exec(again.output)?.[0]);
-  await browser.click('#pair-again');
-  await browser.type('#pair-code', secondCode);
+  // This time the code arrives as the QR code's link would bring it.
+  await browser.send('Page.navigate', { url: `${origin}/#${secondCode}` });
+  await until('the code in the pairing field', async () => (await browser.eval("document.querySelector('#pair-code')?.value")) === secondCode);
+  check((await browser.eval('location.hash')) === '', 'a code received in the address is taken and removed from it');
+  check(!(await browser.eval("document.querySelector('#setup').hidden")), 'and the pairing step is shown again');
   await browser.click('#pair');
   await until('the second pairing', () => again.output.includes('Paired.'));
   check(again.output.includes(publicKey), 'pairing again keeps the same SSH public key');
@@ -278,6 +281,19 @@ async function main() {
   const peak = windows.reduce((a, b) => (b.length > a.length ? b : a), []);
   check(peak.length <= 4, `never more than 4 API calls in any second (peak ${peak.length}${
     peak.length > 4 ? `: ${peak.map((r) => `${r.at - peak[0].at}ms ${new URL(r.url).pathname.replace(/[0-9a-f]{32}/g, '…')}`).join(', ')}` : ''})`);
+
+  // 8. The same link opened where there is no key (the phone's browser
+  //    rather than the installed app): the page only hands the code over.
+  const main = browser.session;
+  browser.session = undefined; // browser-level commands
+  const { browserContextId } = await browser.send('Target.createBrowserContext');
+  const { targetId } = await browser.send('Target.createTarget', { url: `${origin}/#cva1-${'A'.repeat(43)}`, browserContextId });
+  browser.session = (await browser.send('Target.attachToTarget', { targetId, flatten: true })).sessionId;
+  await browser.send('Runtime.enable');
+  await until('the hand-over notice', async () => (await browser.eval("document.querySelector('#handoff')?.hidden")) === false);
+  check((await browser.text('#handoff-code')) === `cva1-${'A'.repeat(43)}`, 'without a key, the page shows the code to copy into the app');
+  check((await browser.eval('location.hash')) === '', 'and removes it from the address there too');
+  browser.session = main;
 
   const noise = browser.console.filter((line) => !/apple-mobile-web-app-capable/.test(line));
   check(noise.length === 0, `no console error or CSP violation${noise.length ? `: ${noise.join(' | ')}` : ''}`);

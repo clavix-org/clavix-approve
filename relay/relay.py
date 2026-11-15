@@ -473,6 +473,15 @@ def load_static(web_dir):
     return files
 
 
+# Paths browsers request on their own, whatever the page declares: iOS
+# when a page is added to the home screen or a notification is shown,
+# every browser for the tab icon, and installations made before the icon
+# files were renamed. Answering 404 would count against the client at a
+# proxy that bans on repeated errors, so they all get the main icon.
+ICON_ALIAS = re.compile(r"^/(apple-touch-icon[0-9a-z-]*\.png|favicon\.ico|icon\.png)$")
+MAIN_ICON = "/clavix-icon-180.png"
+
+
 ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|subscription|requests|"
                    r"responses/([0-9a-f]{32}))$")
 
@@ -540,6 +549,9 @@ def make_handler(relay, static, vapid_public):
             if url.path in static:
                 ctype, data = static[url.path]
                 return self.reply(200, data, ctype, cache="no-cache")
+            if ICON_ALIAS.match(url.path) and MAIN_ICON in static:
+                ctype, data = static[MAIN_ICON]
+                return self.reply(200, data, ctype, cache="max-age=86400")
             if url.path == "/healthz":
                 return self.reply(200, {"ok": True})
             if url.path == "/api/vapid-public-key":

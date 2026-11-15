@@ -241,6 +241,27 @@ impl Offer {
     }
 }
 
+/// The pairing code as a link to the approval page, for a QR code: the
+/// phone's camera opens the page with the code in the URL fragment, which
+/// is never sent to the server.
+pub fn pairing_url(relay: &str, code: &str) -> String {
+    format!("{}/#{code}", relay.trim_end_matches('/'))
+}
+
+/// A QR code drawn with half-block characters, for a terminal. Drawn for a
+/// dark background (the usual case): the light modules are the inked ones.
+pub fn terminal_qr(text: &str) -> Option<String> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    Some(
+        code.render::<Dense1x2>()
+            .dark_color(Dense1x2::Light)
+            .light_color(Dense1x2::Dark)
+            .quiet_zone(true)
+            .build(),
+    )
+}
+
 impl Default for Offer {
     fn default() -> Self {
         Self::new()
@@ -371,6 +392,23 @@ mod tests {
         assert!(offer
             .read_answer(&json!({ "signer": "../../etc", "msg": "AAAA" }))
             .is_err());
+    }
+
+    #[test]
+    fn the_qr_link_puts_the_code_in_the_fragment() {
+        let url = pairing_url("https://approve.example/", "cva1-abc");
+        assert_eq!(url, "https://approve.example/#cva1-abc");
+        let offer = Offer::new();
+        let qr = terminal_qr(&pairing_url("https://approve.example", &offer.code)).unwrap();
+        let lines: Vec<&str> = qr.lines().collect();
+        // Small enough for an 80-column terminal, and rectangular.
+        assert!(
+            lines.len() >= 15 && lines.len() <= 30,
+            "{} lines",
+            lines.len()
+        );
+        let width = lines[0].chars().count();
+        assert!(width <= 60 && lines.iter().all(|l| l.chars().count() == width));
     }
 
     #[test]

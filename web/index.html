@@ -24,6 +24,16 @@
   </header>
 
   <main>
+    <section id="handoff" class="step" hidden>
+      <h2>Code d’appairage reçu</h2>
+      <p>Cette page est ouverte dans le navigateur, pas dans l’application installée : la clé de
+        signature n’est pas ici.</p>
+      <p>Copiez le code, ouvrez <strong>Clavix</strong> depuis l’écran d’accueil, puis collez-le à
+        l’étape « Appairage ».</p>
+      <pre id="handoff-code" class="wrap"></pre>
+      <button id="handoff-copy" type="button">Copier le code</button>
+    </section>
+
     <section id="requests" hidden>
       <h2>Demandes de signature</h2>
       <p id="no-request" class="muted">Aucune demande en attente.</p>

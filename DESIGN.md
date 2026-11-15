@@ -138,7 +138,9 @@ Phase 0 replaces the QR code by a short code typed or pasted into the
 approval page: the central use case drives the remote machine from the
 very phone that would have to scan it, and the phone's camera app would
 open the browser rather than the installed web app. The exchange is the
-same; see `PROTOCOL.md`.
+same; see `PROTOCOL.md`. A QR code of the same code is printed too,
+for when the terminal is on another screen: it leads to the page in the
+browser, from which the code is copied into the installed app.
 
 After pairing, every message is encrypted to the peer's static key and
 signed by the sender's (HPKE, RFC 9180, plus Ed25519 — no bespoke

@@ -257,7 +257,7 @@ class HttpTest(unittest.TestCase):
         os.makedirs(os.path.join(web, "lib"))
         os.makedirs(os.path.join(web, "test"))
         for name, text in (("index.html", "<!doctype html>"), ("lib/x.js", "export {};"),
-                           ("test/secret.js", "no"), ("notes.txt", "no")):
+                           ("clavix-icon-180.png", "PNG"), ("test/secret.js", "no"), ("notes.txt", "no")):
             with open(os.path.join(web, name), "w", encoding="utf-8") as f:
                 f.write(text)
         self.server = R.serve("127.0.0.1", 0, os.path.join(self.dir.name, "state"), ENROLL, web,
@@ -326,6 +326,15 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/lib/x.js")[0], 200)
         # Only the page and its modules are reachable.
         for path in ("/test/secret.js", "/notes.txt", "/../relay.py", "/lib/../test/secret.js"):
+            self.assertEqual(self.call("GET", path)[0], 404, path)
+
+    def test_icon_paths_browsers_ask_for_unprompted_are_answered(self):
+        for path in ("/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
+                     "/apple-touch-icon-240x240.png", "/apple-touch-icon-240x240-precomposed.png",
+                     "/favicon.ico", "/icon.png"):
+            status, headers, body = self.call("GET", path)
+            self.assertEqual((status, body, headers["Content-Type"]), (200, b"PNG", "image/png"), path)
+        for path in ("/apple-touch-icon.png/x", "/apple-touch-icon..png", "/favicon.ico.bak"):
             self.assertEqual(self.call("GET", path)[0], 404, path)
 
     def test_health_and_vapid_key(self):
