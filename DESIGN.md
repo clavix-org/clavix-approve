@@ -3,12 +3,13 @@
 This document describes a planned "approve every SSH signature on your
 phone" feature: a key-less agent on a remote machine, and a phone that
 holds the private key and signs after a biometric check. It is a design
-sketch to be reviewed before any code lands; nothing here is
-implemented. Statements marked **to verify** have not been tested yet.
+sketch: phase 0 of "Phasing" is implemented in this repository (see
+`README.md`, `PROTOCOL.md`), the rest is not. Statements marked **to
+verify** have not been tested yet.
 
-A threat model for this repository must land with the first
-implementation; if the desktop client ever integrates it, Clavix's own
-`THREAT_MODEL.md` needs the matching addition.
+The threat model of the implementation is `THREAT_MODEL.md`; if the
+desktop client ever integrates it, Clavix's own `THREAT_MODEL.md` needs
+the matching addition.
 
 ## Decisions so far
 
@@ -133,6 +134,12 @@ One-time, in person, by QR code:
    the user to compare. The agent prints the SSH public key to install
    in `authorized_keys`.
 
+Phase 0 replaces the QR code by a short code typed or pasted into the
+approval page: the central use case drives the remote machine from the
+very phone that would have to scan it, and the phone's camera app would
+open the browser rather than the installed web app. The exchange is the
+same; see `PROTOCOL.md`.
+
 After pairing, every message is encrypted to the peer's static key and
 signed by the sender's (HPKE, RFC 9180, plus Ed25519 — no bespoke
 primitive). The relay learns timing and sizes, nothing else.
@@ -142,7 +149,8 @@ primitive). The relay learns timing and sizes, nothing else.
 1. An SSH client sends `SSH_AGENTC_SIGN_REQUEST` to `clavix-agent`.
 2. The agent packages the request: data to sign, the connection's
    verified `session-bind@openssh.com` bindings, the caller's process
-   name, a request id and an expiry (default 60 s).
+   name, a request id and an expiry (default 90 s, under sshd's
+   120 s `LoginGraceTime`).
 3. The agent posts the sealed request to the relay; the relay sends a
    content-free push.
 4. The phone fetches and decrypts the request, **re-verifies it
@@ -328,6 +336,30 @@ state survives long idle periods. Phase 0 exists to answer those.
 - **Audit scope.** Pairing, the sealed channel and the phone-side
   verification are new security-critical code; `AUDIT_SCOPE.md` needs
   an entry before phase 1 ships.
+- **Security key as the lock (web prototype).** The SSH key is wrapped
+  under "any passkey that yields a PRF secret", not under Face ID: the
+  page must assume neither a synced passkey nor a platform
+  authenticator. A YubiKey 5 provides the secret (`hmac-secret`).
+  **To verify** on the iPhone: does Safari on iOS pass the PRF
+  extension to an external security key (NFC or USB-C)? Only a synced
+  passkey was tested. Expected differences: tap plus PIN instead of
+  Face ID, slower; the lock is not synced, so a compromised cloud
+  account does not expose it. Unchanged: the SSH key is still briefly
+  decrypted in page memory.
+- **Security key as the SSH key (native app phase, untested).** OpenSSH
+  natively accepts FIDO keys (`sk-ssh-ed25519@openssh.com`,
+  `sk-ecdsa-sha2-nistp256@openssh.com`) with their ordinary signature:
+  no server setting, no refusal by the stock client — unlike the
+  `webauthn-sk-…` variant rejected in "Passkey experiment". A web page
+  cannot produce that signature (the browser imposes the WebAuthn
+  wrapping), but a native app could speak CTAP2 to the key over NFC:
+  the phone would only display and relay, the private key would never
+  leave the security key, and losing the phone would lose nothing.
+  **To verify** then: that the agent can hand the stock `ssh` client an
+  ordinary sk signature produced remotely (flags and counter included),
+  and that an iOS app gets raw CTAP2 access with an `ssh:` application.
+  Kept open by the protocol: the signer's answer carries a complete SSH
+  signature blob, which names its own algorithm.
 - **RSA-only servers and existing keys.** Hardware-held keys are P-256
   only; existing vault keys cannot be migrated. Is a software-held,
   biometry-gated key on the phone an acceptable second tier?

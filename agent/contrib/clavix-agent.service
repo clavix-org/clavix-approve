@@ -1,0 +1,26 @@
+# systemd user unit for the key-less agent. Install as
+# ~/.config/systemd/user/clavix-agent.service, then:
+#
+#   systemctl --user enable --now clavix-agent
+#   loginctl enable-linger "$USER"     # keep it running without a session
+#
+# and point SSH at the socket, e.g. in ~/.ssh/config:
+#
+#   Host *
+#       IdentityAgent ${XDG_RUNTIME_DIR}/clavix-agent.sock
+#
+# Pair first (`clavix-agent pair --relay …`): the unit fails until then.
+
+[Unit]
+Description=Clavix key-less SSH agent (signatures approved on a paired device)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/clavix-agent run --socket %t/clavix-agent.sock
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
