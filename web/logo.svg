@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!--
+    Clavix mark — "le sceau précis".
+
+    A machined seal: a perfect disc with a knurled rim, one hairline
+    inner ring, and a C pressed into the field. A seal is the object of
+    secrets and signatures, which is what a vault holds and what the
+    SSH agent does; the knurling and the flat-cut C keep it technical
+    rather than nostalgic. Chosen by the maintainer on 2026-10-23 over
+    key, lock, monogram and tree concepts.
+
+    Colours are the brand palette, not Bitwarden's: deep teal #0b5c5e
+    for the tile, verdigris #0f8b8d for the disc, mint #bfe9e4 for the
+    hairline, white for the letter. The C is white rather than pressed
+    dark so the mark still reads at 16 px in a tray or a tab; the
+    dark offset underneath keeps the impression.
+
+    Fully geometric, no text, no gradients: renders identically in
+    rsvg-convert, ImageMagick, WebKitGTK and `tauri icon`.
+  -->
+  <rect width="512" height="512" rx="112" fill="#0b5c5e"/>
+  <!-- knurled rim: a dashed ring whose dashes read as teeth -->
+  <circle cx="256" cy="256" r="180" fill="none" stroke="#0f8b8d" stroke-width="28" stroke-dasharray="14 9.6"/>
+  <!-- the disc -->
+  <circle cx="256" cy="256" r="166" fill="#0f8b8d"/>
+  <!-- hairline inner ring -->
+  <circle cx="256" cy="256" r="138" fill="none" stroke="#bfe9e4" stroke-width="6"/>
+  <!-- the pressed C: dark impression underneath, white face on top -->
+  <path d="M322 194 A90 90 0 1 0 322 318" fill="none" stroke="#0b5c5e" stroke-width="50" stroke-linecap="butt" transform="translate(6 7)"/>
+  <path d="M322 194 A90 90 0 1 0 322 318" fill="none" stroke="#ffffff" stroke-width="50" stroke-linecap="butt"/>
+</svg>

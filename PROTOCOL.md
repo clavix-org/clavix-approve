@@ -152,16 +152,21 @@ Same origin as the page. JSON bodies, bearer tokens in `Authorization`.
 | `GET /api/ch/{ch}/pair/answer?wait=` | agent | fetch the signer's answer |
 | `POST /api/ch/{ch}/subscription` | signer | store the push subscription |
 | `POST /api/ch/{ch}/requests` | agent | queue a request, send the push |
-| `GET /api/ch/{ch}/requests?wait=` | signer | pending requests |
+| `GET /api/ch/{ch}/requests?wait=&known=` | signer | pending requests |
 | `POST /api/ch/{ch}/responses/{id}` | signer | answer a request |
 | `GET /api/ch/{ch}/responses/{id}?wait=` | agent | fetch the answer |
 | `GET /api/vapid-public-key`, `GET /healthz` | none | |
 
 `wait` is a long-poll in seconds, capped at 25 and at the request's
-expiry. "Nothing yet" is `204`. Normal outcomes are `200` with a `state`
+expiry. `known` is the comma-separated list of request ids the signer
+already holds (possibly empty): the relay then answers only when the
+pending set differs from it, so a request that stays on screen does not
+make the long-poll return in a loop. "Nothing yet" is `204`. Normal outcomes are `200` with a `state`
 (`queued`, `busy`, `duplicate`, `expired`, `unknown`, `accepted`, …);
 `401` and `400` mean a wrong token or a malformed call and are never
-retried by a client. Limits: 64 KiB per body, 8 pending requests per
+retried by a client. `429` and `5xx` (from the relay or a proxy in front,
+whose body may be HTML) are retried with a growing pause. The page starts
+at most one call every 350 ms, whatever triggers it. Limits: 64 KiB per body, 8 pending requests per
 channel, 300 s maximum lifetime, 15 minutes to complete a pairing.
 
 The push is VAPID-signed, `aes128gcm`-encrypted, and its payload is the
@@ -173,5 +178,7 @@ constant `{"t":"sign"}`: the notification says only that a request waits.
 - At most 4 requests wait at once; after a denial, requests fail
   immediately for 5 s.
 - It contacts the relay only while one of its own requests is pending.
+- It logs one line per request: host key fingerprint, outcome, seconds
+  waited.
 - Several signers per channel are possible in the format (`to`, signer
   ids); the prototype pairs one.

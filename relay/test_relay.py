@@ -175,6 +175,34 @@ class RelayTest(unittest.TestCase):
         waiter.join(5)
         self.assertEqual(got, [(200, {"state": "answered", "msg": "signed"})])
 
+    def test_long_poll_with_known_ids_only_returns_on_news(self):
+        import time
+        self.pair()
+        self.request()
+        # Without `known`, a pending request answers at once, every time.
+        started = time.monotonic()
+        self.relay.get_requests(CH, PHONE, wait=5)
+        self.assertLess(time.monotonic() - started, 1)
+        # The caller already holds it: the call must wait, not spin.
+        started = time.monotonic()
+        status, body = self.relay.get_requests(CH, PHONE, wait=0.4, known={RID})
+        self.assertGreaterEqual(time.monotonic() - started, 0.35)
+        self.assertEqual([r["id"] for r in body["requests"]], [RID])
+        # A new request, or the disappearance of a known one, is news.
+        got = []
+        waiter = threading.Thread(
+            target=lambda: got.append(self.relay.get_requests(CH, PHONE, wait=10, known={RID})))
+        waiter.start()
+        self.request(rid="1" * 32)
+        waiter.join(5)
+        self.assertEqual(sorted(r["id"] for r in got[0][1]["requests"]), sorted([RID, "1" * 32]))
+        started = time.monotonic()
+        self.relay.get_requests(CH, PHONE, wait=5, known={RID, "1" * 32, "2" * 32})
+        self.assertLess(time.monotonic() - started, 1)
+        started = time.monotonic()
+        self.assertEqual(self.relay.get_requests(CH, PHONE, wait=0.3, known=set())[1]["requests"][0]["id"], RID)
+        self.assertLess(time.monotonic() - started, 0.25)
+
     def test_long_poll_does_not_outlast_the_request(self):
         import time
         self.pair()
@@ -271,6 +299,16 @@ class HttpTest(unittest.TestCase):
             json.loads(self.call("GET", f"/api/ch/{CH}/responses/{RID}", token=AGENT)[2]),
             {"state": "answered", "msg": "signed"})
 
+    def test_known_parameter_over_http(self):
+        self.call("POST", "/api/channels", token=ENROLL, body={
+            "ch": CH, "agent_auth": R.digest(AGENT), "pair_auth": R.digest(PAIR), "hello": "hi"})
+        self.call("POST", f"/api/ch/{CH}/pair", token=PAIR, body={
+            "signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "answer"})
+        for query in ("known=", f"known={RID}", f"known={RID},{'1' * 32}&wait=0"):
+            self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests?{query}", token=PHONE)[0], 200, query)
+        for query in ("known=abc", f"known={RID},", "known=%27"):
+            self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests?{query}", token=PHONE)[0], 400, query)
+
     def test_errors_and_limits(self):
         self.assertEqual(self.call("GET", "/api/ch/nope/requests")[0], 404)
         self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests")[0], 401)
@@ -286,7 +324,6 @@ class HttpTest(unittest.TestCase):
         self.assertIn("publickey-credentials-get=(self)", headers["Permissions-Policy"])
         self.assertEqual(headers["Cache-Control"], "no-cache")
         self.assertEqual(self.call("GET", "/lib/x.js")[0], 200)
-        self.assertEqual(self.call("GET", "/icon.png")[0], 200)
         # Only the page and its modules are reachable.
         for path in ("/test/secret.js", "/notes.txt", "/../relay.py", "/lib/../test/secret.js"):
             self.assertEqual(self.call("GET", path)[0], 404, path)

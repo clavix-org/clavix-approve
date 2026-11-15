@@ -213,26 +213,49 @@ async function connect() {
   watch();
 }
 
+// Whatever happens, never more than one call per second to the relay: a
+// proxy in front may throttle, and ban a client that keeps hitting it.
+const MIN_GAP_MS = 1000;
+let lastCall = 0;
+
+async function paced(signal) {
+  const due = lastCall + MIN_GAP_MS - Date.now();
+  if (due > 0) await new Promise((r) => setTimeout(r, due));
+  if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+  lastCall = Date.now();
+}
+
+// 4xx other than "slow down" means our pairing is gone: stop for good.
+const isFatal = (e) => e instanceof RelayError && e.status >= 400 && e.status < 500 && e.status !== 429;
+
 // Long-poll the relay while the page is visible; stop when it is hidden.
 async function watch() {
   if (polling || !relay || document.visibilityState !== 'visible') return;
   const controller = new AbortController();
   polling = controller;
-  let wait = 0; // the first call returns at once
+  let wait = 0;    // the first call returns at once
+  let backoff = 0; // seconds, grows on consecutive failures
   while (!controller.signal.aborted) {
     try {
-      await show(await relay.requests(wait, controller.signal));
+      await paced(controller.signal);
+      // Tell the relay what we already show, so it only answers on news.
+      await show(await relay.requests(wait, controller.signal, [...cards.keys()]));
       status(cards.size ? '' : 'Prêt. En attente de demandes.');
       wait = 20;
+      backoff = 0;
     } catch (e) {
       if (controller.signal.aborted) break;
-      if (e instanceof RelayError && e.status >= 400 && e.status < 500) {
-        // Never insist on a 4xx: the pairing is gone or the relay changed.
-        status(`Arrêt : ${describe(e)}. Refaites l’appairage si besoin.`, true);
+      if (isFatal(e)) {
+        status(`Arrêt : ${describe(e)}. Si cela persiste, appairez à nouveau.`, true);
         break;
       }
-      status('Relais injoignable, nouvel essai…', true);
-      await new Promise((r) => setTimeout(r, 5000));
+      // Throttled, proxy error or network trouble: wait longer each time.
+      // Requests already on screen stay usable meanwhile.
+      backoff = Math.min(backoff ? backoff * 2 : 5, 60);
+      status(e instanceof RelayError && e.status === 429
+        ? `Trop de requêtes, reprise dans ${backoff} s.`
+        : `Relais injoignable, nouvel essai dans ${backoff} s.`, true);
+      await new Promise((r) => setTimeout(r, backoff * 1000));
     }
   }
   if (polling === controller) polling = null;

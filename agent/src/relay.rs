@@ -8,7 +8,8 @@
 //! - nothing is sent while idle: the agent only talks to the relay while
 //!   one of its own requests is waiting;
 //! - one POST per request, then long-poll GETs;
-//! - a 4xx answer is never retried — it means our configuration is wrong.
+//! - a 4xx answer is never retried — it means our configuration is wrong
+//!   — except 429, which is retried slowly.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +36,8 @@ const MAX_IN_FLIGHT: usize = 4;
 const BACKOFF_AFTER_DENIAL: Duration = Duration::from_secs(5);
 /// Pause before retrying after a network error or a 5xx.
 const RETRY_PAUSE: Duration = Duration::from_secs(2);
+/// Pause after the relay (or a proxy in front) said "too many requests".
+const THROTTLED_PAUSE: Duration = Duration::from_secs(10);
 
 pub fn b64u(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -77,10 +80,10 @@ pub enum RelayError {
 }
 
 impl RelayError {
-    /// Worth trying again? Never for a 4xx.
+    /// Worth trying again? Never for a 4xx, except "too many requests".
     fn is_transient(&self) -> bool {
         match self {
-            Self::Status(code) => *code >= 500,
+            Self::Status(code) => *code >= 500 || *code == 429,
             Self::Transport(_) => true,
             Self::Protocol(_) => false,
         }
@@ -378,6 +381,9 @@ impl Signer for RelaySigner {
                             )))
                         }
                     },
+                    // Throttled: back off for real, each 429 counts
+                    // against us at a proxy that bans.
+                    Err(RelayError::Status(429)) => tokio::time::sleep(THROTTLED_PAUSE).await,
                     Err(e) if e.is_transient() => tokio::time::sleep(RETRY_PAUSE).await,
                     Err(e) => return Err(SignError::Backend(e.to_string())),
                 }
@@ -432,7 +438,8 @@ mod tests {
     fn only_server_errors_and_network_errors_are_retried() {
         assert!(RelayError::Status(502).is_transient());
         assert!(RelayError::Transport("reset".into()).is_transient());
-        for code in [400, 401, 403, 404, 429] {
+        assert!(RelayError::Status(429).is_transient());
+        for code in [400, 401, 403, 404] {
             assert!(!RelayError::Status(code).is_transient(), "{code}");
         }
         assert!(!RelayError::Protocol("html".into()).is_transient());

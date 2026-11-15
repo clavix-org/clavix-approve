@@ -7,6 +7,19 @@ export class RelayError extends Error {
   }
 }
 
+// Calls are spaced out, whatever triggers them: a reverse proxy in front
+// of the relay may throttle a client, and ban one that insists. With this
+// gap between two call starts, no second sees more than three.
+const MIN_GAP_MS = 350;
+let nextSlot = 0;
+
+async function slot() {
+  const now = Date.now();
+  const at = Math.max(now, nextSlot);
+  nextSlot = at + MIN_GAP_MS;
+  if (at > now) await new Promise((resolve) => setTimeout(resolve, at - now));
+}
+
 export class RelayClient {
   // `base` is '' in the page (same origin) and a URL for the stand-in.
   constructor(base, ch, token, fetchFn = (...args) => fetch(...args)) {
@@ -17,6 +30,7 @@ export class RelayClient {
   }
 
   async call(method, path, body, signal) {
+    await slot();
     const res = await this.fetch(`${this.base}/api/ch/${this.ch}/${path}`, {
       method,
       headers: {
@@ -52,8 +66,12 @@ export class RelayClient {
     return this.call('POST', 'subscription', subscription);
   }
 
-  async requests(wait = 0, signal) {
-    const res = await this.call('GET', `requests${wait ? `?wait=${wait}` : ''}`, undefined, signal);
+  // Pending requests. With `wait`, the relay holds the call until the
+  // pending set differs from `known` (ids we already hold): a request
+  // that stays on screen must not make this return at once, in a loop.
+  async requests(wait = 0, signal, known = []) {
+    const query = wait ? `?wait=${wait}&known=${known.join(',')}` : '';
+    const res = await this.call('GET', `requests${query}`, undefined, signal);
     return res.requests;
   }
 

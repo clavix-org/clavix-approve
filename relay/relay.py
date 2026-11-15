@@ -44,7 +44,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -59,6 +58,7 @@ CHANNEL_RE = re.compile(r"^[0-9a-f]{32}$")
 REQUEST_RE = re.compile(r"^[0-9a-f]{32}$")
 SIGNER_RE = re.compile(r"^[0-9a-f]{16}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+KNOWN_RE = re.compile(r"^([0-9a-f]{32}(,[0-9a-f]{32}){0,31})?$")
 
 MAX_BODY = 64 * 1024        # one HTTP request body
 MAX_BLOB = 8 * 1024         # pairing hello / answer
@@ -339,7 +339,14 @@ class Relay:
             self._save()
         return 200, {"state": "stored"}
 
-    def get_requests(self, ch, token, wait=0):
+    def get_requests(self, ch, token, wait=0, known=None):
+        """Pending requests of this signer.
+
+        With `wait`, blocks until there is something the caller has not
+        seen: `known` is the set of request ids it already holds, and the
+        call returns as soon as the pending set differs from it. Without
+        `known`, any pending request counts as news.
+        """
         with self.cond:
             c, sid = self._channel(ch, token, "signer")
             if c is None:
@@ -350,7 +357,14 @@ class Relay:
                 return [{"id": rid, "exp": e["exp"], "msg": e["msg"]}
                         for rid, e in self.pending.get(ch, {}).items()
                         if e["to"] == sid and e["response"] is None and e["exp"] > now]
-            return 200, {"requests": self._wait(waiting, wait)}
+
+            def news():
+                current = waiting()
+                if known is None:
+                    return current
+                return [current] if {r["id"] for r in current} != known else None
+            self._wait(news, wait)
+            return 200, {"requests": waiting()}
 
     def post_response(self, ch, token, rid, body):
         msg = body.get("msg")
@@ -438,21 +452,12 @@ class Relay:
 
 # ---- HTTP ------------------------------------------------------------------
 
-def icon_png(size=180):
-    row = b"\x00" + bytes((0x1F, 0x3A, 0x5F)) * size
-
-    def chunk(t, d):
-        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(row * size)) + chunk(b"IEND", b""))
-
-
 def load_static(web_dir):
     """Map URL paths to (content type, bytes), read once at start.
 
     Only top-level files and `lib/` are served; tests and tools are not.
     """
-    files = {"/icon.png": (STATIC_TYPES[".png"], icon_png())}
+    files = {}
     for sub in ("", "lib"):
         folder = os.path.join(web_dir, sub)
         if not os.path.isdir(folder):
@@ -478,6 +483,13 @@ def make_handler(relay, static, vapid_public):
         sys_version = ""
 
         def reply(self, code, body=None, ctype="application/json", cache="no-store"):
+            try:
+                self.send_reply(code, body, ctype, cache)
+            except (BrokenPipeError, ConnectionResetError):
+                # The client left during a long-poll: nothing to report.
+                self.close_connection = True
+
+        def send_reply(self, code, body, ctype, cache):
             if body is not None and not isinstance(body, bytes):
                 body = json.dumps(body, separators=(",", ":")).encode()
             self.send_response(code)
@@ -514,6 +526,15 @@ def make_handler(relay, static, vapid_public):
             except ValueError:
                 return 0.0
 
+        def known(self, query):
+            """The `known` parameter: None when absent, else a set of ids."""
+            values = urllib.parse.parse_qs(query, keep_blank_values=True).get("known")
+            if values is None:
+                return None
+            if not KNOWN_RE.match(values[0]):
+                raise ValueError("known")
+            return set(filter(None, values[0].split(",")))
+
         def do_GET(self):
             url = urllib.parse.urlsplit(self.path)
             if url.path in static:
@@ -532,7 +553,11 @@ def make_handler(relay, static, vapid_public):
             if what == "pair/answer":
                 return self.reply(*relay.get_pair_answer(ch, self.token(), self.wait(url.query)))
             if what == "requests":
-                return self.reply(*relay.get_requests(ch, self.token(), self.wait(url.query)))
+                try:
+                    known = self.known(url.query)
+                except ValueError:
+                    return self.reply(400, {"error": "bad request"})
+                return self.reply(*relay.get_requests(ch, self.token(), self.wait(url.query), known))
             if rid:
                 return self.reply(*relay.get_response(ch, self.token(), rid, self.wait(url.query)))
             return self.reply(404, {"error": "not found"})

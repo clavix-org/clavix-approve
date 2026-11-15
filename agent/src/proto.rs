@@ -416,19 +416,35 @@ async fn handle_sign(
         hops: conn.hops.clone(),
         caller: caller.cloned(),
     };
-    let sig_blob = match signer.sign(job).await {
+    // One log line per request, whatever its outcome: the host key
+    // fingerprint (which this machine knows anyway) and how long the
+    // signer took — the figure that matters against the expiry.
+    let started = std::time::Instant::now();
+    let answer = signer.sign(job).await;
+    let waited = started.elapsed().as_secs_f32();
+    let sig_blob = match answer {
         Ok(sig) => sig,
         Err(e) => {
-            log(&format!("no signature for {}: {e}", bound.fingerprint));
+            log(&format!(
+                "no signature for {} after {waited:.1} s: {e}",
+                bound.fingerprint
+            ));
             return failure;
         }
     };
     // A wrong signature would only fail later, at the server, with a
     // less useful message — and a signer returning one is worth knowing.
     if !signature_is_valid(key_blob, data, &sig_blob) {
-        log("signer returned a signature that does not verify; dropped");
+        log(&format!(
+            "signer returned a signature that does not verify for {} after {waited:.1} s; dropped",
+            bound.fingerprint
+        ));
         return failure;
     }
+    log(&format!(
+        "signed for {} after {waited:.1} s",
+        bound.fingerprint
+    ));
 
     let mut out = Vec::with_capacity(sig_blob.len() + 5);
     out.push(SSH_AGENT_SIGN_RESPONSE);
