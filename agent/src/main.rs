@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clavix_agent::channel::{Identity, Peer};
-use clavix_agent::pairing::{Offer, PAIRING_WINDOW};
+use clavix_agent::pairing::{pairing_url, terminal_qr, Offer, PAIRING_WINDOW};
 use clavix_agent::relay::{
     b64u, known_host_name, unb64u, RelayClient, RelaySigner, DEFAULT_TIMEOUT,
 };
@@ -96,7 +96,12 @@ async fn pair(args: &[String]) -> Result<(), String> {
         "Pairing code (valid 15 minutes, works once):\n\n    {}\n",
         offer.code
     );
-    println!("Enter it in the approval app. Waiting…");
+    // The same code as a QR code, when the phone is not the screen this
+    // is displayed on: its camera opens the approval page with the code.
+    if let Some(qr) = terminal_qr(&pairing_url(relay, &offer.code)) {
+        println!("Or scan this with the phone's camera, then follow the page:\n\n{qr}");
+    }
+    println!("Enter the code in the approval app. Waiting…");
 
     let paired = offer.wait_for_signer(&client, PAIRING_WINDOW).await?;
     println!(

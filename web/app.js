@@ -6,6 +6,7 @@
 import { equal, unb64u } from './lib/bytes.js';
 import { generateIdentity, peer, withPublicBytes } from './lib/channel.js';
 import { createPasskey, createWrappedKey, signWithWrappedKey, unlock } from './lib/lock.js';
+import { PAIR_CODE_PREFIX } from './lib/pairing.js';
 import { RelayClient, RelayError } from './lib/relay.js';
 import { approve, deny, pairWithAgent, readRequest } from './lib/signer.js';
 import { publicKeyLine } from './lib/ssh.js';
@@ -531,6 +532,31 @@ function draw() {
   else if (!paired) status('Clé prête. Il reste à appairer une machine.');
 }
 
+// A pairing code can arrive in the URL fragment, from the QR code the
+// agent displays. The fragment never reaches the server; it is removed
+// from the address at once so it does not linger there.
+function takeCodeFromAddress() {
+  const code = decodeURIComponent(location.hash.slice(1));
+  if (!code.startsWith(PAIR_CODE_PREFIX) || !/^[A-Za-z0-9_-]+$/.test(code)) return null;
+  history.replaceState(null, '', location.pathname);
+  return code;
+}
+
+function offerCode(code) {
+  $('pair-code').value = code;
+  if (state.sshKey) {
+    // The key is here: go straight to the pairing step.
+    repairing = Boolean(state.pairing);
+    return;
+  }
+  if (!standalone()) {
+    // Opened by the camera in the browser, whose storage is not the
+    // installed app's: all we can do here is hand the code over.
+    $('handoff-code').textContent = code;
+    $('handoff').hidden = false;
+  }
+}
+
 async function start() {
   state.identity = (await store.get('identity')) ?? null;
   state.credentialId = (await store.get('credentialId')) ?? null;
@@ -568,7 +594,27 @@ async function start() {
   }
   setInterval(tick, 1000);
 
+  onClick('handoff-copy', async () => {
+    try {
+      await navigator.clipboard.writeText($('handoff-code').textContent);
+      $('handoff-copy').textContent = 'Code copié — ouvrez Clavix';
+    } catch (_) {
+      $('handoff-copy').textContent = 'Copie impossible : sélectionnez le code';
+    }
+  });
+  // At start, and when the link is opened in a tab that already shows
+  // the page (which changes the fragment without reloading).
+  const receiveCode = () => {
+    const code = takeCodeFromAddress();
+    if (!code) return;
+    offerCode(code);
+    draw();
+    if (state.sshKey) $('step-pair').scrollIntoView();
+  };
+  window.addEventListener('hashchange', receiveCode);
+
   draw();
+  receiveCode();
   await connect();
   await refreshSubscription();
 }
