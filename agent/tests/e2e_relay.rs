@@ -17,7 +17,8 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
 use common::{
-    current_user, free_port, openssh_available, skip_unless, ssh, start_sshd, wait_for_port, Kill,
+    current_user, free_port, openssh_available, skip_unless, ssh, ssh_run, start_sshd,
+    wait_for_port, Kill, SSH_OPTIONS,
 };
 use serde_json::Value;
 
@@ -274,6 +275,54 @@ fn ssh_logs_in_through_the_relay_and_the_phone_sees_the_real_destination() {
     let signed: Vec<&str> = log.lines().filter(|l| l.contains("signed for")).collect();
     assert_eq!(signed.len(), 2, "agent log:\n{log}");
     assert!(signed[0].contains(&bench.sshd.host_fingerprint) && signed[0].ends_with(" s"));
+}
+
+/// `ssh -A` to a first server, and from there `ssh` to a second one with
+/// the forwarded agent: the real OpenSSH programs produce the chain of
+/// session bindings, and the phone must see both hops.
+#[test]
+fn a_forwarded_agent_shows_the_whole_chain_and_needs_its_own_approval() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    let far_dir = bench.path("far");
+    std::fs::create_dir(&far_dir).unwrap();
+    let far = start_sshd(&far_dir, &bench.public_key);
+    let (_agent, socket) = bench.agent("30");
+    let phone = bench.phone(&[]);
+
+    // What runs on the first server: a plain ssh to the second one, whose
+    // only source of keys is the forwarded agent (SSH_AUTH_SOCK there).
+    let onward = format!(
+        "ssh {} -p {} 127.0.0.1 echo reached-the-far-host",
+        SSH_OPTIONS.join(" "),
+        far.port
+    );
+    let (ok, stdout, stderr) = ssh_run(&socket, bench.sshd.port, true, &onward);
+    assert!(
+        ok,
+        "ssh -A failed:\n{stderr}\nagent:\n{}",
+        bench.agent_log()
+    );
+    assert_eq!(stdout.trim(), "reached-the-far-host");
+
+    // First approval: the jump host, directly.
+    let first = phone.event("signed");
+    assert_eq!(first["host"], bench.sshd.host_fingerprint);
+    assert_eq!(first["chain"].as_array().unwrap().len(), 1);
+
+    // Second approval: the far host, through the agent forwarded to the
+    // jump host — both hops verified by the phone.
+    let second = phone.event("signed");
+    assert_eq!(second["host"], far.host_fingerprint);
+    let chain = second["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 2, "chain: {chain:?}");
+    assert_eq!(chain[0]["host"], bench.sshd.host_fingerprint);
+    assert_eq!(chain[0]["forwarded"], true);
+    assert_eq!(chain[1]["host"], far.host_fingerprint);
+    assert_eq!(chain[1]["forwarded"], false);
+    assert!(phone.nothing_more(), "two logins, two approvals");
 }
 
 #[test]

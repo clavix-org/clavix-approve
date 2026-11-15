@@ -123,20 +123,50 @@ pub fn current_user() -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+/// Options that make the stock client use nothing but the agent, and
+/// leave the user's own configuration and known hosts alone.
+pub const SSH_OPTIONS: &[&str] = &[
+    "-F",
+    "none",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "IdentityFile=none",
+    "-o",
+    "PreferredAuthentications=publickey",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "ConnectTimeout=10",
+];
+
 /// Run the stock client against the scratch server, with the agent as
 /// its only source of keys. Returns (success, stdout, stderr).
 pub fn ssh(agent_socket: &Path, port: u16) -> (bool, String, String) {
-    let out = Command::new("ssh")
-        .args(["-F", "none", "-p", &port.to_string()])
-        .args(["-o", "BatchMode=yes"])
-        .args(["-o", "IdentityFile=none"])
-        .args(["-o", "PreferredAuthentications=publickey"])
-        .args(["-o", "StrictHostKeyChecking=no"])
-        .args(["-o", "UserKnownHostsFile=/dev/null"])
-        .args(["-o", "ConnectTimeout=10"])
+    ssh_run(agent_socket, port, false, "echo signed-in")
+}
+
+/// Same, running `remote_command` there, with the agent forwarded to the
+/// server (`ssh -A`) when `forward_agent` is set.
+pub fn ssh_run(
+    agent_socket: &Path,
+    port: u16,
+    forward_agent: bool,
+    remote_command: &str,
+) -> (bool, String, String) {
+    let mut command = Command::new("ssh");
+    command
+        .args(SSH_OPTIONS)
+        .args(["-p", &port.to_string()])
         .arg("-o")
-        .arg(format!("IdentityAgent={}", agent_socket.display()))
-        .args(["127.0.0.1", "echo", "signed-in"])
+        .arg(format!("IdentityAgent={}", agent_socket.display()));
+    if forward_agent {
+        command.arg("-A");
+    }
+    let out = command
+        .args(["127.0.0.1", remote_command])
         .stdin(Stdio::null())
         .output()
         .unwrap();
