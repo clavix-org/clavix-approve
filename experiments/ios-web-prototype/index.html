@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Essai approbation SSH</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1f3a5f">
+<style>
+  :root { --fond:#f4f1ea; --carte:#fffdf8; --texte:#1c2530; --doux:#5d6875; --trait:#d9d3c5;
+          --accent:#1f3a5f; --ok:#1e6b45; --ko:#a3312a; --attente:#8a6a14; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fond:#12171d; --carte:#1a212a; --texte:#e8e4da; --doux:#9aa5b1; --trait:#2c3642;
+            --accent:#8fb4e3; --ok:#6fcf9a; --ko:#f0867d; --attente:#e0c070; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px 16px calc(32px + env(safe-area-inset-bottom)); background:var(--fond);
+         color:var(--texte); font:16px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:560px; margin:0 auto; }
+  h1 { font-size:1.35rem; margin:8px 0 4px; }
+  p.intro { color:var(--doux); margin:0 0 16px; }
+  section { background:var(--carte); border:1px solid var(--trait); border-radius:12px;
+            padding:14px; margin:0 0 12px; }
+  h2 { font-size:1rem; margin:0 0 4px; display:flex; gap:8px; align-items:baseline; }
+  h2 .n { color:var(--doux); font-variant-numeric:tabular-nums; }
+  section p { margin:0 0 10px; color:var(--doux); font-size:.92rem; }
+  button { font:inherit; font-weight:600; width:100%; min-height:48px; border-radius:10px;
+           border:1px solid var(--accent); background:var(--accent); color:var(--fond); padding:10px 14px; }
+  button.second { background:transparent; color:var(--accent); margin-top:8px; }
+  button:disabled { opacity:.45; }
+  .etat { margin-top:10px; font-size:.92rem; overflow-wrap:anywhere; white-space:pre-wrap; }
+  .etat.ok { color:var(--ok); } .etat.ko { color:var(--ko); } .etat.attente { color:var(--attente); }
+  #bilan { font:.8rem/1.4 ui-monospace, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere;
+           background:var(--fond); border:1px solid var(--trait); border-radius:8px; padding:10px; margin:0 0 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Essai approbation SSH</h1>
+  <p class="intro">Cinq étapes, dans l'ordre. À la fin, envoie le bilan.</p>
+
+  <section>
+    <h2><span class="n">1</span> Installer sur l'écran d'accueil</h2>
+    <p>Dans Safari : Partager → « Sur l'écran d'accueil », puis rouvre la page depuis l'icône. Les notifications n'existent que dans ce mode.</p>
+    <div class="etat" id="e-install"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span> Créer la passkey</h2>
+    <p>Elle servira de verrou : sans Face ID, la clé SSH reste illisible.</p>
+    <button id="b-passkey">Créer la passkey</button>
+    <div class="etat" id="e-passkey"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">3</span> Créer la clé SSH protégée</h2>
+    <p>Une clé de signature est créée puis chiffrée avec un secret que seule la passkey fournit.</p>
+    <button id="b-cle">Créer la clé (Face ID)</button>
+    <div class="etat" id="e-cle"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">4</span> Signer</h2>
+    <p>Face ID déverrouille la clé, qui signe une demande. À faire deux fois.</p>
+    <button id="b-signer">Signer (Face ID)</button>
+    <div class="etat" id="e-signer"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">5</span> Notifications</h2>
+    <p>Active-les, demande un envoi, puis verrouille l'iPhone. Touche la notification quand elle arrive.</p>
+    <button id="b-notif">Activer les notifications</button>
+    <button id="b-push" class="second">Envoyer une notification dans 10 s</button>
+    <div class="etat" id="e-notif"></div>
+  </section>
+
+  <section>
+    <h2>Bilan</h2>
+    <div id="bilan"></div>
+    <button id="b-copier" class="second">Copier le bilan</button>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

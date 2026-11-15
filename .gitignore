@@ -1,0 +1,11 @@
+# Local state of the experiments (throwaway keys, VAPID key)
+state/
+*.pem
+*.pub
+*.log
+__pycache__/
+target/
+node_modules/
+.env
+.env.*
+.claude
