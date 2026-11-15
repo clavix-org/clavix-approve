@@ -24,6 +24,8 @@ rand = "0.8"
 hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "nistp", "aes"] }
 ed25519-dalek = "2"
 hmac = "0.12"
+# Hashed known_hosts entries are HMAC-SHA1.
+sha1 = "0.10"
 qrcode = { version = "0.14.1", default-features = false }
 
 [dev-dependencies]

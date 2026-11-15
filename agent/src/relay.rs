@@ -16,13 +16,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde_json::{json, Value};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use crate::channel::{self, request_header, response_header, Peer};
-use crate::proto::{Identity, SignError, SignFuture, SignJob, Signer};
+use crate::proto::{CallerInfo, Identity, SignError, SignFuture, SignJob, Signer};
 
 /// How long the user has to approve. Must stay under the server's
 /// `LoginGraceTime` (120 s by default), which starts before we are asked.
@@ -169,8 +171,9 @@ fn state_of(value: &Value) -> &str {
     value.get("state").and_then(Value::as_str).unwrap_or("")
 }
 
-/// Names a host key, for display only.
-type HintFn = Arc<dyn Fn(&[u8]) -> Option<String> + Send + Sync>;
+/// Names a host key, for display only. The caller is the process that
+/// asked for the signature, when known.
+type HintFn = Arc<dyn Fn(&[u8], Option<&CallerInfo>) -> Option<String> + Send + Sync>;
 
 /// Sends each sign job to the paired device and waits for its answer.
 pub struct RelaySigner {
@@ -222,7 +225,7 @@ impl RelaySigner {
             me: Arc::new(me),
             peer: Arc::new(peer),
             timeout,
-            hints: Arc::new(|_| None),
+            hints: Arc::new(|_, _| None),
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             backoff_until: Arc::new(Mutex::new(None)),
         })
@@ -232,7 +235,7 @@ impl RelaySigner {
     /// The device shows such names as unverified.
     pub fn with_hints(
         mut self,
-        hints: impl Fn(&[u8]) -> Option<String> + Send + Sync + 'static,
+        hints: impl Fn(&[u8], Option<&CallerInfo>) -> Option<String> + Send + Sync + 'static,
     ) -> Self {
         self.hints = Arc::new(hints);
         self
@@ -241,7 +244,7 @@ impl RelaySigner {
     fn request_body(&self, job: &SignJob, id: &str, now: u64, exp: u64) -> Value {
         let mut hints = serde_json::Map::new();
         for hop in &job.hops {
-            if let Some(name) = (self.hints)(&hop.key_blob) {
+            if let Some(name) = (self.hints)(&hop.key_blob, job.caller.as_ref()) {
                 hints.insert(hop.fingerprint.clone(), Value::String(name));
             }
         }
@@ -403,21 +406,107 @@ impl Signer for RelaySigner {
 }
 
 /// Look a host key up in an OpenSSH `known_hosts` file and return the
-/// first name it is listed under. Hashed entries cannot be named, and
-/// revoked or CA lines are ignored.
-pub fn known_host_name(known_hosts: &str, key_blob: &[u8]) -> Option<String> {
+/// first name it is listed under. A hashed entry (`HashKnownHosts yes`,
+/// the default on Debian) cannot be read back: it is named only when one
+/// of `candidates` hashes to it. Revoked and CA lines are ignored.
+pub fn known_host_name(
+    known_hosts: &str,
+    key_blob: &[u8],
+    candidates: &[String],
+) -> Option<String> {
     let wanted = STANDARD.encode(key_blob);
     known_hosts.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         let names = fields.next()?;
         let _key_type = fields.next()?;
-        if names.starts_with(['#', '@', '|']) || fields.next()? != wanted {
+        if names.starts_with(['#', '@']) || fields.next()? != wanted {
+            return None;
+        }
+        if let Some(hashed) = names.strip_prefix("|1|") {
+            // "|1|salt|HMAC-SHA1(salt, name)", both in base64.
+            let (salt, hash) = hashed.split_once('|')?;
+            let salt = STANDARD.decode(salt).ok()?;
+            let hash = STANDARD.decode(hash).ok()?;
+            return candidates
+                .iter()
+                .find(|name| {
+                    Hmac::<Sha1>::new_from_slice(&salt).is_ok_and(|mut mac| {
+                        mac.update(name.as_bytes());
+                        mac.verify_slice(&hash).is_ok()
+                    })
+                })
+                .cloned();
+        }
+        if names.starts_with('|') {
             return None;
         }
         let name = names.split(',').next()?;
         // "[host]:port" for non-default ports.
         Some(name.to_string())
     })
+}
+
+/// Most arguments of a command line looked at, and most names tried.
+const MAX_CANDIDATE_ARGS: usize = 64;
+const MAX_CANDIDATE_HOSTS: usize = 32;
+const MAX_CANDIDATE_PORTS: usize = 4;
+
+/// Every host name a command line (of `ssh`, `scp`, `git`…) may be
+/// naming, in the forms `known_hosts` uses. Deliberately generous, with
+/// no knowledge of any program's options: a candidate is only ever used
+/// if it hashes to a `known_hosts` entry, so a wrong guess costs nothing.
+pub fn host_candidates(args: &[String]) -> Vec<String> {
+    fn push(list: &mut Vec<String>, max: usize, value: &str) {
+        let usable = !value.is_empty()
+            && !value.starts_with('-')
+            && !value.chars().any(|c| c.is_control() || c.is_whitespace());
+        if usable && list.len() < max && !list.iter().any(|v| v == value) {
+            list.push(value.to_string());
+        }
+    }
+    let is_port = |s: &str| !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit());
+
+    let mut hosts = Vec::new();
+    let mut ports = Vec::new();
+    for arg in args.iter().take(MAX_CANDIDATE_ARGS) {
+        if arg.is_empty() || arg.len() > 255 {
+            continue;
+        }
+        // "2222" after -p, "-p2222", "-P2222", "-oPort=2222", "Port=2222".
+        let port = ["-p", "-P"]
+            .iter()
+            .find_map(|flag| arg.strip_prefix(flag))
+            .or_else(|| arg.rsplit_once('=').map(|(_, value)| value))
+            .unwrap_or(arg);
+        if is_port(port) {
+            push(&mut ports, MAX_CANDIDATE_PORTS, port);
+            continue;
+        }
+        // "host", "user@host", "host:path", "ssh://user@host:port/".
+        let lower = arg.to_lowercase();
+        let rest = lower.strip_prefix("ssh://").unwrap_or(&lower);
+        let rest = rest.split('/').next().unwrap_or(rest);
+        let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        push(&mut hosts, MAX_CANDIDATE_HOSTS, rest);
+        if let Some((host, tail)) = rest.split_once(':') {
+            push(&mut hosts, MAX_CANDIDATE_HOSTS, host);
+            if is_port(tail) {
+                push(&mut ports, MAX_CANDIDATE_PORTS, tail);
+            }
+        }
+        if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.split(']').next()) {
+            push(&mut hosts, MAX_CANDIDATE_HOSTS, inner);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for host in &hosts {
+        for port in ports.iter().filter(|p| p.as_str() != "22") {
+            candidates.push(format!("[{host}]:{port}"));
+        }
+    }
+    candidates.extend(hosts);
+    candidates
 }
 
 #[cfg(test)]
@@ -505,10 +594,72 @@ mod tests {
              later.example ssh-ed25519 {b64}\n"
         );
         assert_eq!(
-            known_host_name(&file, blob),
+            known_host_name(&file, blob, &[]),
             Some("[build.example]:2222".into())
         );
-        assert_eq!(known_host_name(&file, b"unknown"), None);
-        assert_eq!(known_host_name("", blob), None);
+        assert_eq!(known_host_name(&file, b"unknown", &[]), None);
+        assert_eq!(known_host_name("", blob, &[]), None);
+    }
+
+    /// Two lines written by `ssh-keygen -H`, for `build.example` and
+    /// `[build.example]:2222`.
+    const HASHED: &str = "\
+        |1|/qGM3rQScKfdke/wdZbvyaHd+YM=|Zs/sGQ8N5QNYwliMkc469uQtG6I= ssh-ed25519 aG9zdC1rZXktYmxvYg==\n\
+        |1|d5T9vOAE7VUJi5pI1pX1WOqvhUA=|ZMZ35/g9I2XlV1Y+bcURkNjdS8k= ssh-ed25519 aG9zdC1rZXktYmxvYg==\n";
+
+    fn args(line: &str) -> Vec<String> {
+        line.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn hashed_known_hosts_entries_are_named_by_a_matching_candidate_only() {
+        let blob = b"host-key-blob";
+        let named = |line: &str| known_host_name(HASHED, blob, &host_candidates(&args(line)));
+
+        assert_eq!(known_host_name(HASHED, blob, &[]), None);
+        assert_eq!(named("ssh other.example"), None);
+        assert_eq!(
+            named("ssh -o BatchMode=yes deploy@Build.Example uptime"),
+            Some("build.example".into())
+        );
+        assert_eq!(
+            named("scp -q file build.example:/tmp/"),
+            Some("build.example".into())
+        );
+        // The first line is the port-22 entry; without it, the port is needed.
+        let second = HASHED.lines().nth(1).unwrap();
+        let named = |line: &str| known_host_name(second, blob, &host_candidates(&args(line)));
+        assert_eq!(named("ssh build.example"), None);
+        for line in [
+            "ssh -p 2222 build.example",
+            "ssh -p2222 root@build.example",
+            "ssh -oPort=2222 build.example",
+            "scp -P 2222 file build.example:",
+            "git-remote ssh://git@build.example:2222/repo.git",
+        ] {
+            assert_eq!(named(line), Some("[build.example]:2222".into()), "{line}");
+        }
+        // Another key under the same hashed names stays unnamed.
+        assert_eq!(
+            known_host_name(
+                HASHED,
+                b"another-key",
+                &host_candidates(&args("ssh build.example"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn host_candidates_are_bounded_and_printable() {
+        let many: Vec<String> = (0..500).map(|i| format!("host{i}")).collect();
+        assert!(host_candidates(&many).len() <= MAX_CANDIDATE_HOSTS);
+        let odd = vec![
+            "a\u{7}b".to_string(),
+            "x".repeat(300),
+            String::new(),
+            "-v".into(),
+        ];
+        assert!(host_candidates(&odd).is_empty());
     }
 }

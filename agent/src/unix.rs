@@ -24,6 +24,28 @@ impl AgentHandle {
     }
 }
 
+/// The command line of a process, for guessing which host it is
+/// connecting to (see `relay::host_candidates`). Linux-only via `/proc`;
+/// empty when it cannot be read. Like the process name, it is whatever
+/// the process chose to show.
+pub fn process_args(pid: u32) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                raw.split(|b| *b == 0)
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+}
+
 /// Read the peer's credentials off an accepted connection.
 ///
 /// Returns `None` rather than failing the connection: an unidentifiable

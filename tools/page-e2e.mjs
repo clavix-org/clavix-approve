@@ -14,7 +14,7 @@
 //   node tools/page-e2e.mjs        (needs: cargo build, google-chrome, sshd)
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -153,6 +153,14 @@ function sshd(authorizedKey) {
       `AuthorizedKeysFile ${join(dir, 'authorized_keys')}`, 'StrictModes no', 'UsePAM no',
       'PasswordAuthentication no', 'KbdInteractiveAuthentication no', '',
     ].join('\n'));
+    // The machine knows this server, under a hashed name as on Debian:
+    // the agent can only name it from what `ssh` is asked to reach.
+    const knownHosts = join(dir, 'home/.ssh/known_hosts');
+    mkdirSync(join(dir, 'home/.ssh'), { recursive: true });
+    const [type, key] = readFileSync(`${hostKey}.pub`, 'utf8').split(' ');
+    writeFileSync(knownHosts, `[127.0.0.1]:${port} ${type} ${key}\n`);
+    spawnSync('ssh-keygen', ['-H', '-f', knownHosts]);
+    rmSync(`${knownHosts}.old`, { force: true });
     const daemon = start('/usr/sbin/sshd', ['-D', '-e', '-f', join(dir, 'sshd_config')]);
     await until('sshd', () => /Server listening/.test(daemon.output));
     return { port, fingerprint };
@@ -189,7 +197,7 @@ async function main() {
   check(/^ecdsa-sha2-nistp256 AAAA\S+ clavix-approve$/.test(publicKey), 'a P-256 public key is displayed');
 
   // 2. Pairing: the agent prints a code, the page takes it.
-  const agentEnv = { ...process.env, CLAVIX_AGENT_DIR: join(dir, 'agent'), CLAVIX_ENROLL_SECRET: 'page-e2e' };
+  const agentEnv = { ...process.env, HOME: join(dir, 'home'), CLAVIX_AGENT_DIR: join(dir, 'agent'), CLAVIX_ENROLL_SECRET: 'page-e2e' };
   const pairing = start(AGENT, ['pair', '--yes', '--relay', `http://127.0.0.1:${relayPort}`, '--label', 'banc-de-test'],
     { env: agentEnv });
   const code = await until('the pairing code', () => /cva1-\S+/.exec(pairing.output)?.[0]);
@@ -230,6 +238,13 @@ async function main() {
   // Approving an unknown host requires naming it.
   await browser.click('.request .actions button:last-child');
   await until('the refusal to approve unnamed', async () => (await browser.text('.request .progress'))?.includes('donnez un nom'));
+  // The machine's name for it is offered, and taken only on request.
+  const suggested = `[127.0.0.1]:${server.port}`;
+  check((await browser.text('.request .suggestion')).includes(suggested), 'the name from the hashed known_hosts is suggested');
+  check((await browser.eval("document.querySelector('.request input').value")) === '', 'but not filled in');
+  await browser.click('.request .suggestion button');
+  check((await browser.eval("document.querySelector('.request input').value")) === suggested, 'one tap takes the suggestion');
+  await browser.eval("document.querySelector('.request input').value = ''");
   await browser.type('.request input', 'serveur-de-test');
   await browser.click('.request .actions button:last-child');
   let outcome = await login;
