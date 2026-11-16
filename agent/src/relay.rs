@@ -172,8 +172,9 @@ fn state_of(value: &Value) -> &str {
 }
 
 /// Names a host key, for display only. The caller is the process that
-/// asked for the signature, when known.
-type HintFn = Arc<dyn Fn(&[u8], Option<&CallerInfo>) -> Option<String> + Send + Sync>;
+/// asked for the signature, when known; the flag says whether this host
+/// is the only one in the request (no forwarded agent in between).
+type HintFn = Arc<dyn Fn(&[u8], Option<&CallerInfo>, bool) -> Option<String> + Send + Sync>;
 
 /// Sends each sign job to the paired device and waits for its answer.
 pub struct RelaySigner {
@@ -225,17 +226,18 @@ impl RelaySigner {
             me: Arc::new(me),
             peer: Arc::new(peer),
             timeout,
-            hints: Arc::new(|_, _| None),
+            hints: Arc::new(|_, _, _| None),
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             backoff_until: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Name a host key for display on the device (from `known_hosts`).
-    /// The device shows such names as unverified.
+    /// Name a host key for display on the device (from `known_hosts`, or
+    /// the caller's command line). The device shows such names as
+    /// unverified.
     pub fn with_hints(
         mut self,
-        hints: impl Fn(&[u8], Option<&CallerInfo>) -> Option<String> + Send + Sync + 'static,
+        hints: impl Fn(&[u8], Option<&CallerInfo>, bool) -> Option<String> + Send + Sync + 'static,
     ) -> Self {
         self.hints = Arc::new(hints);
         self
@@ -243,8 +245,9 @@ impl RelaySigner {
 
     fn request_body(&self, job: &SignJob, id: &str, now: u64, exp: u64) -> Value {
         let mut hints = serde_json::Map::new();
+        let sole = job.hops.len() == 1;
         for hop in &job.hops {
-            if let Some(name) = (self.hints)(&hop.key_blob, job.caller.as_ref()) {
+            if let Some(name) = (self.hints)(&hop.key_blob, job.caller.as_ref(), sole) {
                 hints.insert(hop.fingerprint.clone(), Value::String(name));
             }
         }
@@ -509,6 +512,91 @@ pub fn host_candidates(args: &[String]) -> Vec<String> {
     candidates
 }
 
+/// The destination named on an `ssh` command line, as typed: an alias
+/// stays an alias, which is what the user knows the host by. `None` when
+/// the command is not `ssh` or names no usable host. The port is added
+/// when one other than 22 is given with `-p`.
+///
+/// Only meaningful when the request has a single host: through a
+/// forwarded agent, the local `ssh` names the first host, not the one
+/// that asks.
+pub fn ssh_destination(args: &[String]) -> Option<String> {
+    // OpenSSH options that take a value (ssh(1)).
+    const WITH_VALUE: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+    let (program, rest) = args.split_first()?;
+    if program.rsplit('/').next() != Some("ssh") {
+        return None;
+    }
+    let mut port: Option<&str> = None;
+    let mut dest: Option<&str> = None;
+    let mut it = rest.iter().take(MAX_CANDIDATE_ARGS);
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            dest = it.next().map(String::as_str);
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            dest = Some(arg);
+            break;
+        };
+        // "-4At", "-p2222", "-p 2222", "-oFoo=bar"…
+        for (i, c) in flags.char_indices() {
+            if WITH_VALUE.contains(c) {
+                let inline = &flags[i + c.len_utf8()..];
+                let value = if inline.is_empty() {
+                    it.next().map(String::as_str)
+                } else {
+                    Some(inline)
+                };
+                if c == 'p' {
+                    port = value;
+                }
+                break;
+            }
+        }
+    }
+
+    let dest = dest?.to_lowercase();
+    let (host, url_port) = match dest.strip_prefix("ssh://") {
+        Some(url) => {
+            let authority = url.split('/').next().unwrap_or(url);
+            let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            match host_port.strip_prefix('[') {
+                Some(v6) => {
+                    let (host, tail) = v6.split_once(']')?;
+                    (host.to_string(), tail.strip_prefix(':').map(str::to_string))
+                }
+                None => match host_port.split_once(':') {
+                    Some((h, p)) => (h.to_string(), Some(p.to_string())),
+                    None => (host_port.to_string(), None),
+                },
+            }
+        }
+        None => (
+            dest.rsplit_once('@')
+                .map_or(dest.as_str(), |(_, h)| h)
+                .to_string(),
+            None,
+        ),
+    };
+    let usable = !host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+    if !usable {
+        return None;
+    }
+    let port = url_port.as_deref().or(port).filter(|p| {
+        *p != "22" && !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit())
+    });
+    Some(match port {
+        Some(p) if host.contains(':') => format!("[{host}]:{p}"),
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +736,49 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn ssh_destination_is_the_host_as_typed() {
+        let dest = |line: &str| ssh_destination(&args(line));
+        assert_eq!(dest("ssh build"), Some("build".into()));
+        assert_eq!(
+            dest("/usr/bin/ssh Me@Build.Example"),
+            Some("build.example".into())
+        );
+        assert_eq!(
+            dest("ssh -A -i key -p 2222 build ls -l"),
+            Some("build:2222".into())
+        );
+        assert_eq!(dest("ssh -4At -p22 -oUser=me build"), Some("build".into()));
+        assert_eq!(dest("ssh -J jump -l me build"), Some("build".into()));
+        // How git and scp run it.
+        assert_eq!(
+            dest("ssh -o SendEnv=GIT_PROTOCOL git@github.com git-upload-pack 'x.git'"),
+            Some("github.com".into())
+        );
+        assert_eq!(
+            dest("ssh -x -oForwardAgent=no -l me -s -- files.example sftp"),
+            Some("files.example".into())
+        );
+        assert_eq!(dest("ssh ssh://me@build:2200/"), Some("build:2200".into()));
+        assert_eq!(
+            dest("ssh ssh://[fd00::7]:2200"),
+            Some("[fd00::7]:2200".into())
+        );
+    }
+
+    #[test]
+    fn ssh_destination_needs_ssh_and_a_plain_host() {
+        let dest = |line: &str| ssh_destination(&args(line));
+        assert_eq!(dest("git fetch origin"), None);
+        assert_eq!(dest("sshd -D"), None);
+        assert_eq!(dest("ssh"), None);
+        assert_eq!(dest("ssh -p"), None);
+        assert_eq!(dest("ssh -i key"), None);
+        assert_eq!(dest("ssh b\u{202e}ad"), None);
+        assert_eq!(dest("ssh me@"), None);
+        assert_eq!(ssh_destination(&[]), None);
     }
 
     #[test]
