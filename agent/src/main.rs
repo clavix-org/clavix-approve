@@ -8,7 +8,8 @@ use std::time::Duration;
 use clavix_agent::channel::{Identity, Peer};
 use clavix_agent::pairing::{pairing_url, terminal_qr, Offer, PAIRING_WINDOW};
 use clavix_agent::relay::{
-    b64u, host_candidates, known_host_name, unb64u, RelayClient, RelaySigner, DEFAULT_TIMEOUT,
+    b64u, host_candidates, known_host_name, ssh_destination, unb64u, RelayClient, RelaySigner,
+    DEFAULT_TIMEOUT,
 };
 use clavix_agent::state::{self, State};
 use clavix_agent::unix::{process_args, start_agent};
@@ -182,11 +183,39 @@ async fn run(args: &[String]) -> Result<(), String> {
     )?
     // Read at each request: the file changes as the user accepts hosts.
     // Hashed entries are named from what the calling `ssh` was asked to
-    // reach, when that hashes to the entry.
-    .with_hints(move |key_blob, caller| {
-        let content = std::fs::read_to_string(known_hosts.as_ref()?).ok()?;
+    // reach, when that hashes to the entry. Failing that (an alias from
+    // ~/.ssh/config, a HostKeyAlias, another known_hosts file…), the
+    // destination typed on the `ssh` command line, when it can only be
+    // this host. Either way the device shows the name as unverified.
+    .with_hints(move |key_blob, caller, sole_hop| {
         let args = caller.map(|c| process_args(c.pid)).unwrap_or_default();
-        known_host_name(&content, key_blob, &host_candidates(&args))
+        let content = known_hosts
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        if let Some(name) = content
+            .as_deref()
+            .and_then(|c| known_host_name(c, key_blob, &host_candidates(&args)))
+        {
+            return Some(name);
+        }
+        let typed = if sole_hop {
+            ssh_destination(&args)
+        } else {
+            None
+        };
+        if typed.is_none() {
+            let why = if caller.is_none() {
+                "caller unknown"
+            } else if args.is_empty() {
+                "caller's command line unreadable"
+            } else if !sole_hop {
+                "not in known_hosts, and reached through a forwarded agent"
+            } else {
+                "not in known_hosts, and the caller is not a plain ssh command"
+            };
+            eprintln!("[clavix-agent] no name suggested for a host key: {why}");
+        }
+        typed
     });
 
     let agent = start_agent(socket.clone(), Arc::new(signer))

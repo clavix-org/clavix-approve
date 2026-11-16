@@ -229,6 +229,19 @@ async function paced(signal) {
 // 4xx other than "slow down" means our pairing is gone: stop for good.
 const isFatal = (e) => e instanceof RelayError && e.status >= 400 && e.status < 500 && e.status !== 429;
 
+// How long a long-poll may outlive its `wait` before it is taken for dead.
+const POLL_GRACE_S = 10;
+// When the current call to the relay started (0: none under way).
+let pollSince = 0;
+
+// A call bounded in time, also stopped by `signal`. Without the bound, a
+// connection that died while the phone slept would hang until the system
+// gives up on it, and new requests would wait as long.
+function bounded(signal, seconds) {
+  if (typeof AbortSignal.any !== 'function' || typeof AbortSignal.timeout !== 'function') return signal;
+  return AbortSignal.any([signal, AbortSignal.timeout(seconds * 1000)]);
+}
+
 // Long-poll the relay while the page is visible; stop when it is hidden.
 async function watch() {
   if (polling || !relay || document.visibilityState !== 'visible') return;
@@ -239,13 +252,20 @@ async function watch() {
   while (!controller.signal.aborted) {
     try {
       await paced(controller.signal);
+      pollSince = Date.now();
       // Tell the relay what we already show, so it only answers on news.
-      await show(await relay.requests(wait, controller.signal, [...cards.keys()]));
+      const signal = bounded(controller.signal, wait + POLL_GRACE_S);
+      await show(await relay.requests(wait, signal, [...cards.keys()]));
       status(cards.size ? '' : 'Prêt. En attente de demandes.');
       wait = 20;
       backoff = 0;
     } catch (e) {
       if (controller.signal.aborted) break;
+      if (e && e.name === 'TimeoutError') {
+        // A dead connection, not a refusal: ask again at once.
+        wait = 0;
+        continue;
+      }
       if (isFatal(e)) {
         status(`Arrêt : ${describe(e)}. Si cela persiste, appairez à nouveau.`, true);
         break;
@@ -259,12 +279,26 @@ async function watch() {
       await new Promise((r) => setTimeout(r, backoff * 1000));
     }
   }
-  if (polling === controller) polling = null;
+  if (polling === controller) {
+    polling = null;
+    pollSince = 0;
+  }
 }
 
 function stopWatching() {
   if (polling) polling.abort();
   polling = null;
+  pollSince = 0;
+}
+
+// The page comes back to the front, or a notification was tapped. iOS
+// may have frozen the page before it could stop its long-poll, leaving a
+// call that will only end after its full wait (or never): drop it and ask
+// the relay now. A call started just before is fresh, and kept.
+function watchAfresh() {
+  if (polling && Date.now() - pollSince < 2000) return;
+  stopWatching();
+  watch();
 }
 
 async function show(entries) {
@@ -594,11 +628,15 @@ async function start() {
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') watch();
+    if (document.visibilityState === 'visible') watchAfresh();
     else stopWatching();
   });
+  // A page frozen while still "visible" gets no visibilitychange on its
+  // return; these still fire.
+  window.addEventListener('pageshow', watchAfresh);
+  window.addEventListener('focus', watchAfresh);
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.addEventListener('message', () => watch());
+    navigator.serviceWorker.addEventListener('message', watchAfresh);
   }
   setInterval(tick, 1000);
 
