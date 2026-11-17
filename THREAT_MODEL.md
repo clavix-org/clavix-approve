@@ -21,6 +21,7 @@ key as the passkey, read "user verification" for "biometric".)
 | Pinned host list | page storage | a destination shown under a wrong name |
 | Pairing code | on screen for a few minutes | pairing another device in the user's place |
 | Relay enrolment secret | relay and agent environments | creating channels on the relay (spam, storage) |
+| APNs auth key (`.p8`) | relay environment | sending notifications to the app on any device that registered it (spam, false alerts; no request content, no signature) |
 
 ## Who is trusted for what
 
@@ -124,8 +125,8 @@ and a short `ControlPersist` on the server side are outside this project.
   used. It is not sent to the server and is removed from the address, but
   it passes through the phone's camera and browser. It works once, for 15
   minutes, and the verification digits still have to match.
-- **Metadata**: the relay and the push service learn when the user
-  authenticates, and how often.
+- **Metadata**: the relay and the push service (Apple's for the app)
+  learn when the user authenticates, and how often.
 - **Revocation cuts the channel, not the key.** Either end can delete
   the pairing on the relay (`clavix-agent unpair`, "Oublier cette
   machine"): a lost phone then receives nothing, a decommissioned machine

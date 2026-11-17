@@ -12,6 +12,15 @@ import unittest
 import urllib.error
 import urllib.request
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import relay as R  # noqa: E402
 
@@ -20,6 +29,7 @@ RID = "b" * 32
 SIGNER = "c" * 16
 ENROLL, AGENT, PAIR, PHONE = "enroll-secret", "agent-token", "pair-token", "phone-token"
 APPLE = "https://web.push.apple.com/abc"
+TOKEN = "0123456789abcdef" * 4
 
 
 class Clock:
@@ -31,13 +41,14 @@ class Clock:
 
 
 class FakePush:
-    def __init__(self, gone=False):
+    def __init__(self, gone=False, supports_apns=True):
         self.sent = []
         self.gone = gone
+        self.supports_apns = supports_apns
         self.done = threading.Event()
 
     def send(self, sub, payload):
-        self.sent.append((sub["endpoint"], payload))
+        self.sent.append((sub.get("endpoint") or sub.get("apns"), payload))
         self.done.set()
         return "fake push", self.gone
 
@@ -389,6 +400,135 @@ class RelayTest(unittest.TestCase):
 
     def test_push_encryption_roundtrip(self):
         R.selftest()
+
+    # -- APNs subscription --
+
+    def test_an_apns_subscription_is_checked_and_stored(self):
+        self.pair()
+        for body in ({"apns": "zz" * 32, "sandbox": True}, {"apns": "ab" * 31, "sandbox": True},
+                     {"apns": "AB" * 32, "sandbox": True}, {"apns": TOKEN},
+                     {"apns": TOKEN, "sandbox": "yes"}, {"apns": 12, "sandbox": False}):
+            self.assertEqual(self.relay.put_subscription(CH, PHONE, body)[0], 400, body)
+        self.assertEqual(self.relay.put_subscription(CH, AGENT, {"apns": TOKEN, "sandbox": True})[0],
+                         401)
+        self.assertEqual(self.relay.put_subscription(CH, PHONE, {"apns": TOKEN, "sandbox": True}),
+                         (200, {"state": "stored"}))
+        self.assertIn(TOKEN, self.saved_state())
+        self.assertEqual(self.request(), (200, {"state": "queued", "push": True}))
+        self.assertTrue(self.push.done.wait(5))
+        self.assertEqual(self.push.sent, [(TOKEN, {"t": "sign"})])
+
+    def test_a_relay_without_apns_keeps_the_web_push_subscription(self):
+        self.push.supports_apns = False
+        self.pair()
+        self.relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": {"p256dh": "x", "auth": "y"}})
+        self.assertEqual(self.relay.put_subscription(CH, PHONE, {"apns": TOKEN, "sandbox": False}),
+                         (200, {"state": "unsupported"}))
+        self.assertIn(APPLE, self.saved_state())
+        self.assertNotIn(TOKEN, self.saved_state())
+
+
+def p8_key():
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption())
+    return key, pem
+
+
+@unittest.skipIf(httpx is None, "httpx not installed")
+class ApnsTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.calls = []
+        self.answer = (200, b"")
+        self.key, pem = p8_key()
+
+        def handler(request):
+            self.calls.append(request)
+            return httpx.Response(self.answer[0], content=self.answer[1])
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        self.addCleanup(client.close)
+        self.apns = R.ApnsPush(pem, "KEYID12345", "TEAMID1234", "org.clavix.approve",
+                               client=client, now=self.clock)
+
+    def send(self, sandbox=False):
+        return self.apns.send({"apns": TOKEN, "sandbox": sandbox}, {"t": "sign"})
+
+    def jwt_claims(self, request):
+        head, body, sig = request.headers["authorization"].split(" ")[1].split(".")
+        raw = R.unb64u(sig)
+        self.key.public_key().verify(
+            encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")),
+            f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256()))
+        return json.loads(R.unb64u(head)), json.loads(R.unb64u(body))
+
+    def test_the_notification_is_content_free_and_signed(self):
+        self.assertEqual(self.send(), ("push accepted by APNs (HTTP 200)", False))
+        r = self.calls[0]
+        self.assertEqual(str(r.url), f"https://api.push.apple.com/3/device/{TOKEN}")
+        self.assertEqual(r.headers["apns-topic"], "org.clavix.approve")
+        self.assertEqual(r.headers["apns-push-type"], "alert")
+        self.assertEqual(r.headers["apns-priority"], "10")
+        self.assertEqual(int(r.headers["apns-expiration"]), int(self.clock.t) + 90)
+        self.assertEqual(json.loads(r.content), {"aps": {
+            "alert": {"title": "Clavix", "body": "Une demande de signature attend"},
+            "sound": "default", "interruption-level": "time-sensitive"}})
+        self.assertEqual(self.jwt_claims(r), ({"alg": "ES256", "kid": "KEYID12345"},
+                                              {"iss": "TEAMID1234", "iat": int(self.clock.t)}))
+
+    def test_a_development_build_goes_to_the_sandbox(self):
+        self.send(sandbox=True)
+        self.assertEqual(self.calls[0].url.host, "api.sandbox.push.apple.com")
+
+    def test_the_provider_token_is_reused_then_renewed(self):
+        self.send()
+        self.clock.t += 30 * 60
+        self.send()
+        self.clock.t += 15 * 60
+        self.send()
+        tokens = [c.headers["authorization"] for c in self.calls]
+        self.assertEqual(tokens[0], tokens[1])
+        self.assertNotEqual(tokens[1], tokens[2])
+
+    def test_a_refused_provider_token_is_renewed_at_once(self):
+        self.answer = (403, b'{"reason":"ExpiredProviderToken"}')
+        self.assertEqual(self.send(), ("push rejected by APNs (HTTP 403 ExpiredProviderToken)", False))
+        self.clock.t += 1
+        self.answer = (200, b"")
+        self.send()
+        self.assertNotEqual(self.calls[0].headers["authorization"],
+                            self.calls[1].headers["authorization"])
+
+    def test_a_dead_device_token_is_reported_gone(self):
+        for answer, gone in (((410, b'{"reason":"Unregistered"}'), True),
+                             ((400, b'{"reason":"BadDeviceToken"}'), True),
+                             ((400, b'{"reason":"BadTopic"}'), False),
+                             ((429, b'{"reason":"TooManyRequests"}'), False),
+                             ((500, b"oops"), False)):
+            self.answer = answer
+            self.assertEqual(self.send()[1], gone, answer)
+
+    def test_the_route_follows_the_subscription(self):
+        web = FakePush()
+        pushers = R.Pushers(web, self.apns)
+        pushers.send({"apns": TOKEN, "sandbox": False}, {"t": "sign"})
+        pushers.send({"endpoint": APPLE, "keys": {}}, {"t": "sign"})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(web.sent, [(APPLE, {"t": "sign"})])
+        self.assertTrue(pushers.supports_apns)
+        self.assertFalse(R.Pushers(web).supports_apns)
+        self.assertEqual(R.Pushers(web).send({"apns": TOKEN, "sandbox": False}, {}),
+                         ("APNs not configured, not sent", False))
+
+    def test_bad_settings_are_refused(self):
+        _, pem = p8_key()
+        with self.assertRaises(ValueError):
+            R.ApnsPush(pem, "short", "TEAMID1234", "t", enabled=False)
+        rsa_pem = rsa.generate_private_key(65537, 2048).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption())
+        with self.assertRaises(ValueError):
+            R.ApnsPush(rsa_pem, "KEYID12345", "TEAMID1234", "t", enabled=False)
 
 
 class HttpTest(unittest.TestCase):

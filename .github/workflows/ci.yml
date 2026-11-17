@@ -33,10 +33,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: agent
-      - name: Install sshd and the relay's dependency
+      - name: Install sshd and the relay's dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq openssh-server python3-cryptography
+          sudo apt-get install -y -qq openssh-server python3-cryptography python3-httpx python3-h2
           sudo mkdir -p /run/sshd
       - name: Agent — format, lint, tests (with ssh end to end)
         working-directory: agent

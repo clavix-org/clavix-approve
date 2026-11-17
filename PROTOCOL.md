@@ -180,6 +180,14 @@ channel, 300 s maximum lifetime, 15 minutes to complete a pairing.
 The push is VAPID-signed, `aes128gcm`-encrypted, and its payload is the
 constant `{"t":"sign"}`: the notification says only that a request waits.
 
+The iOS app subscribes with `{ apns, sandbox }` instead: its APNs device
+token in lowercase hex and `true` for a development build (APNs sandbox).
+A relay started without an APNs key answers `200 {"state":"unsupported"}`
+and keeps the previous subscription. The notification is a constant
+time-sensitive alert ("Une demande de signature attend"), valid 90 s, with
+nothing else in it. A token APNs reports dead (`410`, `BadDeviceToken`)
+is forgotten, like a Web Push subscription answering `404` or `410`.
+
 ## Several devices
 
 A channel holds up to four signers, each with its own SSH key. To add one,
