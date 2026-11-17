@@ -7,14 +7,16 @@
 //
 //   fake-phone.mjs pair --relay URL --state FILE --code CODE
 //   fake-phone.mjs run  --state FILE [--deny] [--once]
+//   fake-phone.mjs revoke --state FILE
 //
-// Both print one JSON line per event on standard output.
+// Each prints one JSON line per event on standard output. `run` ends with
+// a `revoked` event when the relay no longer knows the pairing.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import { b64u, unb64u } from '../web/lib/bytes.js';
 import { generateIdentity, peer, withPublicBytes } from '../web/lib/channel.js';
-import { RelayClient } from '../web/lib/relay.js';
+import { RelayClient, RelayError } from '../web/lib/relay.js';
 import { approve, deny, pairWithAgent, readRequest } from '../web/lib/signer.js';
 import { p256KeyBlob, p256SignatureBlob, publicKeyLine } from '../web/lib/ssh.js';
 
@@ -98,7 +100,17 @@ async function run({ state: file, deny: denyAll, once }) {
   // name them so the long-poll does not return them in a loop.
   const ignored = new Set();
   for (;;) {
-    for (const entry of await relay.requests(20, undefined, [...ignored])) {
+    let pending;
+    try {
+      pending = await relay.requests(20, undefined, [...ignored]);
+    } catch (e) {
+      if (e instanceof RelayError && e.status === 401) {
+        say({ event: 'revoked' });
+        return;
+      }
+      throw e;
+    }
+    for (const entry of pending) {
       const { id } = entry;
       if (ignored.has(id)) continue;
       const view = await readRequest(ctx, entry, Date.now() / 1000);
@@ -130,10 +142,17 @@ async function run({ state: file, deny: denyAll, once }) {
   }
 }
 
+async function revoke({ state: file }) {
+  if (!file) throw new Error('revoke needs --state');
+  const state = JSON.parse(readFileSync(file, 'utf8'));
+  const relay = new RelayClient(state.relay, state.ch, state.token);
+  say({ event: 'revoked', deleted: await relay.revoke() });
+}
+
 const [command, ...rest] = process.argv.slice(2);
-const commands = { pair, run };
+const commands = { pair, run, revoke };
 if (!commands[command]) {
-  console.error('usage: fake-phone.mjs pair|run [options]  (see the header of this file)');
+  console.error('usage: fake-phone.mjs pair|run|revoke [options]  (see the header of this file)');
   process.exit(2);
 }
 commands[command](options(rest)).catch((e) => {

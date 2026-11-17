@@ -78,4 +78,15 @@ export class RelayClient {
   respond(id, msg) {
     return this.call('POST', `responses/${id}`, { msg });
   }
+
+  // Delete the pairing on the relay. True when this call deleted it,
+  // false when the relay no longer knew it (already revoked elsewhere).
+  async revoke() {
+    try {
+      return (await this.call('POST', 'revoke', {})).state === 'revoked';
+    } catch (e) {
+      if (e instanceof RelayError && e.status === 401) return false;
+      throw e;
+    }
+  }
 }

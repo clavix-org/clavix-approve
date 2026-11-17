@@ -109,6 +109,65 @@ class RelayTest(unittest.TestCase):
         again = R.Relay(self.dir.name, ENROLL, self.push, self.clock)
         self.assertEqual(again.get_requests(CH, PHONE), (200, {"requests": []}))
 
+    # -- revocation --
+
+    def test_either_end_can_revoke_and_everything_goes(self):
+        for token in (AGENT, PHONE):
+            with self.subTest(by=token):
+                self.pair()
+                self.relay.put_subscription(CH, PHONE, {
+                    "endpoint": "https://web.push.apple.com/x", "keys": {"p256dh": "k", "auth": "a"}})
+                self.request()
+                self.assertEqual(self.relay.revoke(CH, token), (200, {"state": "revoked"}))
+                self.assertNotIn(CH, self.saved_state())
+                self.assertNotIn(CH, self.relay.pending)
+                self.assertEqual(self.relay.get_requests(CH, PHONE)[0], 401)
+                self.assertEqual(self.request()[0], 401)
+                self.assertEqual(self.relay.get_response(CH, AGENT, RID)[0], 401)
+                # Gone after a restart too.
+                again = R.Relay(self.dir.name, ENROLL, self.push, self.clock)
+                self.assertEqual(again.get_requests(CH, PHONE)[0], 401)
+
+    def test_revocation_needs_a_token_of_the_channel(self):
+        self.create()
+        self.assertEqual(self.relay.revoke(CH, PAIR)[0], 401)   # the pairing secret cannot
+        self.relay.post_pair(CH, PAIR, {
+            "signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "answer"})
+        for token in (None, "", ENROLL, "wrong"):
+            self.assertEqual(self.relay.revoke(CH, token)[0], 401)
+        self.assertEqual(self.relay.revoke("0" * 32, AGENT)[0], 401)
+        self.assertEqual(self.relay.get_requests(CH, PHONE)[0], 200)
+        # Revoking twice: the second time the channel is simply unknown.
+        self.relay.revoke(CH, AGENT)
+        self.assertEqual(self.relay.revoke(CH, AGENT)[0], 401)
+
+    def test_revocation_ends_the_long_polls_on_the_channel(self):
+        self.pair()
+        self.request()
+        got = []
+        waiters = [
+            threading.Thread(target=lambda: got.append(
+                ("signer", self.relay.get_requests(CH, PHONE, wait=10, known={RID})[0]))),
+            threading.Thread(target=lambda: got.append(
+                ("agent", self.relay.get_response(CH, AGENT, RID, wait=10)[0]))),
+        ]
+        for w in waiters:
+            w.start()
+        import time
+        time.sleep(0.2)
+        self.relay.revoke(CH, AGENT)
+        for w in waiters:
+            w.join(5)
+        self.assertEqual(sorted(got), [("agent", 401), ("signer", 401)])
+
+    def test_revoking_one_channel_leaves_the_others(self):
+        self.pair()
+        other = "f" * 32
+        self.relay.create_channel(ENROLL, {
+            "ch": other, "agent_auth": R.digest("agent2"), "pair_auth": R.digest(PAIR), "hello": "hi"})
+        self.relay.revoke(CH, AGENT)
+        self.assertEqual(self.relay.get_hello(other, PAIR), (200, {"hello": "hi"}))
+
     # -- requests and responses --
 
     def test_request_reaches_the_signer_and_the_answer_reaches_the_agent(self):
@@ -298,6 +357,17 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(
             json.loads(self.call("GET", f"/api/ch/{CH}/responses/{RID}", token=AGENT)[2]),
             {"state": "answered", "msg": "signed"})
+
+    def test_revocation_over_http(self):
+        self.call("POST", "/api/channels", token=ENROLL, body={
+            "ch": CH, "agent_auth": R.digest(AGENT), "pair_auth": R.digest(PAIR), "hello": "hi"})
+        self.call("POST", f"/api/ch/{CH}/pair", token=PAIR, body={
+            "signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "answer"})
+        self.assertEqual(self.call("GET", f"/api/ch/{CH}/revoke", token=PHONE)[0], 404)
+        status, _, body = self.call("POST", f"/api/ch/{CH}/revoke", token=PHONE, body={})
+        self.assertEqual((status, json.loads(body)), (200, {"state": "revoked"}))
+        self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests", token=PHONE)[0], 401)
+        self.assertEqual(self.call("POST", f"/api/ch/{CH}/revoke", token=AGENT, body={})[0], 401)
 
     def test_known_parameter_over_http(self):
         self.call("POST", "/api/channels", token=ENROLL, body={

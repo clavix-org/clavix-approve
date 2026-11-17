@@ -160,6 +160,7 @@ Same origin as the page. JSON bodies, bearer tokens in `Authorization`.
 | `GET /api/ch/{ch}/requests?wait=&known=` | signer | pending requests |
 | `POST /api/ch/{ch}/responses/{id}` | signer | answer a request |
 | `GET /api/ch/{ch}/responses/{id}?wait=` | agent | fetch the answer |
+| `POST /api/ch/{ch}/revoke` | agent or signer | delete the pairing (body `{}`) |
 | `GET /api/vapid-public-key`, `GET /healthz` | none | |
 
 `wait` is a long-poll in seconds, capped at 25 and at the request's
@@ -176,6 +177,31 @@ channel, 300 s maximum lifetime, 15 minutes to complete a pairing.
 
 The push is VAPID-signed, `aes128gcm`-encrypted, and its payload is the
 constant `{"t":"sign"}`: the notification says only that a request waits.
+
+## Revocation
+
+Either end deletes its pairing with `POST /api/ch/{ch}/revoke` and its own
+token; the body is `{}`. It is a `POST` rather than a `DELETE` so that a
+proxy allowing only `GET`, `POST` and `HEAD` lets it through. The relay
+then forgets the channel, the signer's push subscription and the pending
+requests, and every long-poll on the channel returns `401`. The answer is
+`200 {"state": "revoked"}`; a channel that no longer exists answers `401`,
+like a wrong token, so the relay does not tell who asks whether a channel
+exists. A client therefore takes `401` on revocation as "already revoked".
+
+- `clavix-agent unpair` revokes, then deletes its state file; when the
+  relay cannot be reached it changes nothing, unless given
+  `--local-only`. `clavix-agent pair` revokes the pairing it replaces,
+  once the new one is confirmed (best effort).
+- The page's "Oublier cette machine" revokes, then forgets the pairing,
+  keeping the SSH key and the pinned hosts; pairing again from the page
+  revokes the replaced pairing (best effort). On a `401` while
+  long-polling it says the machine was removed, and does not forget the
+  pairing by itself: a proxy that dropped the `Authorization` header would
+  otherwise erase it.
+
+Revocation cuts the channel, not the key: the signer's SSH key still
+opens every server whose `authorized_keys` lists it. Both ends say so.
 
 ## Agent behaviour worth knowing
 

@@ -298,6 +298,25 @@ async function main() {
   check(peak.length <= 4, `never more than 4 API calls in any second (peak ${peak.length}${
     peak.length > 4 ? `: ${peak.map((r) => `${r.at - peak[0].at}ms ${new URL(r.url).pathname.replace(/[0-9a-f]{32}/g, '…')}`).join(', ')}` : ''})`);
 
+  // 9. Revocation from the machine: the page says so, and forgetting the
+  //    machine there clears the pairing but keeps the key.
+  await until('the agent to revoke the replaced pairing', () => again.output.includes('The previous pairing was revoked.')
+    || again.output.includes('could not revoke the previous pairing'));
+  check(again.output.includes('The previous pairing was revoked.'), 'pairing again revokes the replaced pairing');
+  const unpair = start(AGENT, ['unpair'], { env: agentEnv });
+  await until('the agent to unpair', () => unpair.output.includes('Pairing forgotten'));
+  check(unpair.output.includes('Pairing revoked on the relay.'), 'clavix-agent unpair revokes the pairing on the relay');
+  await until('the page to notice', async () => (await browser.text('#status'))?.includes('a été retirée'));
+  check(true, 'the page says the machine was removed');
+  check(!(await browser.eval("document.querySelector('#forget').hidden")), 'and offers to forget it');
+  await browser.click('#forget');
+  check((await browser.text('#forget')) === 'Toucher encore pour confirmer', 'forgetting asks for a second touch');
+  await browser.click('#forget');
+  await until('the pairing to be forgotten', async () => (await browser.eval("document.querySelector('#forget').hidden")) === true);
+  check((await browser.text('#journal')).includes('déjà révoqué'), 'the journal records that it was already revoked');
+  check((await browser.text('#public-key')) === publicKey, 'the SSH key stays after forgetting the machine');
+  check((await browser.text('#status')).startsWith('Clé prête'), 'and the page asks for a new pairing');
+
   // 8. The same link opened where there is no key (the phone's browser
   //    rather than the installed app): the page only hands the code over.
   const main = browser.session;
@@ -311,7 +330,11 @@ async function main() {
   check((await browser.eval('location.hash')) === '', 'and removes it from the address there too');
   browser.session = main;
 
-  const noise = browser.console.filter((line) => !/apple-mobile-web-app-capable/.test(line));
+  // The 401s are step 9's: a revoked pairing is told by the relay that way
+  // (the long-poll, forgetting an already revoked machine, and the replaced
+  // channel the agent revoked first). Chrome logs each failed load.
+  const noise = browser.console.filter((line) => !/apple-mobile-web-app-capable/.test(line)
+    && !/status of 401 \(Unauthorized\)/.test(line));
   check(noise.length === 0, `no console error or CSP violation${noise.length ? `: ${noise.join(' | ')}` : ''}`);
   console.log('\npage-e2e: all checks passed');
 }

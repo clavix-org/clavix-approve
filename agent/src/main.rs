@@ -8,8 +8,8 @@ use std::time::Duration;
 use clavix_agent::channel::{Identity, Peer};
 use clavix_agent::pairing::{pairing_url, terminal_qr, Offer, PAIRING_WINDOW};
 use clavix_agent::relay::{
-    b64u, host_candidates, known_host_name, ssh_destination, unb64u, RelayClient, RelaySigner,
-    DEFAULT_TIMEOUT,
+    b64u, host_candidates, known_host_name, revoke, ssh_destination, unb64u, RelayClient,
+    RelaySigner, DEFAULT_TIMEOUT,
 };
 use clavix_agent::state::{self, State};
 use clavix_agent::unix::{process_args, start_agent};
@@ -23,11 +23,17 @@ Usage:
       CLAVIX_ENROLL_SECRET environment variable. Prints a code to enter on
       the device, then verification digits to compare with the device's
       (--yes: do not ask), then the SSH public key to install on servers.
+      A previous pairing is revoked once the new one is confirmed.
   clavix-agent run [--socket PATH] [--timeout SECONDS]
       Serve the agent protocol. Point SSH_AUTH_SOCK (or IdentityAgent) at
       the socket. Default timeout: 90 seconds per request.
   clavix-agent pubkey
       Print the paired device's SSH public key.
+  clavix-agent unpair [--local-only]
+      Revoke the pairing on the relay, then forget it here. The device can
+      then no longer sign through this agent; its key still has to be
+      removed from the servers' authorized_keys. --local-only: forget it
+      here even when the relay cannot be reached.
 
 State lives in $CLAVIX_AGENT_DIR, else $XDG_CONFIG_HOME/clavix-agent, else
 ~/.config/clavix-agent.";
@@ -122,9 +128,82 @@ async fn pair(args: &[String]) -> Result<(), String> {
         sig_private: b64u(&sig_private),
         signer: paired.signer,
     };
+    // Read before it is replaced: the pairing this one supersedes.
+    let previous = state::load(&dir).ok().filter(|old| old.ch != state.ch);
     state::save(&dir, &state).map_err(|e| format!("cannot save {}: {e}", dir.display()))?;
     println!(
         "Paired. Public key to install in authorized_keys:\n\n{}\n",
+        state.signer.public_key
+    );
+    if let Some(old) = previous {
+        revoke_previous(&old, &state.signer.public_key).await;
+    }
+    Ok(())
+}
+
+/// Best effort: a failure here leaves a dead channel on the old relay,
+/// not a security problem, so it is reported and the pairing stands.
+async fn revoke_previous(old: &State, new_key: &str) {
+    let outcome = match RelayClient::new(&old.relay) {
+        Ok(client) => revoke(&client, &old.ch, &old.agent_token)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Ok(_) => println!("The previous pairing was revoked."),
+        Err(e) => eprintln!("clavix-agent: could not revoke the previous pairing: {e}"),
+    }
+    // Same device paired again: same key, still in use.
+    if same_key(&old.signer.public_key, new_key) {
+        return;
+    }
+    {
+        println!(
+            "If the previous device's key is no longer needed, remove it from the servers:\n\n{}\n",
+            old.signer.public_key
+        );
+    }
+}
+
+/// Two `authorized_keys` lines for the same key, whatever their comments.
+fn same_key(a: &str, b: &str) -> bool {
+    fn key(line: &str) -> Vec<&str> {
+        line.split_whitespace().take(2).collect()
+    }
+    key(a) == key(b)
+}
+
+async fn unpair(args: &[String]) -> Result<(), String> {
+    let local_only = match args {
+        [] => false,
+        [flag] if flag == "--local-only" => true,
+        [other, ..] => return Err(format!("unexpected argument: {other}")),
+    };
+    let dir = state_dir()?;
+    let state = load_state()?;
+    if local_only {
+        println!(
+            "Not contacting the relay: the pairing stays there until revoked from the device."
+        );
+    } else {
+        let client = RelayClient::new(&state.relay)?;
+        match revoke(&client, &state.ch, &state.agent_token).await {
+            Ok(true) => println!("Pairing revoked on the relay."),
+            Ok(false) => println!("The relay no longer knew this pairing."),
+            Err(e) => {
+                return Err(format!(
+                    "{e}; nothing was changed. Try again, or pass --local-only to forget \
+                     the pairing here anyway"
+                ))
+            }
+        }
+    }
+    state::remove(&dir)
+        .map_err(|e| format!("cannot remove the state in {}: {e}", dir.display()))?;
+    println!(
+        "Pairing forgotten. The device's key still opens the servers it was installed on; \
+         remove this line from their authorized_keys:\n\n{}\n",
         state.signer.public_key
     );
     Ok(())
@@ -240,6 +319,7 @@ async fn main() -> ExitCode {
         Some("pair") => pair(&args[1..]).await,
         Some("run") => run(&args[1..]).await,
         Some("pubkey") => load_state().map(|s| println!("{}", s.signer.public_key)),
+        Some("unpair") => unpair(&args[1..]).await,
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())

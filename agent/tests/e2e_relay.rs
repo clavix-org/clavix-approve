@@ -374,3 +374,151 @@ fn no_answer_expires_and_a_dead_relay_fails_fast() {
     assert!(bench.agent_log().contains("relay unreachable"));
     let _ = &bench.relay_url;
 }
+
+impl Bench {
+    /// `clavix-agent unpair` with these arguments: (success, stdout, stderr).
+    fn unpair(&self, args: &[&str]) -> (bool, String, String) {
+        let out = Command::new(AGENT)
+            .arg("unpair")
+            .args(args)
+            .env("CLAVIX_AGENT_DIR", self.path("agent-state"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn agent_state_exists(&self) -> bool {
+        self.path("agent-state").join("state.json").exists()
+    }
+}
+
+#[test]
+fn unpair_from_the_agent_cuts_the_phone_off() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    let phone = bench.phone(&[]);
+
+    let (ok, out, err) = bench.unpair(&[]);
+    assert!(ok, "unpair failed: {err}");
+    assert!(out.contains("Pairing revoked on the relay."), "{out}");
+    // It says which key still has to leave the servers.
+    assert!(out.contains(&bench.public_key), "{out}");
+    assert!(!bench.agent_state_exists());
+    // The phone's long-poll ends: the relay no longer knows it.
+    phone.event("revoked");
+
+    // Nothing left to unpair.
+    let (ok, _, err) = bench.unpair(&[]);
+    assert!(!ok);
+    assert!(err.contains("not paired yet"), "{err}");
+}
+
+#[test]
+fn a_pairing_revoked_from_the_phone_fails_with_a_clear_message() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    let revoked = Command::new("node")
+        .arg(repo().join("tools/fake-phone.mjs"))
+        .args(["revoke", "--state"])
+        .arg(bench.path("phone.json"))
+        .output()
+        .unwrap();
+    assert!(revoked.status.success());
+    let event: Value = serde_json::from_slice(&revoked.stdout).unwrap();
+    assert_eq!(event["deleted"], true);
+
+    let (_agent, socket) = bench.agent("10");
+    let started = Instant::now();
+    let (ok, _, _) = ssh(&socket, bench.sshd.port);
+    assert!(!ok);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        bench.agent_log().contains("no longer knows this pairing"),
+        "{}",
+        bench.agent_log()
+    );
+
+    // The agent end then finds the channel already gone, and still cleans up.
+    let (ok, out, err) = bench.unpair(&[]);
+    assert!(ok, "{err}");
+    assert!(out.contains("no longer knew this pairing"), "{out}");
+    assert!(!bench.agent_state_exists());
+}
+
+#[test]
+fn unpair_keeps_the_pairing_when_the_relay_is_unreachable() {
+    if !available() {
+        return;
+    }
+    let mut bench = Bench::new();
+    bench.relay = None;
+
+    let (ok, _, err) = bench.unpair(&[]);
+    assert!(!ok);
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert!(bench.agent_state_exists());
+
+    let (ok, out, err) = bench.unpair(&["--local-only"]);
+    assert!(ok, "{err}");
+    assert!(out.contains(&bench.public_key), "{out}");
+    assert!(!bench.agent_state_exists());
+}
+
+#[test]
+fn pairing_again_revokes_the_previous_pairing() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    let old_phone = bench.phone(&[]);
+
+    // A new device pairs with the same agent.
+    let mut pair = Command::new(AGENT);
+    pair.args([
+        "pair",
+        "--yes",
+        "--relay",
+        &bench.relay_url,
+        "--label",
+        "test-bench",
+    ])
+    .env("CLAVIX_AGENT_DIR", bench.path("agent-state"))
+    .env("CLAVIX_ENROLL_SECRET", ENROLL_SECRET);
+    let pairing = Lines::spawn(pair);
+    let code = pairing.next("pairing code", |line| {
+        line.trim()
+            .starts_with("cva1-")
+            .then(|| line.trim().to_string())
+    });
+    let phone = Command::new("node")
+        .arg(repo().join("tools/fake-phone.mjs"))
+        .args([
+            "pair",
+            "--relay",
+            &bench.relay_url,
+            "--code",
+            &code,
+            "--state",
+        ])
+        .arg(bench.path("phone2.json"))
+        .output()
+        .unwrap();
+    assert!(phone.status.success());
+    pairing.next("revocation of the previous pairing", |line| {
+        (line == "The previous pairing was revoked.").then_some(())
+    });
+    // The old device's key differs from the new one: remove it from servers.
+    pairing.next("old key to remove", |line| {
+        (line == bench.public_key).then_some(())
+    });
+    old_phone.event("revoked");
+}

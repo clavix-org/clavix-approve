@@ -261,10 +261,16 @@ class Relay:
             return c, None
         return None, None
 
-    def _wait(self, ready, wait):
-        """Block until ready() is truthy or `wait` seconds passed."""
+    def _wait(self, ready, wait, ch=None, c=None):
+        """Block until ready() is truthy or `wait` seconds passed.
+
+        Given the channel the caller holds, returns GONE as soon as that
+        channel is revoked, so a long-poll does not outlive its pairing.
+        """
         deadline = time.monotonic() + max(0.0, min(float(wait or 0), MAX_WAIT))
         while True:
+            if c is not None and self.channels.get(ch) is not c:
+                return self.GONE
             result = ready()
             remaining = deadline - time.monotonic()
             if result or remaining <= 0:
@@ -272,6 +278,7 @@ class Relay:
             self.cond.wait(remaining)
 
     DENIED = (401, {"error": "unauthorized"})
+    GONE = object()
     BAD = (400, {"error": "bad request"})
 
     # -- pairing --
@@ -327,10 +334,35 @@ class Relay:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
                 return self.DENIED
-            answer = self._wait(lambda: c["answer"], wait)
+            answer = self._wait(lambda: c["answer"], wait, ch, c)
+            if answer is self.GONE:
+                return self.DENIED
             if not answer:
                 return 204, None
             return 200, {"state": "answered", **answer}
+
+    def revoke(self, ch, token):
+        """Delete a pairing. Either end may do it, with its own token.
+
+        The channel, the signer's push subscription and the pending
+        requests go; long-polls on the channel return 401. A channel that
+        no longer exists answers 401 like a wrong token: the relay does
+        not tell who asks whether a channel exists.
+        """
+        with self.cond:
+            c, _ = self._channel(ch, token, "agent")
+            by = "agent"
+            if c is None:
+                c, _ = self._channel(ch, token, "signer")
+                by = "signer"
+            if c is None:
+                return self.DENIED
+            del self.channels[ch]
+            self.pending.pop(ch, None)
+            self._save()
+            self.cond.notify_all()
+        log(f"channel {ch[:8]} revoked by the {by}")
+        return 200, {"state": "revoked"}
 
     # -- signer side --
 
@@ -372,7 +404,8 @@ class Relay:
                 if known is None:
                     return current
                 return [current] if {r["id"] for r in current} != known else None
-            self._wait(news, wait)
+            if self._wait(news, wait, ch, c) is self.GONE:
+                return self.DENIED
             return 200, {"requests": waiting()}
 
     def post_response(self, ch, token, rid, body):
@@ -455,7 +488,9 @@ class Relay:
             e = self.pending.get(ch, {}).get(rid)
             if e is not None:
                 wait = min(float(wait or 0), max(0.0, e["exp"] - self.now()) + 0.05)
-            result = self._wait(settled, wait)
+            result = self._wait(settled, wait, ch, c)
+            if result is self.GONE:
+                return self.DENIED
             return (200, result) if result else (204, None)
 
 
@@ -493,7 +528,7 @@ ICON_ALIAS = re.compile(r"^/(apple-touch-icon[0-9a-z-]*\.png|favicon\.ico|icon\.
 MAIN_ICON = "/clavix-icon-180.png"
 
 
-ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|subscription|requests|"
+ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|subscription|requests|revoke|"
                    r"responses/([0-9a-f]{32}))$")
 
 
@@ -602,6 +637,8 @@ def make_handler(relay, static, vapid_public):
                 return self.reply(*relay.post_pair(ch, self.token(), body))
             if what == "subscription":
                 return self.reply(*relay.put_subscription(ch, self.token(), body))
+            if what == "revoke":
+                return self.reply(*relay.revoke(ch, self.token()))
             if what == "requests":
                 return self.reply(*relay.post_request(ch, self.token(), body))
             if rid:

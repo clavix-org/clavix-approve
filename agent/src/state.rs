@@ -78,6 +78,15 @@ pub fn save(dir: &Path, state: &State) -> std::io::Result<()> {
     std::fs::rename(tmp, dir.join(FILE))
 }
 
+/// Forget the pairing: delete the state file. Not an error when there is
+/// none.
+pub fn remove(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +127,14 @@ mod tests {
         assert!(load(tmp.path()).is_err());
         std::fs::write(tmp.path().join(FILE), b"{").unwrap();
         assert!(load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn remove_forgets_the_state_and_tolerates_its_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(FILE), b"{}").unwrap();
+        remove(tmp.path()).unwrap();
+        assert!(!tmp.path().join(FILE).exists());
+        remove(tmp.path()).unwrap();
     }
 }
