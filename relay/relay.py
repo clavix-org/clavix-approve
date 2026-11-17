@@ -66,6 +66,7 @@ MAX_PENDING = 8             # sign requests waiting on one channel
 MAX_TTL = 300               # seconds a sign request may ask to live
 MAX_WAIT = 25               # long-poll cap, under usual proxy read timeouts
 MAX_CHANNELS = 1000
+MAX_SIGNERS = 4             # devices paired on one channel
 PAIR_WINDOW = 900           # seconds to complete a pairing
 KEEP_AFTER_EXPIRY = 60      # an agent can still learn "expired" that long
 
@@ -256,20 +257,24 @@ class Relay:
                 if hmac.compare_digest(given, s["auth"]):
                     return c, sid
             return None, None
+        if role == "pair" and c.get("pair_until", float("inf")) < self.now():
+            return None, None
         expected = c.get(role + "_auth")
         if expected and hmac.compare_digest(given, expected):
             return c, None
         return None, None
 
-    def _wait(self, ready, wait, ch=None, c=None):
+    def _wait(self, ready, wait, ch=None, c=None, sid=None):
         """Block until ready() is truthy or `wait` seconds passed.
 
-        Given the channel the caller holds, returns GONE as soon as that
-        channel is revoked, so a long-poll does not outlive its pairing.
+        Given the channel the caller holds (and, for a signer, its id),
+        returns GONE as soon as that channel or signer is revoked, so a
+        long-poll does not outlive its pairing.
         """
         deadline = time.monotonic() + max(0.0, min(float(wait or 0), MAX_WAIT))
         while True:
-            if c is not None and self.channels.get(ch) is not c:
+            if c is not None and (self.channels.get(ch) is not c
+                                  or (sid is not None and sid not in c["signers"])):
                 return self.GONE
             result = ready()
             remaining = deadline - time.monotonic()
@@ -299,10 +304,33 @@ class Relay:
             if len(self.channels) >= MAX_CHANNELS:
                 return 200, {"state": "full"}
             self.channels[ch] = {"agent_auth": auths[0], "pair_auth": auths[1], "hello": hello,
-                                 "answer": None, "created": int(self.now()), "signers": {}}
+                                 "answer": None, "created": int(self.now()), "signers": {},
+                                 "pair_until": int(self.now()) + PAIR_WINDOW}
             self._save()
         log(f"channel {ch[:8]} created")
         return 200, {"state": "created"}
+
+    def open_pairing(self, ch, token, body):
+        """Let one more device pair with an existing channel.
+
+        The agent sends a fresh pairing secret's token and a new hello; the
+        window and the one-time rule are those of a first pairing.
+        """
+        pair_auth, hello = body.get("pair_auth"), body.get("hello")
+        if not (isinstance(pair_auth, str) and HASH_RE.match(pair_auth)
+                and isinstance(hello, str) and len(hello) <= MAX_BLOB):
+            return self.BAD
+        with self.cond:
+            c, _ = self._channel(ch, token, "agent")
+            if c is None:
+                return self.DENIED
+            if len(c["signers"]) >= MAX_SIGNERS:
+                return 200, {"state": "full"}
+            c.update(pair_auth=pair_auth, hello=hello, answer=None,
+                     pair_until=int(self.now()) + PAIR_WINDOW)
+            self._save()
+        log(f"channel {ch[:8]} open for one more device")
+        return 200, {"state": "open"}
 
     def get_hello(self, ch, token):
         with self.cond:
@@ -321,6 +349,8 @@ class Relay:
             c, _ = self._channel(ch, token, "pair")
             if c is None:
                 return self.DENIED
+            if len(c["signers"]) >= MAX_SIGNERS or signer in c["signers"]:
+                return 200, {"state": "full"}
             c["signers"][signer] = {"auth": auth, "sub": None}
             c["answer"] = {"signer": signer, "msg": msg}
             c["pair_auth"] = None   # the pairing secret works once
@@ -341,27 +371,46 @@ class Relay:
                 return 204, None
             return 200, {"state": "answered", **answer}
 
-    def revoke(self, ch, token):
-        """Delete a pairing. Either end may do it, with its own token.
+    def revoke(self, ch, token, body=None):
+        """Revoke a pairing, or one device of it.
 
-        The channel, the signer's push subscription and the pending
-        requests go; long-polls on the channel return 401. A channel that
-        no longer exists answers 401 like a wrong token: the relay does
-        not tell who asks whether a channel exists.
+        The agent's token revokes the whole channel, or with `signer` in
+        the body only that device. A signer's token revokes that signer.
+        A channel left without any device goes too. What goes with a
+        device: its push subscription and the requests addressed to it;
+        long-polls on what was revoked return 401. A channel that no longer
+        exists answers 401 like a wrong token: the relay does not tell who
+        asks whether a channel exists.
         """
+        target = (body or {}).get("signer")
+        if target is not None and not (isinstance(target, str) and SIGNER_RE.match(target)):
+            return self.BAD
         with self.cond:
             c, _ = self._channel(ch, token, "agent")
             by = "agent"
             if c is None:
-                c, _ = self._channel(ch, token, "signer")
+                if target is not None:
+                    return self.DENIED
+                c, target = self._channel(ch, token, "signer")
                 by = "signer"
             if c is None:
                 return self.DENIED
-            del self.channels[ch]
-            self.pending.pop(ch, None)
+            if target is not None:
+                if target not in c["signers"]:
+                    return 200, {"state": "unknown-signer"}
+                del c["signers"][target]
+                for rid, e in list(self.pending.get(ch, {}).items()):
+                    if e["to"] == target:
+                        del self.pending[ch][rid]
+            if target is None or not c["signers"]:
+                del self.channels[ch]
+                self.pending.pop(ch, None)
+                what = "channel"
+            else:
+                what = f"signer {target[:4]}"
             self._save()
             self.cond.notify_all()
-        log(f"channel {ch[:8]} revoked by the {by}")
+        log(f"channel {ch[:8]}: {what} revoked by the {by}")
         return 200, {"state": "revoked"}
 
     # -- signer side --
@@ -404,9 +453,12 @@ class Relay:
                 if known is None:
                     return current
                 return [current] if {r["id"] for r in current} != known else None
-            if self._wait(news, wait, ch, c) is self.GONE:
+            if self._wait(news, wait, ch, c, sid) is self.GONE:
                 return self.DENIED
-            return 200, {"requests": waiting()}
+            current = waiting()
+            for r in current:   # the agent may ask whether its request was picked up
+                self.pending[ch][r["id"]]["seen"] = True
+            return 200, {"requests": current}
 
     def post_response(self, ch, token, rid, body):
         msg = body.get("msg")
@@ -452,12 +504,25 @@ class Relay:
             live = sum(1 for e in entries.values() if e["response"] is None and e["exp"] > now)
             if live >= MAX_PENDING:
                 return 200, {"state": "busy"}
-            entries[rid] = {"to": to, "exp": exp, "msg": msg, "response": None}
+            entries[rid] = {"to": to, "exp": exp, "msg": msg, "response": None, "seen": False}
             sub = signer["sub"]
             self.cond.notify_all()
         if sub and self.push:
             threading.Thread(target=self._wake, args=(ch, to, sub), daemon=True).start()
         return 200, {"state": "queued", "push": bool(sub and self.push)}
+
+    def cancel(self, ch, token, rid):
+        """The agent gave up on a request: the device no longer offers it."""
+        with self.cond:
+            c, _ = self._channel(ch, token, "agent")
+            if c is None:
+                return self.DENIED
+            e = self.pending.get(ch, {}).get(rid)
+            if e is None or e["response"] is not None:
+                return 200, {"state": "unknown"}
+            e["exp"] = min(e["exp"], self.now())
+            self.cond.notify_all()
+        return 200, {"state": "cancelled"}
 
     def _wake(self, ch, sid, sub):
         outcome, gone = self.push.send(sub, {"t": "sign"})   # content-free
@@ -469,7 +534,11 @@ class Relay:
                     signer["sub"] = None
                     self._save()
 
-    def get_response(self, ch, token, rid, wait=0):
+    def get_response(self, ch, token, rid, wait=0, report_seen=False):
+        """The answer to a request. "Nothing yet" is 204, or with
+        `report_seen` 200 `pending` saying whether the device has fetched
+        the request: an agent with another device to fall back on gives up
+        on one that never picked it up."""
         with self.cond:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
@@ -491,7 +560,12 @@ class Relay:
             result = self._wait(settled, wait, ch, c)
             if result is self.GONE:
                 return self.DENIED
-            return (200, result) if result else (204, None)
+            if result:
+                return 200, result
+            if report_seen:
+                e = self.pending.get(ch, {}).get(rid)
+                return 200, {"state": "pending", "seen": bool(e and e.get("seen"))}
+            return 204, None
 
 
 # ---- HTTP ------------------------------------------------------------------
@@ -528,8 +602,8 @@ ICON_ALIAS = re.compile(r"^/(apple-touch-icon[0-9a-z-]*\.png|favicon\.ico|icon\.
 MAIN_ICON = "/clavix-icon-180.png"
 
 
-ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|subscription|requests|revoke|"
-                   r"responses/([0-9a-f]{32}))$")
+ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|pair/open|subscription|requests|revoke|"
+                   r"responses/([0-9a-f]{32})|requests/([0-9a-f]{32})/cancel)$")
 
 
 def make_handler(relay, static, vapid_public):
@@ -616,8 +690,9 @@ def make_handler(relay, static, vapid_public):
                 except ValueError:
                     return self.reply(400, {"error": "bad request"})
                 return self.reply(*relay.get_requests(ch, self.token(), self.wait(url.query), known))
-            if rid:
-                return self.reply(*relay.get_response(ch, self.token(), rid, self.wait(url.query)))
+            if rid and what.startswith("responses/"):
+                seen = urllib.parse.parse_qs(url.query).get("seen") == ["1"]
+                return self.reply(*relay.get_response(ch, self.token(), rid, self.wait(url.query), seen))
             return self.reply(404, {"error": "not found"})
 
         do_HEAD = do_GET
@@ -638,10 +713,14 @@ def make_handler(relay, static, vapid_public):
             if what == "subscription":
                 return self.reply(*relay.put_subscription(ch, self.token(), body))
             if what == "revoke":
-                return self.reply(*relay.revoke(ch, self.token()))
+                return self.reply(*relay.revoke(ch, self.token(), body))
+            if what == "pair/open":
+                return self.reply(*relay.open_pairing(ch, self.token(), body))
+            if m.group(4):
+                return self.reply(*relay.cancel(ch, self.token(), m.group(4)))
             if what == "requests":
                 return self.reply(*relay.post_request(ch, self.token(), body))
-            if rid:
+            if rid and what.startswith("responses/"):
                 return self.reply(*relay.post_response(ch, self.token(), rid, body))
             return self.reply(404, {"error": "not found"})
 

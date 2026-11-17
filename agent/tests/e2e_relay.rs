@@ -532,3 +532,219 @@ fn version_names_the_package_version() {
         format!("clavix-agent {}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+// ---- several devices ------------------------------------------------------
+
+impl Bench {
+    /// `clavix-agent` with these arguments: (success, stdout, stderr).
+    fn cli(&self, args: &[&str]) -> (bool, String, String) {
+        let out = Command::new(AGENT)
+            .args(args)
+            .env("CLAVIX_AGENT_DIR", self.path("agent-state"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Pair a second fake phone, keeping its state in `file`, and let the
+    /// server accept its key too. Returns its public key.
+    fn add_device(&self, file: &str) -> String {
+        let mut pair = Command::new(AGENT);
+        pair.args(["pair", "--add", "--yes"])
+            .env("CLAVIX_AGENT_DIR", self.path("agent-state"));
+        let pairing = Lines::spawn(pair);
+        let code = pairing.next("pairing code", |line| {
+            line.trim()
+                .starts_with("cva1-")
+                .then(|| line.trim().to_string())
+        });
+        let phone = Command::new("node")
+            .arg(repo().join("tools/fake-phone.mjs"))
+            .args([
+                "pair",
+                "--relay",
+                &self.relay_url,
+                "--code",
+                &code,
+                "--state",
+            ])
+            .arg(self.path(file))
+            .output()
+            .unwrap();
+        assert!(
+            phone.status.success(),
+            "{}",
+            String::from_utf8_lossy(&phone.stderr)
+        );
+        let paired: Value = serde_json::from_slice(&phone.stdout).unwrap();
+        let key = paired["publicKey"].as_str().unwrap().to_string();
+        pairing.next("the new key from the agent", |line| {
+            (line == key).then_some(())
+        });
+        let authorized = self.dir.path().join("authorized_keys");
+        let mut lines = std::fs::read_to_string(&authorized).unwrap();
+        lines.push_str(&format!("{key}\n"));
+        std::fs::write(&authorized, lines).unwrap();
+        key
+    }
+
+    /// Device ids, in the order `devices` lists them.
+    fn device_ids(&self) -> Vec<String> {
+        let (ok, out, err) = self.cli(&["devices"]);
+        assert!(ok, "{err}");
+        out.lines()
+            .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+            .collect()
+    }
+
+    fn agent_with(&self, args: &[&str]) -> (Kill, PathBuf) {
+        let socket = self.path("agent.sock");
+        let _ = std::fs::remove_file(&socket);
+        let child = Command::new(AGENT)
+            .arg("run")
+            .args(args)
+            .arg("--socket")
+            .arg(&socket)
+            .env("CLAVIX_AGENT_DIR", self.path("agent-state"))
+            .stdin(Stdio::null())
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.path("agent.log"))
+                    .unwrap(),
+            )
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(Instant::now() < deadline, "agent did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (Kill(child), socket)
+    }
+
+    fn phone_at(&self, file: &str, extra: &[&str]) -> Lines {
+        let mut command = Command::new("node");
+        command
+            .arg(repo().join("tools/fake-phone.mjs"))
+            .args(["run", "--state"])
+            .arg(self.path(file))
+            .args(extra);
+        let phone = Lines::spawn(command);
+        phone.event("ready");
+        phone
+    }
+}
+
+#[test]
+fn a_second_device_takes_over_when_the_first_does_not_pick_up() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    let second = bench.add_device("phone2.json");
+    let ids = bench.device_ids();
+    assert_eq!(ids.len(), 2);
+    let (_, keys, _) = bench.cli(&["pubkey"]);
+    assert_eq!(
+        keys.lines().collect::<Vec<_>>(),
+        vec![bench.public_key.as_str(), second.as_str()]
+    );
+
+    // The first device is off: only the second one answers.
+    let (agent, socket) = bench.agent_with(&["--timeout", "30", "--pickup", "3"]);
+    let phone = bench.phone_at("phone2.json", &[]);
+    let started = Instant::now();
+    let (ok, out, err) = ssh(&socket, bench.sshd.port);
+    assert!(ok, "ssh failed: {err}\n{}", bench.agent_log());
+    assert!(out.contains("signed-in"));
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "took {:?}",
+        started.elapsed()
+    );
+    phone.event("signed");
+    assert!(bench
+        .agent_log()
+        .contains("did not pick the request up within 3 s"));
+    drop(agent);
+
+    // Offered first, the second device signs at once.
+    let (ok, out, _) = bench.cli(&["devices", "--first", &ids[1]]);
+    assert!(ok && out.contains("now offered first"), "{out}");
+    let (_, keys, _) = bench.cli(&["pubkey"]);
+    assert_eq!(keys.lines().next(), Some(second.as_str()));
+    let (_agent, socket) = bench.agent_with(&["--timeout", "30", "--pickup", "3"]);
+    let started = Instant::now();
+    let (ok, _, _) = ssh(&socket, bench.sshd.port);
+    assert!(ok);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    phone.event("signed");
+}
+
+#[test]
+fn a_denial_on_one_device_refuses_the_login_without_asking_the_other() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    bench.add_device("phone2.json");
+    let (_agent, socket) = bench.agent_with(&["--timeout", "30", "--pickup", "3"]);
+    let first = bench.phone_at("phone.json", &["--deny"]);
+    let second = bench.phone_at("phone2.json", &[]);
+    let (ok, _, _) = ssh(&socket, bench.sshd.port);
+    assert!(!ok, "a refusal must refuse the login");
+    first.event("denied");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(second.nothing_more(), "the other device must not be asked");
+}
+
+#[test]
+fn one_device_can_be_unpaired_alone_from_either_end() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    let second = bench.add_device("phone2.json");
+    bench.add_device("phone3.json");
+    let ids = bench.device_ids();
+
+    // From the agent: the first device.
+    let first = bench.phone_at("phone.json", &[]);
+    let (ok, out, err) = bench.cli(&["unpair", "--device", &ids[0]]);
+    assert!(ok, "{err}");
+    assert!(out.contains("Device revoked on the relay."), "{out}");
+    assert!(out.contains(&bench.public_key), "{out}");
+    first.event("revoked");
+    assert_eq!(bench.device_ids(), ids[1..].to_vec());
+
+    // From a device: the third forgets itself; the channel stays.
+    let revoked = Command::new("node")
+        .arg(repo().join("tools/fake-phone.mjs"))
+        .args(["revoke", "--state"])
+        .arg(bench.path("phone3.json"))
+        .output()
+        .unwrap();
+    let event: Value = serde_json::from_slice(&revoked.stdout).unwrap();
+    assert_eq!(event["deleted"], true);
+
+    // The second device still signs.
+    let (_agent, socket) = bench.agent_with(&["--timeout", "30"]);
+    let phone = bench.phone_at("phone2.json", &[]);
+    let (ok, _, err) = ssh(&socket, bench.sshd.port);
+    assert!(ok, "{err}\n{}", bench.agent_log());
+    assert_eq!(phone.event("signed")["state"], "accepted");
+    let _ = second;
+
+    // The agent still lists the third until told: asking it fails clearly.
+    let (ok, out, _) = bench.cli(&["unpair", "--device", &ids[2]]);
+    assert!(ok);
+    assert!(out.contains("no longer knew this device"), "{out}");
+    assert_eq!(bench.device_ids(), vec![ids[1].clone()]);
+}

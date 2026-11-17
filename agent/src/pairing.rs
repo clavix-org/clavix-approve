@@ -107,6 +107,27 @@ impl Offer {
         }
     }
 
+    /// A pairing of one more device on an existing channel: same channel,
+    /// same agent keys and token, a fresh one-time secret.
+    pub fn for_channel(existing: &state::State) -> Result<Self, String> {
+        let field = |b64: &str| unb64u(b64).ok_or("corrupt state: bad base64");
+        let identity = Identity::from_secrets(
+            &field(&existing.kem_private)?,
+            &field(&existing.sig_private)?,
+        )?;
+        let ch: [u8; 16] = crate::relay::unhex(&existing.ch)
+            .and_then(|v| v.try_into().ok())
+            .ok_or("corrupt state: bad channel id")?;
+        let secret = random::<16>();
+        Ok(Self {
+            ch: existing.ch.clone(),
+            code: format!("{CODE_PREFIX}{}", b64u(&[ch, secret].concat())),
+            agent_token: existing.agent_token.clone(),
+            identity,
+            secret,
+        })
+    }
+
     /// Our public keys, authenticated by the pairing secret.
     fn hello(&self, label: &str) -> String {
         let (kem, sig) = (self.identity.kem_public(), self.identity.sig_public());
@@ -143,6 +164,38 @@ impl Offer {
             Some("created") => Ok(()),
             other => Err(format!(
                 "the relay did not create the channel ({})",
+                other.unwrap_or("?")
+            )),
+        }
+    }
+
+    /// Open the existing channel to one more device (see `for_channel`).
+    pub async fn open_on_channel(&self, client: &RelayClient, label: &str) -> Result<(), String> {
+        let body = json!({
+            "pair_auth": token_auth(&pair_token(&self.secret)),
+            "hello": self.hello(label),
+        });
+        let answer = client
+            .post(
+                &format!("/api/ch/{}/pair/open", self.ch),
+                &self.agent_token,
+                &body,
+            )
+            .await
+            .map_err(|e| match e {
+                crate::relay::RelayError::Status(401) => {
+                    "the relay no longer knows this pairing; run `clavix-agent pair` without --add"
+                        .to_string()
+                }
+                e => e.to_string(),
+            })?;
+        match answer.get("state").and_then(Value::as_str) {
+            Some("open") => Ok(()),
+            Some("full") => {
+                Err("this pairing already has as many devices as the relay allows".into())
+            }
+            other => Err(format!(
+                "the relay did not open the pairing ({})",
                 other.unwrap_or("?")
             )),
         }

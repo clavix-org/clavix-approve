@@ -168,6 +168,89 @@ class RelayTest(unittest.TestCase):
         self.relay.revoke(CH, AGENT)
         self.assertEqual(self.relay.get_hello(other, PAIR), (200, {"hello": "hi"}))
 
+    # -- several devices --
+
+    def add_device(self, signer="2" * 16, token="phone2", pair="pair2"):
+        self.assertEqual(self.relay.open_pairing(CH, AGENT, {"pair_auth": R.digest(pair), "hello": "hi2"}),
+                         (200, {"state": "open"}))
+        return self.relay.post_pair(CH, pair, {"signer": signer, "signer_auth": R.digest(token), "msg": "a2"})
+
+    def test_a_second_device_pairs_on_the_same_channel(self):
+        self.pair()
+        self.assertEqual(self.relay.get_hello(CH, PAIR)[0], 401)   # the first secret worked once
+        self.assertEqual(self.add_device(), (200, {"state": "paired"}))
+        self.assertEqual(self.relay.get_pair_answer(CH, AGENT)[1]["signer"], "2" * 16)
+        # Each device sees only what is addressed to it.
+        self.request()
+        self.assertEqual(len(self.relay.get_requests(CH, PHONE)[1]["requests"]), 1)
+        self.assertEqual(self.relay.get_requests(CH, "phone2")[1]["requests"], [])
+        # Only the agent opens a pairing, and the new secret works once too.
+        self.assertEqual(self.relay.open_pairing(CH, PHONE, {"pair_auth": R.digest("x"), "hello": "h"})[0], 401)
+        self.assertEqual(self.relay.post_pair(CH, "pair2", {
+            "signer": "3" * 16, "signer_auth": R.digest("p3"), "msg": "m"})[0], 401)
+
+    def test_devices_are_capped_and_the_window_closes(self):
+        self.pair()
+        for i in range(2, R.MAX_SIGNERS + 1):
+            self.assertEqual(self.add_device(str(i) * 16, f"t{i}", f"p{i}")[1]["state"], "paired")
+        self.assertEqual(self.relay.open_pairing(CH, AGENT, {"pair_auth": R.digest("p9"), "hello": "h"}),
+                         (200, {"state": "full"}))
+        self.relay.revoke(CH, AGENT, {"signer": "2" * 16})
+        self.relay.open_pairing(CH, AGENT, {"pair_auth": R.digest("late"), "hello": "h"})
+        self.clock.t += R.PAIR_WINDOW + 1
+        self.assertEqual(self.relay.get_hello(CH, "late")[0], 401)
+
+    def test_one_device_can_be_revoked_alone(self):
+        self.pair()
+        self.add_device()
+        self.request()
+        # By the agent, naming the device.
+        self.assertEqual(self.relay.revoke(CH, AGENT, {"signer": SIGNER}), (200, {"state": "revoked"}))
+        self.assertEqual(self.relay.get_requests(CH, PHONE)[0], 401)
+        self.assertEqual(self.relay.get_requests(CH, "phone2")[0], 200)
+        self.assertEqual(self.relay.get_response(CH, AGENT, RID), (200, {"state": "unknown"}))   # its requests went
+        self.assertEqual(self.relay.revoke(CH, AGENT, {"signer": SIGNER}), (200, {"state": "unknown-signer"}))
+        self.assertEqual(self.relay.revoke(CH, AGENT, {"signer": "nope"})[0], 400)
+        # A device cannot name another one.
+        self.assertEqual(self.relay.revoke(CH, "phone2", {"signer": "2" * 16})[0], 401)
+        # The last device leaving takes the channel with it.
+        self.assertEqual(self.relay.revoke(CH, "phone2"), (200, {"state": "revoked"}))
+        self.assertNotIn(CH, self.saved_state())
+
+    def test_a_device_revoking_itself_leaves_the_others(self):
+        self.pair()
+        self.add_device()
+        got = []
+        waiter = threading.Thread(target=lambda: got.append(
+            self.relay.get_requests(CH, PHONE, wait=10, known=set())[0]))
+        waiter.start()
+        import time
+        time.sleep(0.2)
+        self.assertEqual(self.relay.revoke(CH, PHONE), (200, {"state": "revoked"}))
+        waiter.join(5)
+        self.assertEqual(got, [401])
+        self.assertEqual(self.relay.get_requests(CH, "phone2")[0], 200)
+        self.assertEqual(self.request("2" * 32)[1]["state"], "unknown-signer")
+
+    def test_the_agent_learns_whether_the_device_picked_the_request_up(self):
+        self.pair()
+        self.request()
+        self.assertEqual(self.relay.get_response(CH, AGENT, RID), (204, None))
+        self.assertEqual(self.relay.get_response(CH, AGENT, RID, report_seen=True),
+                         (200, {"state": "pending", "seen": False}))
+        self.relay.get_requests(CH, PHONE)
+        self.assertEqual(self.relay.get_response(CH, AGENT, RID, report_seen=True),
+                         (200, {"state": "pending", "seen": True}))
+
+    def test_a_cancelled_request_is_no_longer_offered(self):
+        self.pair()
+        self.request()
+        self.assertEqual(self.relay.cancel(CH, PHONE, RID)[0], 401)
+        self.assertEqual(self.relay.cancel(CH, AGENT, RID), (200, {"state": "cancelled"}))
+        self.assertEqual(self.relay.get_requests(CH, PHONE), (200, {"requests": []}))
+        self.assertEqual(self.relay.post_response(CH, PHONE, RID, {"msg": "late"}), (200, {"state": "expired"}))
+        self.assertEqual(self.relay.cancel(CH, AGENT, "f" * 32), (200, {"state": "unknown"}))
+
     # -- requests and responses --
 
     def test_request_reaches_the_signer_and_the_answer_reaches_the_agent(self):
@@ -368,6 +451,25 @@ class HttpTest(unittest.TestCase):
         self.assertEqual((status, json.loads(body)), (200, {"state": "revoked"}))
         self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests", token=PHONE)[0], 401)
         self.assertEqual(self.call("POST", f"/api/ch/{CH}/revoke", token=AGENT, body={})[0], 401)
+
+    def test_devices_pickup_and_cancel_over_http(self):
+        import time
+        self.call("POST", "/api/channels", token=ENROLL, body={
+            "ch": CH, "agent_auth": R.digest(AGENT), "pair_auth": R.digest(PAIR), "hello": "hi"})
+        self.call("POST", f"/api/ch/{CH}/pair", token=PAIR, body={
+            "signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "answer"})
+        status, _, body = self.call("POST", f"/api/ch/{CH}/pair/open", token=AGENT,
+                                    body={"pair_auth": R.digest("p2"), "hello": "h2"})
+        self.assertEqual((status, json.loads(body)), (200, {"state": "open"}))
+        self.call("POST", f"/api/ch/{CH}/requests", token=AGENT, body={
+            "id": RID, "to": SIGNER, "exp": time.time() + 30, "msg": "sealed"})
+        status, _, body = self.call("GET", f"/api/ch/{CH}/responses/{RID}?wait=0&seen=1", token=AGENT)
+        self.assertEqual((status, json.loads(body)), (200, {"state": "pending", "seen": False}))
+        self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests/{RID}/cancel", token=AGENT)[0], 404)
+        status, _, body = self.call("POST", f"/api/ch/{CH}/requests/{RID}/cancel", token=AGENT, body={})
+        self.assertEqual((status, json.loads(body)), (200, {"state": "cancelled"}))
+        status, _, body = self.call("POST", f"/api/ch/{CH}/revoke", token=AGENT, body={"signer": SIGNER})
+        self.assertEqual((status, json.loads(body)), (200, {"state": "revoked"}))
 
     def test_known_parameter_over_http(self):
         self.call("POST", "/api/channels", token=ENROLL, body={

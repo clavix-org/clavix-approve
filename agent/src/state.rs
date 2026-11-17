@@ -1,5 +1,5 @@
 //! What the agent keeps on disk: where the relay is, how to authenticate
-//! to it, and which signer it is paired with. No private SSH key, ever.
+//! to it, and which devices it is paired with. No private SSH key, ever.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,10 +23,27 @@ pub struct State {
     /// they cannot sign an SSH login.
     pub kem_private: String,
     pub sig_private: String,
-    pub signer: Signer,
+    /// The paired devices, in the order their keys are offered to `ssh`:
+    /// the first is tried first.
+    pub signers: Vec<Signer>,
 }
 
-/// The paired device.
+/// As written before several devices could be paired: a single `signer`.
+#[derive(Deserialize)]
+struct OnDisk {
+    relay: String,
+    ch: String,
+    agent_token: String,
+    label: String,
+    kem_private: String,
+    sig_private: String,
+    #[serde(default)]
+    signers: Vec<Signer>,
+    #[serde(default)]
+    signer: Option<Signer>,
+}
+
+/// A paired device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Signer {
     /// Signer id on the channel (16 hex digits).
@@ -53,8 +70,24 @@ pub fn default_dir() -> Option<PathBuf> {
 
 pub fn load(dir: &Path) -> std::io::Result<State> {
     let raw = std::fs::read(dir.join(FILE))?;
-    serde_json::from_slice(&raw)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+    let disk: OnDisk = serde_json::from_slice(&raw).map_err(|e| invalid(e.to_string()))?;
+    let mut signers = disk.signers;
+    if signers.is_empty() {
+        signers.extend(disk.signer);
+    }
+    if signers.is_empty() {
+        return Err(invalid("no paired device".into()));
+    }
+    Ok(State {
+        relay: disk.relay,
+        ch: disk.ch,
+        agent_token: disk.agent_token,
+        label: disk.label,
+        kem_private: disk.kem_private,
+        sig_private: disk.sig_private,
+        signers,
+    })
 }
 
 /// Write the state, readable by the current user only, replacing any
@@ -104,12 +137,7 @@ mod tests {
             label: "build-box".into(),
             kem_private: "a2Vt".into(),
             sig_private: "c2ln".into(),
-            signer: Signer {
-                id: "cd".repeat(8),
-                public_key: "ecdsa-sha2-nistp256 AAAA phone".into(),
-                kem_public: "a2Vt".into(),
-                sig_public: "c2ln".into(),
-            },
+            signers: vec![signer("cd"), signer("ef")],
         };
         save(&dir, &state).unwrap();
         assert_eq!(load(&dir).unwrap(), state);
@@ -119,6 +147,33 @@ mod tests {
         // Saving again replaces the file.
         save(&dir, &state).unwrap();
         assert!(!dir.join(format!("{FILE}.tmp")).exists());
+    }
+
+    fn signer(id: &str) -> Signer {
+        Signer {
+            id: id.repeat(8),
+            public_key: format!("ecdsa-sha2-nistp256 AAAA{id} phone"),
+            kem_public: "a2Vt".into(),
+            sig_public: "c2ln".into(),
+        }
+    }
+
+    #[test]
+    fn a_state_from_before_several_devices_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = serde_json::json!({
+            "relay": "https://relay.example", "ch": "ab".repeat(16), "agent_token": "t",
+            "label": "box", "kem_private": "k", "sig_private": "s",
+            "signer": { "id": "cd".repeat(8), "public_key": "ecdsa-sha2-nistp256 AAAAcd phone",
+                        "kem_public": "a2Vt", "sig_public": "c2ln" },
+        });
+        std::fs::write(tmp.path().join(FILE), old.to_string()).unwrap();
+        let state = load(tmp.path()).unwrap();
+        assert_eq!(state.signers, vec![signer("cd")]);
+        // Written back in the new form.
+        save(tmp.path(), &state).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        assert!(raw.contains("\"signers\"") && !raw.contains("\"signer\""));
     }
 
     #[test]
