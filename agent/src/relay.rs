@@ -59,6 +59,16 @@ pub fn random<const N: usize>() -> [u8; N] {
     out
 }
 
+pub fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// What the relay stores of a bearer token.
 pub fn token_auth(token: &str) -> String {
     hex(&Sha256::digest(token.as_bytes()))
@@ -185,6 +195,33 @@ pub async fn revoke(client: &RelayClient, ch: &str, token: &str) -> Result<bool,
     }
 }
 
+/// Revoke one device of the pairing. `Ok(true)` when this call removed it,
+/// `Ok(false)` when the relay no longer knew it (or the whole pairing).
+pub async fn revoke_device(
+    client: &RelayClient,
+    ch: &str,
+    token: &str,
+    signer: &str,
+) -> Result<bool, RelayError> {
+    match client
+        .post(
+            &format!("/api/ch/{ch}/revoke"),
+            token,
+            &json!({ "signer": signer }),
+        )
+        .await
+    {
+        Ok(value) if state_of(&value) == "revoked" => Ok(true),
+        Ok(value) if state_of(&value) == "unknown-signer" => Ok(false),
+        Ok(value) => Err(RelayError::Protocol(format!(
+            "revocation not confirmed ({})",
+            state_of(&value)
+        ))),
+        Err(RelayError::Status(401)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// A relay failure as the agent reports it. A 401 on a paired channel
 /// means the pairing is gone, most likely revoked from the device.
 fn relay_failure(e: RelayError) -> SignError {
@@ -207,60 +244,96 @@ fn state_of(value: &Value) -> &str {
 /// is the only one in the request (no forwarded agent in between).
 type HintFn = Arc<dyn Fn(&[u8], Option<&CallerInfo>, bool) -> Option<String> + Send + Sync>;
 
-/// Sends each sign job to the paired device and waits for its answer.
+/// A paired device, as given to `RelaySigner::new`.
+pub struct Device {
+    /// Signer id on the channel.
+    pub id: String,
+    /// Its SSH public key, as an `authorized_keys` line.
+    pub public_key: String,
+    /// Its channel keys, agreed at pairing.
+    pub peer: Peer,
+}
+
+struct DeviceKeys {
+    id: String,
+    identity: Identity,
+    peer: Arc<Peer>,
+}
+
+/// Sends each sign job to the device holding the requested key and waits
+/// for its answer.
 pub struct RelaySigner {
     client: RelayClient,
     ch: String,
     token: String,
-    signer_id: String,
     label: String,
-    identity: Identity,
-    /// Our channel keys and the paired device's.
+    /// In the order their keys are offered to `ssh`.
+    devices: Vec<DeviceKeys>,
+    /// Our channel keys.
     me: Arc<channel::Identity>,
-    peer: Arc<Peer>,
     timeout: Duration,
+    /// With more than one device: how long a device may take to fetch a
+    /// request before the agent gives up on it, so that `ssh` moves on to
+    /// the next key instead of waiting for the full timeout.
+    pickup: Option<Duration>,
     hints: HintFn,
     slots: Arc<Semaphore>,
     backoff_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl RelaySigner {
-    /// `public_key` is the signer's `authorized_keys` line; `me` and
-    /// `peer` are the channel keys agreed at pairing.
-    #[allow(clippy::too_many_arguments)]
+    /// `me` holds the agent's channel keys; `devices` the paired devices,
+    /// in the order their keys are offered.
     pub fn new(
         client: RelayClient,
         ch: &str,
         token: &str,
-        signer_id: &str,
-        public_key: &str,
         label: &str,
         me: channel::Identity,
-        peer: Peer,
+        devices: Vec<Device>,
         timeout: Duration,
     ) -> Result<Self, String> {
-        let key = ssh_key::PublicKey::from_openssh(public_key)
-            .map_err(|e| format!("invalid signer public key: {e}"))?;
-        let identity = Identity {
-            key_blob: key
-                .to_bytes()
-                .map_err(|e| format!("signer public key: {e}"))?,
-            comment: key.comment().to_string(),
-        };
+        if devices.is_empty() {
+            return Err("no paired device".into());
+        }
+        let devices = devices
+            .into_iter()
+            .map(|d| {
+                let key = ssh_key::PublicKey::from_openssh(&d.public_key)
+                    .map_err(|e| format!("invalid signer public key: {e}"))?;
+                Ok(DeviceKeys {
+                    id: d.id,
+                    identity: Identity {
+                        key_blob: key
+                            .to_bytes()
+                            .map_err(|e| format!("signer public key: {e}"))?,
+                        comment: key.comment().to_string(),
+                    },
+                    peer: Arc::new(d.peer),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
             client,
             ch: ch.to_string(),
             token: token.to_string(),
-            signer_id: signer_id.to_string(),
             label: label.to_string(),
-            identity,
+            devices,
             me: Arc::new(me),
-            peer: Arc::new(peer),
             timeout,
+            pickup: None,
             hints: Arc::new(|_, _, _| None),
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             backoff_until: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Give up on a device that has not fetched a request after `pickup`
+    /// (zero: never). Only with more than one device: alone, there is no
+    /// other key to fall back on.
+    pub fn with_pickup(mut self, pickup: Duration) -> Self {
+        self.pickup = (!pickup.is_zero()).then_some(pickup);
+        self
     }
 
     /// Name a host key for display on the device (from `known_hosts`, or
@@ -341,22 +414,32 @@ fn read_response(inner: &Value, id: &str, sent: &str) -> Result<Vec<u8>, SignErr
 
 impl Signer for RelaySigner {
     fn identities(&self) -> Vec<Identity> {
-        vec![self.identity.clone()]
+        self.devices.iter().map(|d| d.identity.clone()).collect()
     }
 
     fn sign(&self, job: SignJob) -> SignFuture {
+        let Some(device) = self
+            .devices
+            .iter()
+            .find(|d| d.identity.key_blob == job.key_blob)
+        else {
+            return Box::pin(async {
+                Err(SignError::Backend("no paired device holds this key".into()))
+            });
+        };
+        let pickup = self.pickup.filter(|_| self.devices.len() > 1);
         let id = hex(&random::<16>());
         let now = unix_now();
         let exp = now + self.timeout.as_secs();
         let sealed = channel::seal(
             &self.me,
-            &self.peer,
-            &request_header(&self.ch, &self.signer_id, &id, exp),
+            &device.peer,
+            &request_header(&self.ch, &device.id, &id, exp),
             &self.request_body(&job, &id, now, exp),
         );
-        let answer_header = response_header(&self.ch, &self.signer_id, &id);
-        let (me, peer) = (self.me.clone(), self.peer.clone());
-        let to = self.signer_id.clone();
+        let answer_header = response_header(&self.ch, &device.id, &id);
+        let (me, peer) = (self.me.clone(), device.peer.clone());
+        let to = device.id.clone();
 
         let client = self.client.clone();
         let token = self.token.clone();
@@ -387,6 +470,12 @@ impl Signer for RelaySigner {
                 .post(&format!("{base}/requests"), &token, &envelope)
                 .await
                 .map_err(relay_failure)?;
+            if state_of(&queued) == "unknown-signer" {
+                return Err(SignError::Backend(format!(
+                    "device {to} is no longer paired (forgotten on the device?); \
+                     run `clavix-agent unpair --device {to}`"
+                )));
+            }
             if state_of(&queued) != "queued" {
                 return Err(SignError::Backend(format!(
                     "relay did not queue the request ({})",
@@ -394,17 +483,40 @@ impl Signer for RelaySigner {
                 )));
             }
 
+            let pickup_at = pickup.map(|p| (Instant::now() + p, p));
+            let mut seen = false;
             let answer = loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return Err(SignError::Expired);
                 }
                 // Never ask the relay to hold the connection past the expiry.
-                let wait = (left.as_secs() + 1).min(POLL_SECONDS);
-                let poll = format!("{base}/responses/{id}?wait={wait}");
+                let mut wait = (left.as_secs() + 1).min(POLL_SECONDS);
+                if let (Some((at, allowed)), false) = (pickup_at, seen) {
+                    let until = at.saturating_duration_since(Instant::now());
+                    if until.is_zero() {
+                        // The device never fetched it: give up, so that
+                        // ssh tries the next key, and take it off the relay.
+                        let _ = client
+                            .post(&format!("{base}/requests/{id}/cancel"), &token, &json!({}))
+                            .await;
+                        return Err(SignError::Backend(format!(
+                            "device {to} did not pick the request up within {} s; \
+                             ssh may try the next device's key",
+                            allowed.as_secs()
+                        )));
+                    }
+                    wait = wait.min(until.as_secs().max(1));
+                }
+                let report = if pickup_at.is_some() { "&seen=1" } else { "" };
+                let poll = format!("{base}/responses/{id}?wait={wait}{report}");
                 match client.get(&poll, &token).await {
                     Ok(None) => continue,
                     Ok(Some(value)) => match state_of(&value) {
+                        "pending" => {
+                            seen |= value.get("seen").and_then(Value::as_bool) == Some(true);
+                            continue;
+                        }
                         "answered" => match value.get("msg").and_then(Value::as_str) {
                             Some(msg) => break msg.to_string(),
                             None => {

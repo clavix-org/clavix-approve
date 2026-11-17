@@ -160,7 +160,9 @@ Same origin as the page. JSON bodies, bearer tokens in `Authorization`.
 | `GET /api/ch/{ch}/requests?wait=&known=` | signer | pending requests |
 | `POST /api/ch/{ch}/responses/{id}` | signer | answer a request |
 | `GET /api/ch/{ch}/responses/{id}?wait=` | agent | fetch the answer |
-| `POST /api/ch/{ch}/revoke` | agent or signer | delete the pairing (body `{}`) |
+| `POST /api/ch/{ch}/pair/open` | agent | let one more device pair |
+| `POST /api/ch/{ch}/requests/{id}/cancel` | agent | withdraw a request (body `{}`) |
+| `POST /api/ch/{ch}/revoke` | agent or signer | revoke the pairing or one device |
 | `GET /api/vapid-public-key`, `GET /healthz` | none | |
 
 `wait` is a long-poll in seconds, capped at 25 and at the request's
@@ -178,29 +180,63 @@ channel, 300 s maximum lifetime, 15 minutes to complete a pairing.
 The push is VAPID-signed, `aes128gcm`-encrypted, and its payload is the
 constant `{"t":"sign"}`: the notification says only that a request waits.
 
+## Several devices
+
+A channel holds up to four signers, each with its own SSH key. To add one,
+the agent sends `POST /api/ch/{ch}/pair/open` with its own token and body
+`{ pair_auth, hello }`: the SHA-256 of a fresh pairing token and a new
+hello, exactly as when creating a channel. The pairing code then names the
+same channel with the new secret, and the rest of "Pairing" applies as is:
+same agent keys, same 15-minute window, the secret works once. The relay
+answers `full` when the channel already has four signers.
+
+The agent offers every device's key to `ssh`, in its own order
+(`clavix-agent devices`, `--first ID`). A sign request goes to the device
+whose key `ssh` chose; only that device can sign it. When it does not
+answer, `ssh` moves on to the next key once the agent fails the request:
+at the expiry, or sooner with the **pickup** rule below. A denial makes
+every request fail for 5 seconds, so the next key fails too: refusing on
+one device refuses the login.
+
+Pickup: with more than one device, the agent polls for the answer with
+`GET …/responses/{id}?seen=1`. "Nothing yet" is then `200 {"state":
+"pending", "seen": bool}`, `seen` telling whether the device has fetched
+the request. If it has not after `--pickup` seconds (default 20), the
+agent withdraws the request with `POST …/requests/{id}/cancel` (the device
+no longer receives it; a late answer gets `expired`) and fails it, so that
+`ssh` tries the next key at once instead of after the full timeout.
+
 ## Revocation
 
-Either end deletes its pairing with `POST /api/ch/{ch}/revoke` and its own
-token; the body is `{}`. It is a `POST` rather than a `DELETE` so that a
-proxy allowing only `GET`, `POST` and `HEAD` lets it through. The relay
-then forgets the channel, the signer's push subscription and the pending
-requests, and every long-poll on the channel returns `401`. The answer is
+`POST /api/ch/{ch}/revoke` revokes, with the caller's own token:
+
+| Token | Body | Revokes |
+|---|---|---|
+| agent | `{}` | the whole channel |
+| agent | `{"signer": id}` | that device (`unknown-signer` if it is not there) |
+| signer | `{}` | the calling device |
+
+What goes with a device: its push subscription and the requests addressed
+to it. A channel left without any device goes too. Long-polls on what was
+revoked return `401`. It is a `POST` rather than a `DELETE` so that a proxy
+allowing only `GET`, `POST` and `HEAD` lets it through. The answer is
 `200 {"state": "revoked"}`; a channel that no longer exists answers `401`,
 like a wrong token, so the relay does not tell who asks whether a channel
 exists. A client therefore takes `401` on revocation as "already revoked".
 
-- `clavix-agent unpair` revokes, then deletes its state file; when the
-  relay cannot be reached it changes nothing, unless given
-  `--local-only`. `clavix-agent pair` revokes the pairing it replaces,
-  once the new one is confirmed (best effort).
-- The page's "Oublier cette machine" revokes, then forgets the pairing,
-  keeping the SSH key and the pinned hosts; pairing again from the page
-  revokes the replaced pairing (best effort). On a `401` while
+- `clavix-agent unpair` revokes the whole pairing, `unpair --device ID`
+  one device; then it updates its state file. When the relay cannot be
+  reached it changes nothing, unless given `--local-only`. `clavix-agent
+  pair` (without `--add`) revokes the pairing it replaces, once the new
+  one is confirmed (best effort).
+- The page's "Oublier cette machine" revokes this device, then forgets the
+  pairing, keeping the SSH key and the pinned hosts; pairing again from
+  the page revokes the replaced pairing (best effort). On a `401` while
   long-polling it says the machine was removed, and does not forget the
   pairing by itself: a proxy that dropped the `Authorization` header would
   otherwise erase it.
 
-Revocation cuts the channel, not the key: the signer's SSH key still
+Revocation cuts the channel, not the key: a revoked device's SSH key still
 opens every server whose `authorized_keys` lists it. Both ends say so.
 
 ## Agent behaviour worth knowing
@@ -211,5 +247,5 @@ opens every server whose `authorized_keys` lists it. Both ends say so.
 - It contacts the relay only while one of its own requests is pending.
 - It logs one line per request: host key fingerprint, outcome, seconds
   waited.
-- Several signers per channel are possible in the format (`to`, signer
-  ids); the prototype pairs one.
+- With several devices, see "Several devices" for the order of the keys
+  and the pickup rule.
