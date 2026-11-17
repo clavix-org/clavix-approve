@@ -1,6 +1,6 @@
 [package]
 name = "clavix-agent"
-version = "0.1.5"
+version = "0.1.6"
 description = "Key-less SSH agent: every signature is produced by a remote signer after approval"
 edition = "2021"
 rust-version = "1.95"
