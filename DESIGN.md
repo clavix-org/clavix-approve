@@ -249,7 +249,7 @@ servers, short `ControlPersist`.
    approval screen. Android follows the same protocol.
 4. **Desktop integration:** the Clavix desktop agent can delegate a
    prompt to the phone when the screen is locked, and lists/revokes
-   paired signers.
+   paired signers. Proposal: [`DESKTOP_APPROVAL.md`](DESKTOP_APPROVAL.md).
 
 Each phase is usable on its own; 0 may conclude that 3 is not worth
 building.
