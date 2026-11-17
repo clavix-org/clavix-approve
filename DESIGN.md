@@ -246,7 +246,8 @@ servers, short `ControlPersist`.
    shared protocol core, with pairing, relay client and logging.
 2. **Reference relay**, self-hostable, single small service.
 3. **iOS app** with Secure Enclave key, notification extension and the
-   approval screen. Android follows the same protocol.
+   approval screen. Android follows the same protocol. In progress:
+   [`ios/README.md`](ios/README.md).
 4. **Desktop integration:** the Clavix desktop agent can delegate a
    prompt to the phone when the screen is locked, and lists/revokes
    paired signers. Proposal: [`DESKTOP_APPROVAL.md`](DESKTOP_APPROVAL.md).

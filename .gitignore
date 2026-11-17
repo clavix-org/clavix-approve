@@ -9,3 +9,9 @@ node_modules/
 .env
 .env.*
 .claude
+# Xcode and SwiftPM
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.swiftpm/
