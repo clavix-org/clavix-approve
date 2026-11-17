@@ -335,6 +335,14 @@ state survives long idle periods. Phase 0 exists to answer those.
   Clavix feature or a companion product sharing the protocol core?
 - **Hosted relay.** Do we run a public relay, or ship self-hosting
   only? A public one is a service to operate and a metadata sink.
+- **Enrolment secret per agent (deferred).** Every agent of a relay
+  creates its channels with the same secret. Whoever holds it can fill
+  the relay with channels (1000 at most) and so block new pairings; it
+  cannot read, sign or touch an existing pairing. Taking that right from
+  one machine means changing the secret for all. Low stakes for one
+  person's relay; needed before a relay serves several people (hosted
+  relay, team offer), where enrolment tokens would be issued, listed and
+  withdrawn one by one, and logged.
 - **Audit scope.** Pairing, the sealed channel and the phone-side
   verification are new security-critical code; `AUDIT_SCOPE.md` needs
   an entry before phase 1 ships.
