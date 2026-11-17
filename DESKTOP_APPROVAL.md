@@ -8,10 +8,16 @@ before that.
 ## Goal
 
 The Clavix desktop agent asks for a confirmation before signing (policy
-`Always` or `PerSession`). When nobody is at the screen, the dialog goes
-unseen and the request times out (`DESIGN.md`, "Problem", case 1). The
-proposal: let the desktop put the same question to a paired phone, which
-answers after a passkey user verification.
+`Always` or `PerSession`). The dialog is missed in two situations:
+
+- **nobody is at the screen** (`DESIGN.md`, "Problem", case 1);
+- **the user is there but does not see it**: the window comes up behind
+  others, and the 30 s timeout runs out.
+
+The proposal: let the desktop put the same question to a paired phone,
+which answers after a passkey user verification. The second situation
+also has a desktop-only part (making sure the dialog really comes to the
+front), handled in Clavix independently of this proposal.
 
 ## The choice: the phone approves, the desktop signs
 
@@ -37,28 +43,38 @@ Approve-only means:
 
 ## When the phone is asked
 
-A new desktop setting, next to the confirmation policy:
+One desktop setting, next to the confirmation policy: **off** (default,
+today's behaviour) or **on, with a delay of N seconds** (default 10).
+When on:
 
-| Setting | Behaviour |
+| Situation | Who is asked |
 |---|---|
-| Off (default) | today's local dialog only |
-| When away | local dialog while the user is present; phone and dialog together while away |
-| Always | phone and dialog together for every confirmation |
+| Session unlocked | the local dialog first; the phone as well if nobody answered after N seconds |
+| Screen locked | the phone only, at once |
+| Screen unlocked while a request waits | the dialog comes back, next to the phone |
 
-"Away" means the session screen is locked (`screen_lock::probe()` returns
-`Some(true)`), or the session has been idle for a configurable time.
-Where the platform cannot tell (`None`), "When away" behaves as "Always",
-and the setting says so, like the screen-lock auto-lock trigger does.
+The delay keeps the phone quiet for the confirmations answered at the
+desk (every `git push`), and reaches it when the dialog was missed,
+whether the user stepped away or the window is buried.
+
+Phone only while locked: behind the lock screen the dialog is useless to
+the user, who must unlock before clicking, but a process able to inject
+input (X11) may still reach it. Bringing the dialog back on unlock is
+the fallback when the phone is lost or the relay is down: unlock and
+answer locally, as today. Where the platform cannot tell whether the
+screen is locked (`screen_lock::probe()` returns `None`), the session is
+treated as unlocked, and the setting says so, like the screen-lock
+auto-lock trigger does.
 
 When both are asked, the **first answer wins**: the other prompt is
 withdrawn (dialog closed; on the phone, a `cancel` message removes the
 request). A deny from either side denies. The desktop's confirmation
 timeout is 30 s today (`commands/ssh.rs`), shorter than the 16 to 29 s
-measured from `ssh` to approval on the phone in phase 0 plus any margin;
-while the phone is involved it becomes 90 s, as in `clavix-agent`, to stay
-under sshd's `LoginGraceTime`.
+measured from `ssh` to approval on the phone in phase 0; once the phone
+is asked it becomes 90 s, as in `clavix-agent`, to stay under sshd's
+`LoginGraceTime`.
 
-The setting only matters between the screen lock and the vault lock: with
+The locked-screen case only exists between the screen lock and the vault lock: with
 the screen-lock auto-lock trigger at its shortest, the vault (and its
 keys) is gone before anyone could approve. The UI must make that
 visible rather than let a user believe the phone covers a locked vault.
@@ -192,7 +208,7 @@ pending.
 | The relay or the network | Can delay or drop requests: the local dialog still works, so the worst case is today's behaviour. Cannot forge an approval (needs the PRF-wrapped approval key) or replay one (bound to channel, request id and request hash). |
 | A malicious page served by the relay | As in phase 0: it could show a different destination to obtain a passkey verification. Same residual risk, same mitigation (the page's integrity is the relay's). |
 | A compromised desktop | No change: it holds the keys and can sign without asking anyone. The phone is a check on what goes through the agent, not on the machine. |
-| A process in the desktop session | Can no longer approve by faking input once the phone is the only prompt; while the dialog is also shown ("When away", "Always"), it still can. A "phone only while away" variant would close that, at the cost of no fallback. |
+| A process in the desktop session | Cannot approve by faking input while the screen is locked, when the phone is the only prompt. While the session is unlocked the dialog is shown, and it still can, as today. |
 | A thief with the unlocked phone | Needs the passkey's user verification for each approval. |
 
 New risk accepted: a signature can now happen while the user is away,
@@ -212,13 +228,14 @@ each one still needs a verification on the phone.
 
 ## Open questions
 
-- **Locked vault while away.** An "away mode" could keep the keys in
-  memory after the screen locks, on condition that every signature then
-  goes to the phone. It would cover case 2 but weakens auto-lock, whose
-  purpose is that a locked session holds no keys. Not proposed here.
-- **Phone only while away**, without the local dialog (see the threat
-  table): more protective, but a lost phone or a relay outage then blocks
-  every signature until the user is back.
+- **Locked vault while away** (case 2). An "away mode" could keep the
+  keys in memory after the screen locks, on condition that every
+  signature then goes to the phone. Not proposed: "a locked session holds
+  no keys" is a core promise of Clavix's auto-lock and of its audit
+  argument, and case 2 is better served by `clavix-agent` with the
+  phone's key, or by a longer vault-lock delay. If ever built: explicit
+  opt-in, phone required for every signature, keys kept for a bounded
+  time (an hour, say) after the screen locks.
 - **Git signing:** whether an unverifiable `SSHSIG` request is worth
   showing on the phone at all.
 - **Several phones:** the format allows several signers per channel;
