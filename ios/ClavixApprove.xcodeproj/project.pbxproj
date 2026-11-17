@@ -13,6 +13,8 @@
 /* Begin PBXFileReference section */
 		C1A0000000000000000000A1 /* ClavixApprove.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ClavixApprove.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C1A0000000000000000000A2 /* ClavixApprove.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ClavixApprove.entitlements; sourceTree = "<group>"; };
+		C1A0000000000000000000A4 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		C1A0000000000000000000A5 /* ClavixApprove-NoPush.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "ClavixApprove-NoPush.entitlements"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -35,7 +37,9 @@
 			isa = PBXGroup;
 			children = (
 				C1A0000000000000000000A3 /* ClavixApprove */,
+				C1A0000000000000000000A4 /* Base.xcconfig */,
 				C1A0000000000000000000A2 /* ClavixApprove.entitlements */,
+				C1A0000000000000000000A5 /* ClavixApprove-NoPush.entitlements */,
 				C1A0000000000000000000F2 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -178,12 +182,11 @@
 		};
 		C1A000000000000000000403 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = C1A0000000000000000000A4 /* Base.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = ClavixApprove.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Clavix;
@@ -197,7 +200,6 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = org.clavix.approve;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -209,12 +211,11 @@
 		};
 		C1A000000000000000000404 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = C1A0000000000000000000A4 /* Base.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = ClavixApprove.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Clavix;
@@ -228,7 +229,6 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = org.clavix.approve;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;

@@ -46,10 +46,14 @@ CI runs both on macOS (`.github/workflows/ci.yml`, job `ios`).
 
 ## Building on a device
 
-1. Xcode → Settings → Accounts: the paid developer account.
-2. Open `ios/ClavixApprove.xcodeproj`, target ClavixApprove → Signing &
-   Capabilities: choose the team. Push Notifications is already in the
-   entitlements.
+1. Xcode → Settings → Accounts: the developer account.
+2. Copy `ios/Local.xcconfig.example` to `ios/Local.xcconfig` and put the
+   team ID in it. Signing settings live there, out of the repository: do
+   not pick the team in Xcode's Signing & Capabilities tab, which would
+   write it into the project file.
+   With a free Personal Team, also uncomment the two lines that switch to
+   `org.clavix.approve.personal` without push: an app ID taken by a free
+   team could block the real one for the paid team later.
 3. Connect the iPhone, enable Developer Mode on it, Run.
 
 ## Wake-up

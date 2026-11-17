@@ -1,0 +1,7 @@
+// Settings of the app target. Signing comes from Local.xcconfig, which is
+// not in the repository: copy Local.xcconfig.example and fill it in.
+PRODUCT_BUNDLE_IDENTIFIER = org.clavix.approve
+CODE_SIGN_ENTITLEMENTS = ClavixApprove.entitlements
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"
