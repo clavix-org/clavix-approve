@@ -12,6 +12,8 @@ on a development machine; they have not been deployed or tried on a real
 phone yet, and nothing here has been audited. Do not rely on it.
 
 - [`DESIGN.md`](DESIGN.md) — problem, architecture, phasing, open questions.
+- [`DESKTOP_APPROVAL.md`](DESKTOP_APPROVAL.md) — proposal: approve the Clavix
+  desktop agent's confirmations on the phone (not implemented).
 - [`PROTOCOL.md`](PROTOCOL.md) — keys, pairing, messages, relay API.
 - [`THREAT_MODEL.md`](THREAT_MODEL.md) — what each part can do to the
   others, residual risk, known weaknesses of the prototype.
