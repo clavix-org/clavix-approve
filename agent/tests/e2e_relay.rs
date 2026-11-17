@@ -522,3 +522,13 @@ fn pairing_again_revokes_the_previous_pairing() {
     });
     old_phone.event("revoked");
 }
+
+#[test]
+fn version_names_the_package_version() {
+    let out = Command::new(AGENT).arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("clavix-agent {}", env!("CARGO_PKG_VERSION"))
+    );
+}

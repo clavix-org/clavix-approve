@@ -29,6 +29,8 @@ Usage:
       the socket. Default timeout: 90 seconds per request.
   clavix-agent pubkey
       Print the paired device's SSH public key.
+  clavix-agent --version
+      Print the version.
   clavix-agent unpair [--local-only]
       Revoke the pairing on the relay, then forget it here. The device can
       then no longer sign through this agent; its key still has to be
@@ -320,6 +322,10 @@ async fn main() -> ExitCode {
         Some("run") => run(&args[1..]).await,
         Some("pubkey") => load_state().map(|s| println!("{}", s.signer.public_key)),
         Some("unpair") => unpair(&args[1..]).await,
+        Some("version" | "--version" | "-V") => {
+            println!("clavix-agent {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())
