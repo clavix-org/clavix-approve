@@ -167,6 +167,37 @@ impl RelayClient {
     }
 }
 
+/// Delete the pairing on the relay. `Ok(true)` when this call deleted it,
+/// `Ok(false)` when the relay no longer knew it (already revoked from the
+/// other end, or the relay lost its state).
+pub async fn revoke(client: &RelayClient, ch: &str, token: &str) -> Result<bool, RelayError> {
+    match client
+        .post(&format!("/api/ch/{ch}/revoke"), token, &json!({}))
+        .await
+    {
+        Ok(value) if state_of(&value) == "revoked" => Ok(true),
+        Ok(value) => Err(RelayError::Protocol(format!(
+            "revocation not confirmed ({})",
+            state_of(&value)
+        ))),
+        Err(RelayError::Status(401)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// A relay failure as the agent reports it. A 401 on a paired channel
+/// means the pairing is gone, most likely revoked from the device.
+fn relay_failure(e: RelayError) -> SignError {
+    match e {
+        RelayError::Status(401) => SignError::Backend(
+            "the relay no longer knows this pairing (revoked from the device?); \
+             run `clavix-agent pair` again"
+                .into(),
+        ),
+        e => SignError::Backend(e.to_string()),
+    }
+}
+
 fn state_of(value: &Value) -> &str {
     value.get("state").and_then(Value::as_str).unwrap_or("")
 }
@@ -355,7 +386,7 @@ impl Signer for RelaySigner {
             let queued = client
                 .post(&format!("{base}/requests"), &token, &envelope)
                 .await
-                .map_err(|e| SignError::Backend(e.to_string()))?;
+                .map_err(relay_failure)?;
             if state_of(&queued) != "queued" {
                 return Err(SignError::Backend(format!(
                     "relay did not queue the request ({})",
@@ -391,7 +422,7 @@ impl Signer for RelaySigner {
                     // against us at a proxy that bans.
                     Err(RelayError::Status(429)) => tokio::time::sleep(THROTTLED_PAUSE).await,
                     Err(e) if e.is_transient() => tokio::time::sleep(RETRY_PAUSE).await,
-                    Err(e) => return Err(SignError::Backend(e.to_string())),
+                    Err(e) => return Err(relay_failure(e)),
                 }
             };
 

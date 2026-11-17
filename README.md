@@ -97,6 +97,11 @@ not cache.
   new key must then be created and installed on every server. Changing
   the icon or the label also requires removing it. Keep another way into
   your servers.
+- **Revoking a pairing**: `clavix-agent unpair` on the machine, or
+  "Oublier cette machine" on the phone, deletes the pairing on the relay;
+  the other end then gets nothing more. The phone's public key must
+  still be removed from the servers' `authorized_keys` if the phone is
+  lost: the command prints it.
 - **A request left unanswered expires** after 90 seconds and `ssh` fails
   with `agent refused operation`.
 - **Pairing with a QR code**: `clavix-agent pair` prints the code and a QR

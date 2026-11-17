@@ -204,7 +204,7 @@ an explicit "destination unknown" warning.
 |---|---|
 | Phone offline or push not delivered | request expires, client sees `agent refused operation`; agent logs "no answer from signer" |
 | Relay down | same; agent reports the relay error distinctly |
-| Phone lost or replaced | revoke the public key on servers; re-pair. Access falls back to the user's other keys — the feature must never be the only way in |
+| Phone lost or replaced | revoke the pairing (`clavix-agent unpair`) and the public key on servers; re-pair. Access falls back to the user's other keys — the feature must never be the only way in |
 | Headless machine compromised | attacker can send requests and read approved sessions (see below); cannot sign without the phone, cannot forge the destination shown |
 | Relay compromised | can drop or delay; cannot read, forge or replay (request ids, expiry, and the SSH session id is unique per connection) |
 

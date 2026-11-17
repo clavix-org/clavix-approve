@@ -126,8 +126,14 @@ and a short `ControlPersist` on the server side are outside this project.
   minutes, and the verification digits still have to match.
 - **Metadata**: the relay and the push service learn when the user
   authenticates, and how often.
-- **No revocation path** other than removing the public key from servers
-  and erasing both ends' state.
+- **Revocation cuts the channel, not the key.** Either end can delete
+  the pairing on the relay (`clavix-agent unpair`, "Oublier cette
+  machine"): a lost phone then receives nothing, a decommissioned machine
+  can send nothing. The phone's SSH key stays valid on every server that
+  lists it until it is removed from `authorized_keys`, and a phone lost
+  while the relay is unreachable keeps its pairing until the agent end
+  revokes it. With a stolen phone, the passkey's user verification still
+  stands between the thief and any signature.
 - **The enrolment secret is shared** by every agent allowed on a relay.
 - Not yet verified on a real device: everything listed under "Needs the
   iPhone" in the README.

@@ -133,6 +133,7 @@ async function pair() {
     const paired = await pairWithAgent({
       base: '', code: $('pair-code').value, me, keyBlob: state.sshKey.keyBlob, comment: COMMENT,
     });
+    const previous = state.pairing;
     state.pairing = {
       ch: paired.ch,
       signer: paired.signer,
@@ -148,6 +149,13 @@ async function pair() {
     cards.forEach((_, id) => removeCard(id));
     $('pair-code').value = '';
     await journal(`Appairé avec ${paired.label || 'un agent'}`);
+    if (previous && previous.ch !== paired.ch) {
+      // Best effort: the old channel is dead to us either way.
+      try {
+        await new RelayClient('', previous.ch, previous.token).revoke();
+        await journal(`Appairage précédent (${previous.label || 'sans nom'}) révoqué`);
+      } catch (_) { /* left on the relay, harmless */ }
+    }
     await connect();
     result('pair-result', `Appairé. Chiffres à comparer avec ceux de l’agent : ${paired.fingerprint}`, 'ok');
   } catch (e) {
@@ -267,7 +275,10 @@ async function watch() {
         continue;
       }
       if (isFatal(e)) {
-        status(`Arrêt : ${describe(e)}. Si cela persiste, appairez à nouveau.`, true);
+        status(e.status === 401
+          ? 'Cette machine a été retirée : le relais ne connaît plus cet appairage. '
+            + 'Touchez « Oublier cette machine » plus bas, ou appairez à nouveau.'
+          : `Arrêt : ${describe(e)}. Si cela persiste, appairez à nouveau.`, true);
         break;
       }
       // Throttled, proxy error or network trouble: wait longer each time.
@@ -462,6 +473,7 @@ function drawDetails() {
   $('pairing-info').textContent = state.pairing
     ? `Agent : ${state.pairing.label || 'sans nom'} — chiffres de vérification : ${state.pairing.fingerprint}`
     : 'Pas encore appairé.';
+  $('forget').hidden = !state.pairing;
 
   const pins = $('pins');
   pins.replaceChildren();
@@ -526,6 +538,55 @@ async function diagnose() {
     ? `disponibles, autorisation ${Notification.permission}` : 'indisponibles dans ce mode'));
   await check('stockage persistant', async () => (navigator.storage && navigator.storage.persisted
     ? ((await navigator.storage.persisted()) ? 'oui' : 'non garanti') : 'inconnu'));
+}
+
+// Revoke the pairing on the relay, then forget it here. Keeps the SSH key
+// and the known hosts: pairing another machine needs nothing new on the
+// servers. Touched twice, like "Tout effacer"; when the relay cannot be
+// reached, a third touch forgets it here anyway.
+let forgetStep = 0;   // 0 idle, 1 armed, 2 relay unreachable, local only next
+let forgetTimer = null;
+function armForget(step, label) {
+  forgetStep = step;
+  $('forget').textContent = label;
+  clearTimeout(forgetTimer);
+  forgetTimer = setTimeout(() => {
+    forgetStep = 0;
+    $('forget').textContent = 'Oublier cette machine';
+  }, 8000);
+}
+
+async function forget() {
+  if (!state.pairing) return;
+  if (forgetStep === 0) {
+    armForget(1, 'Toucher encore pour confirmer');
+    return;
+  }
+  const label = state.pairing.label || 'sans nom';
+  if (forgetStep === 1) {
+    try {
+      const deleted = await new RelayClient('', state.pairing.ch, state.pairing.token).revoke();
+      await journal(deleted ? `Appairage avec ${label} révoqué` : `${label} : appairage déjà révoqué`);
+    } catch (e) {
+      result('forget-result', `Relais injoignable (${describe(e)}). L’appairage y reste tant qu’il n’est pas `
+        + 'révoqué depuis la machine (clavix-agent unpair).', 'error');
+      armForget(2, 'Oublier quand même sur cet appareil');
+      return;
+    }
+  } else {
+    await journal(`${label} oubliée sur cet appareil seulement`);
+  }
+  clearTimeout(forgetTimer);
+  forgetStep = 0;
+  $('forget').textContent = 'Oublier cette machine';
+  stopWatching();
+  cards.forEach((_, id) => removeCard(id));
+  state.pairing = null;
+  relay = null;
+  ctx = null;
+  await store.remove('pairing');
+  result('forget-result', `${label} est oubliée.`, 'ok');
+  draw();
 }
 
 let resetArmed = false;
@@ -617,6 +678,7 @@ async function start() {
     $('step-pair').scrollIntoView();
   });
   onClick('diagnose', diagnose);
+  onClick('forget', forget);
   onClick('reset', reset);
   onClick('copy-key', async () => {
     try {
