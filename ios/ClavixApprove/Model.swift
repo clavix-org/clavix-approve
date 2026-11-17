@@ -119,7 +119,11 @@ final class Model: ObservableObject {
         let sandbox = false
         #endif
         do {
-            _ = try await RelayClient(base: p.relay, ch: p.ch, token: p.token).subscribeAPNs(deviceToken: token, sandbox: sandbox)
+            let state = try await RelayClient(base: p.relay, ch: p.ch, token: p.token).subscribeAPNs(deviceToken: token, sandbox: sandbox)
+            if state == "unsupported" {
+                // The relay has no APNs key: not an error, and not worth retrying.
+                journal("Ce relais n’envoie pas de notifications à l’appli : ouvrez-la pour voir les demandes")
+            }
         } catch let e as RelayError where e.status == 400 {
             journal("Ce relais ne sait pas encore réveiller l’appli : ouvrez-la pour voir les demandes")
         } catch {

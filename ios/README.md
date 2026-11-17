@@ -60,15 +60,14 @@ CI runs both on macOS (`.github/workflows/ci.yml`, job `ios`).
 
 The app registers for Apple push notifications and sends its device token
 to the relay with `POST /api/ch/{ch}/subscription`, body
-`{"apns": "<hex token>", "sandbox": true|false}` (`sandbox` for a
-development build). **The relay does not accept that body yet**: it only
-knows Web Push. Until it does, the app says so in its journal, and shows
-requests only while it is open. The push stays content-free, as for the
-page.
+`{"apns": "<lowercase hex token>", "sandbox": true|false}` (`sandbox` for
+a development build). A relay without an APNs key answers
+`{"state": "unsupported"}`: the app notes it in its journal and shows
+requests only while it is open. The push is content-free, as for the page,
+and time-sensitive (entitlement in `ClavixApprove.entitlements`).
 
 ## Not done yet
 
-- APNs on the relay (above).
 - A notification extension that would show the destination on the lock
   screen.
 - Several machines paired at once (the page has one pairing too).
