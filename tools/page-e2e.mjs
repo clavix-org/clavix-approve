@@ -317,6 +317,74 @@ async function main() {
   check((await browser.text('#public-key')) === publicKey, 'the SSH key stays after forgetting the machine');
   check((await browser.text('#status')).startsWith('Clé prête'), 'and the page asks for a new pairing');
 
+  // 10. Approve mode, with tools/fake-desktop.mjs in Clavix desktop's place.
+  //     A page set up before approve mode has no approval key: drop it to
+  //     go through that path, where the passkey makes one when first needed.
+  await browser.eval(`new Promise((resolve, reject) => {
+    const open = indexedDB.open('clavix-approve', 1);
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const tx = open.result.transaction('kv', 'readwrite');
+      tx.objectStore('kv').delete('approveKey');
+      tx.oncomplete = () => { open.result.close(); resolve(true); };
+      tx.onerror = () => reject(tx.error);
+    };
+  })`);
+  await browser.send('Page.reload');
+  await until('the page without an approval key', async () => (await browser.text('#status'))?.startsWith('Clé prête'));
+  const desktopState = join(dir, 'fake-desktop.json');
+  const tool = (name, args, env = process.env) => start(process.execPath, [join(repo, 'tools', name), ...args], { env });
+  const jsonEvent = (child, kind) => child.output.split('\n').filter((l) => l.startsWith('{')).map((l) => JSON.parse(l))
+    .find((e) => e.event === kind);
+  const closed = (child) => new Promise((resolve) => (child.exitCode !== null ? resolve() : child.on('close', resolve)));
+  const desktop = tool('fake-desktop.mjs', ['pair', '--relay', `http://127.0.0.1:${relayPort}`, '--state', desktopState,
+    '--label', 'bureau-de-test'], { ...process.env, CLAVIX_ENROLL_SECRET: 'page-e2e' });
+  const approveCode = (await until('an approve-mode code', () => jsonEvent(desktop, 'code'))).code;
+  await browser.type('#pair-code', approveCode);
+  await browser.click('#pair');
+  await until('the offer of an approval key', async () => (await browser.eval("document.querySelector('#approve-key').hidden")) === false);
+  check((await browser.text('#pair-result')).includes('validation seulement'), 'an approve-mode code asks for an approval key first');
+  await browser.click('#approve-key');
+  const approvePaired = await until('the approve-mode pairing', async () => {
+    const text = await browser.text('#pair-result');
+    return text?.startsWith('Appairé') ? text : null;
+  });
+  await closed(desktop);
+  const desktopPaired = jsonEvent(desktop, 'paired');
+  check(desktopPaired && approvePaired.endsWith(desktopPaired.fingerprint),
+    `page and requester show the same digits (${desktopPaired?.fingerprint})`);
+  check(desktopPaired.approveKeyType === 'ssh-ed25519', 'the page answers with an Ed25519 approval key');
+  check((await browser.text('#journal')).includes('Clé de validation créée'), 'made under the passkey when first needed');
+  check((await browser.text('#pairing-info')).includes('validation seulement'), 'the pairing is shown as approve mode');
+
+  const ask = (...args) => tool('fake-desktop.mjs', ['request', '--state', desktopState, ...args]);
+  let asking = ask('--key-type', 'rsa');
+  await until('an approval request on the page', () => browser.text('.request'));
+  const queued = await until('the request', () => jsonEvent(asking, 'queued'));
+  check((await browser.text('.request .destination')) === 'deploy@ hôte inconnu', 'the page shows the verified destination');
+  check((await browser.text('.request .facts')).includes(`Clé de la machine, d’après elle : rsa key of fake-desktop (${queued.key})`),
+    "and the machine's own key, labelled as the machine's word");
+  await browser.type('.request input', 'serveur-du-bureau');
+  await browser.click('.request .actions button:last-child');
+  await closed(asking);
+  check(jsonEvent(asking, 'approved')?.signatureVerified === true,
+    `the requester checks the page's proof, then signs with its own key (${asking.output.trim()})`);
+  await until('the card to go', async () => (await browser.text('.request')) === null);
+
+  // A request withdrawn on the machine leaves the page by itself.
+  asking = ask('--withdraw-after', '3');
+  await until('a request to withdraw', () => browser.text('.request'));
+  await until('the withdrawn request to leave', async () => (await browser.text('.request')) === null);
+  await closed(asking);
+  check(jsonEvent(asking, 'withdrawn')?.state === 'cancelled' && !jsonEvent(asking, 'approved'),
+    'a withdrawn request leaves the page unanswered');
+
+  // A sign request on this channel is refused without asking anyone.
+  asking = ask('--t', 'sign');
+  await closed(asking);
+  check(jsonEvent(asking, 'denied')?.reason === 'malformed', 'a request of the other mode is refused as malformed');
+  check((await browser.text('#journal')).includes('Demande écartée (malformed'), 'and the journal says so');
+
   // 8. The same link opened where there is no key (the phone's browser
   //    rather than the installed app): the page only hands the code over.
   const main = browser.session;
@@ -351,6 +419,12 @@ try {
 } finally {
   for (const child of children) child.kill();
   await sleep(200);
-  rmSync(dir, { recursive: true, force: true });
+  // Chrome may still be writing its profile after the kill: retry, and never
+  // let the cleanup turn a passing run into a failure.
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (e) {
+    console.error(`page-e2e: could not remove ${dir}: ${e.message}`);
+  }
 }
 process.exit(failed ? 1 : 0);

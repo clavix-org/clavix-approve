@@ -39,36 +39,72 @@ async function macKey(secret) {
 
 const transcript = (kind, ...fields) => concat(sshString(utf8(kind)), ...fields.map(sshString));
 
+// A channel is in one mode for good, set at pairing: "sign" (the signer
+// holds the SSH key) or "approve" (it only approves; PROTOCOL.md, "Approve
+// mode"). Each mode has its own labels, so that a relay flipping the mode
+// breaks a MAC or the digits.
+const LABELS = {
+  sign: { hello: 'hello', answer: 'answer', fingerprint: 'clavix-approve/v1/fingerprint', field: 'key' },
+  approve: {
+    hello: 'approve-hello', answer: 'approve-answer', fingerprint: 'clavix-approve/v1/approve-fingerprint',
+    field: 'approve',
+  },
+};
+
+function labels(mode) {
+  if (!Object.hasOwn(LABELS, mode)) throw new Error(`unknown pairing mode ${mode}`);
+  return LABELS[mode];
+}
+
+// The field of the answer that carries the key, after the mode.
+export const answerKeyField = (mode) => labels(mode).field;
+
+// The hello's MAC. `agent` holds the agent's public keys as raw bytes.
+export async function helloMac(secret, mode, ch, agent, label) {
+  const t = transcript(labels(mode).hello, utf8(ch), agent.kemPublic, agent.sigPublic, utf8(label));
+  return new Uint8Array(await crypto.subtle.sign('HMAC', await macKey(secret), t));
+}
+
+// The answer's MAC; `blob` is the SSH key (sign mode) or the approval key
+// (approve mode), as an SSH public key blob.
+export async function answerMac(secret, mode, ch, signer, me, blob, agent) {
+  const t = transcript(labels(mode).answer, utf8(ch), utf8(signer), me.kemPublic, me.sigPublic, blob,
+    agent.kemPublic, agent.sigPublic);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', await macKey(secret), t));
+}
+
 // Read the agent's hello and authenticate its keys with the pairing
-// secret. Returns { label, agent } where `agent` is a channel peer.
+// secret. Returns { label, agent, mode } where `agent` is a channel peer.
+// A hello without `mode` is a sign-mode one, as before approve mode.
 export async function readHello(helloMsg, ch, secret) {
   const hello = JSON.parse(fromUtf8(unb64u(helloMsg)));
+  if (hello.mode !== undefined && hello.mode !== 'approve') throw new Error('this pairing code is for an unknown mode');
+  const mode = hello.mode ?? 'sign';
   const agent = peer(unb64u(hello.kem), unb64u(hello.sig));
   const label = typeof hello.label === 'string' ? hello.label : '';
-  const expected = transcript('hello', utf8(ch), agent.kemPublic, agent.sigPublic, utf8(label));
+  const expected = transcript(labels(mode).hello, utf8(ch), agent.kemPublic, agent.sigPublic, utf8(label));
   if (!(await crypto.subtle.verify('HMAC', await macKey(secret), unb64u(hello.mac), expected))) {
     throw new Error('the pairing code does not match this agent');
   }
-  return { label, agent };
+  return { label, agent, mode };
 }
 
-// Our answer: public keys and the SSH key, sealed to the agent.
-export async function buildAnswer({ ch, signer, secret, me, agent, keyBlob, comment }) {
-  const mac = await crypto.subtle.sign('HMAC', await macKey(secret), transcript(
-    'answer', utf8(ch), utf8(signer), me.kemPublic, me.sigPublic, keyBlob, agent.kemPublic, agent.sigPublic));
+// Our answer: public keys and the key of the mode, sealed to the agent.
+export async function buildAnswer({ ch, signer, secret, me, agent, keyBlob, comment, mode = 'sign' }) {
+  const mac = await answerMac(secret, mode, ch, signer, me, keyBlob, agent);
   return sealIntroduction(me, agent, pairHeader(ch, signer), {
     t: 'pair',
-    key: b64u(keyBlob),
+    [answerKeyField(mode)]: b64u(keyBlob),
     comment,
     kem: b64u(me.kemPublic),
-    mac: b64u(new Uint8Array(mac)),
+    mac: b64u(mac),
   });
 }
 
 // Six digits both ends display once paired, e.g. "042 917".
-export async function pairingFingerprint(agent, me, keyBlob) {
+export async function pairingFingerprint(agent, me, keyBlob, mode = 'sign') {
   const digest = await sha256(transcript(
-    'clavix-approve/v1/fingerprint', agent.kemPublic, agent.sigPublic, me.kemPublic, me.sigPublic, keyBlob));
+    labels(mode).fingerprint, agent.kemPublic, agent.sigPublic, me.kemPublic, me.sigPublic, keyBlob));
   const n = ((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0;
   const digits = String(n % 1_000_000).padStart(6, '0');
   return `${digits.slice(0, 3)} ${digits.slice(3)}`;

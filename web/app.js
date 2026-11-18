@@ -2,13 +2,21 @@
 //
 // Everything security-relevant is in lib/ (and tested there under Node).
 // This file only stores state, calls the passkey and draws.
+//
+// A pairing is in sign mode (this page signs the SSH login with its own
+// key) or in approve mode (the machine holds the SSH key, this page only
+// approves, with its approval key). The agent's code says which.
 
 import { equal, unb64u } from './lib/bytes.js';
 import { generateIdentity, peer, withPublicBytes } from './lib/channel.js';
-import { createPasskey, createWrappedKey, signWithWrappedKey, unlock } from './lib/lock.js';
+import {
+  approveWithWrappedKey, createPasskey, createWrappedApproveKey, createWrappedKey, signWithWrappedKey, unlock,
+} from './lib/lock.js';
 import { PAIR_CODE_PREFIX } from './lib/pairing.js';
 import { RelayClient, RelayError } from './lib/relay.js';
-import { approve, deny, pairWithAgent, readRequest } from './lib/signer.js';
+import {
+  approvalData, approve, completePairing, deny, openPairing, readRequest, sendApproval,
+} from './lib/signer.js';
 import { publicKeyLine } from './lib/ssh.js';
 import * as store from './lib/store.js';
 
@@ -16,13 +24,15 @@ const $ = (id) => document.getElementById(id);
 const RP_ID = location.hostname;
 const COMMENT = 'clavix-approve';
 const JOURNAL_SIZE = 60;
+const TOO_LATE_MS = 6000; // how long "trop tard" stays on a card
 
 // Persistent state, loaded from the store at start.
 const state = {
   identity: null,   // { kem, sig } CryptoKey pairs, non-extractable
   credentialId: null,
   sshKey: null,     // { keyBlob, iv, ct }
-  pairing: null,    // { ch, signer, token, agentKem, agentSig, label, fingerprint }
+  approveKey: null, // { keyBlob, iv, ct }, approve mode; made with the SSH key, or when first needed
+  pairing: null,    // { ch, signer, token, agentKem, agentSig, label, mode, fingerprint }
   pins: {},         // host key fingerprint -> name chosen on this device
   journal: [],      // [{ at, text }]
 };
@@ -84,12 +94,38 @@ const hostName = (fingerprint) => (Object.hasOwn(state.pins, fingerprint) ? stat
 
 // ---- set-up -------------------------------------------------------------------
 
+// The approval key comes with the SSH key, under the same passkey secret:
+// pairing in approve mode then needs no second verification.
 async function finishKey(secret) {
   const wrapped = await createWrappedKey(secret);
+  const approveKey = await createWrappedApproveKey(secret);
   secret.fill(0);
   state.sshKey = wrapped;
+  state.approveKey = approveKey;
   await store.set('sshKey', wrapped);
+  await store.set('approveKey', approveKey);
   await journal('Clé de signature créée');
+}
+
+// A page set up before approve mode has no approval key: made on demand,
+// from its own tap, since it needs the passkey.
+async function createApproveKey() {
+  try {
+    result('pair-result', 'En attente de la passkey…');
+    const secret = await unlock(navigator.credentials, RP_ID, state.credentialId);
+    try {
+      state.approveKey = await createWrappedApproveKey(secret);
+    } finally {
+      secret.fill(0);
+    }
+    await store.set('approveKey', state.approveKey);
+    await journal('Clé de validation créée');
+    $('approve-key').hidden = true;
+  } catch (e) {
+    result('pair-result', `Échec : ${describe(e)}.`, 'error');
+    return;
+  }
+  await pair();
 }
 
 async function createKey() {
@@ -130,8 +166,17 @@ async function pair() {
       await store.set('identity', state.identity);
     }
     const me = await withPublicBytes(state.identity.kem, state.identity.sig);
-    const paired = await pairWithAgent({
-      base: '', code: $('pair-code').value, me, keyBlob: state.sshKey.keyBlob, comment: COMMENT,
+    const opening = await openPairing({ base: '', code: $('pair-code').value });
+    const approveMode = opening.hello.mode === 'approve';
+    if (approveMode && !state.approveKey) {
+      // Nothing sent yet: the code stays good for the next tap.
+      $('approve-key').hidden = false;
+      result('pair-result', 'Ce code demande une validation seulement (la machine garde sa clé SSH). '
+        + 'Il faut une clé de validation, protégée par la même passkey.');
+      return;
+    }
+    const paired = await completePairing(opening, {
+      me, keyBlob: approveMode ? state.approveKey.keyBlob : state.sshKey.keyBlob, comment: COMMENT,
     });
     const previous = state.pairing;
     state.pairing = {
@@ -141,6 +186,7 @@ async function pair() {
       agentKem: paired.agent.kemPublic,
       agentSig: paired.agent.sigPublic,
       label: paired.label,
+      mode: paired.mode,
       fingerprint: paired.fingerprint,
     };
     await store.set('pairing', state.pairing);
@@ -148,7 +194,8 @@ async function pair() {
     stopWatching();
     cards.forEach((_, id) => removeCard(id));
     $('pair-code').value = '';
-    await journal(`Appairé avec ${paired.label || 'un agent'}`);
+    $('approve-key').hidden = true;
+    await journal(`Appairé avec ${paired.label || 'un agent'}${approveMode ? ' (validation seulement)' : ''}`);
     if (previous && previous.ch !== paired.ch) {
       // Best effort: the old channel is dead to us either way.
       try {
@@ -216,6 +263,7 @@ async function connect() {
     signer: state.pairing.signer,
     me,
     agent: peer(state.pairing.agentKem, state.pairing.agentSig),
+    mode: state.pairing.mode ?? 'sign', // pairings from before approve mode are sign-mode ones
     keyBlob: state.sshKey.keyBlob,
   };
   relay = new RelayClient('', state.pairing.ch, state.pairing.token);
@@ -394,6 +442,11 @@ function drawRequest(card) {
     ? `${view.caller.name ?? 'processus'}${view.caller.pid !== null ? ` (pid ${view.caller.pid})` : ''}`
     : 'inconnu';
   facts.append(el('li', 'unverified', `Demandé par ${caller}, sur ${view.agent ?? 'machine sans nom'} — non vérifié`));
+  if (ctx.mode === 'approve') {
+    // The machine signs with its own key: name and fingerprint as it gives them.
+    facts.append(el('li', 'unverified key',
+      `Clé de la machine, d’après elle : ${view.keyName ?? 'sans nom'} (${view.keyFingerprint})`));
+  }
   box.append(facts);
 
   const progress = el('p', 'progress');
@@ -405,25 +458,41 @@ function drawRequest(card) {
   actions.append(no, yes);
   box.append(progress, actions);
 
+  // `work` returns the relay's verdict on our answer. Anything but
+  // "accepted" means the request was settled elsewhere or withdrawn
+  // meanwhile (the machine's own dialog answered first, or it expired):
+  // the card says so for a moment instead of vanishing.
   const settle = async (work) => {
     card.busy = true;
     no.disabled = true;
     yes.disabled = true;
+    let outcome;
     try {
-      await work();
-      removeCard(entry.id);
+      outcome = await work();
     } catch (e) {
       progress.textContent = `Échec : ${describe(e)}.`;
       no.disabled = false;
       yes.disabled = false;
-    } finally {
       card.busy = false;
+      return;
     }
+    if (outcome === 'accepted') {
+      card.busy = false;
+      removeCard(entry.id);
+      return;
+    }
+    progress.textContent = 'Trop tard : la demande a déjà été réglée ou retirée.';
+    box.classList.add('late');
+    setTimeout(() => {
+      card.busy = false;
+      removeCard(entry.id);
+    }, TOO_LATE_MS);
   };
 
   no.addEventListener('click', () => settle(async () => {
-    await deny(ctx, relay, entry, 'user');
+    const outcome = await deny(ctx, relay, entry, 'user');
     await journal(`Refusé : ${user}@${known ?? dest.fingerprint}`);
+    return outcome;
   }));
 
   yes.addEventListener('click', () => settle(async () => {
@@ -431,15 +500,22 @@ function drawRequest(card) {
     if (!name) throw new Error('donnez un nom à ce serveur');
     const started = performance.now();
     progress.textContent = 'En attente de la passkey…';
-    // The user verification: nothing is signed without it.
+    // The user verification: nothing is signed without it. In approve mode
+    // what is signed is the approval, with the approval key.
+    const approveMode = ctx.mode === 'approve';
+    const toSign = approveMode ? await approvalData(ctx, entry) : view.data;
     const secret = await unlock(navigator.credentials, RP_ID, state.credentialId);
     let signature;
     try {
-      signature = await signWithWrappedKey(secret, state.sshKey, view.data);
+      signature = approveMode
+        ? await approveWithWrappedKey(secret, state.approveKey, toSign)
+        : await signWithWrappedKey(secret, state.sshKey, toSign);
     } finally {
       secret.fill(0);
     }
-    const outcome = await approve(ctx, relay, entry, signature);
+    const outcome = approveMode
+      ? await sendApproval(ctx, relay, entry, signature)
+      : await approve(ctx, relay, entry, signature);
     if (!known) {
       state.pins[dest.fingerprint] = name;
       await store.set('pins', state.pins);
@@ -448,6 +524,7 @@ function drawRequest(card) {
     await journal(outcome === 'accepted'
       ? `Approuvé : ${user}@${name} (${seconds} s)`
       : `Approuvé trop tard : ${user}@${name} (${outcome})`);
+    return outcome;
   }));
 
   return box;
@@ -471,7 +548,9 @@ function tick() {
 function drawDetails() {
   if (state.sshKey) $('public-key').textContent = publicKeyLine(state.sshKey.keyBlob, COMMENT);
   $('pairing-info').textContent = state.pairing
-    ? `Agent : ${state.pairing.label || 'sans nom'} — chiffres de vérification : ${state.pairing.fingerprint}`
+    ? `Agent : ${state.pairing.label || 'sans nom'}${state.pairing.mode === 'approve'
+      ? ' — validation seulement : la machine signe avec sa propre clé' : ''} — chiffres de vérification : ${
+      state.pairing.fingerprint}`
     : 'Pas encore appairé.';
   $('forget').hidden = !state.pairing;
 
@@ -664,6 +743,7 @@ async function start() {
   state.identity = (await store.get('identity')) ?? null;
   state.credentialId = (await store.get('credentialId')) ?? null;
   state.sshKey = (await store.get('sshKey')) ?? null;
+  state.approveKey = (await store.get('approveKey')) ?? null;
   state.pairing = (await store.get('pairing')) ?? null;
   state.pins = (await store.get('pins')) ?? {};
   state.journal = (await store.get('journal')) ?? [];
@@ -671,6 +751,7 @@ async function start() {
   onClick('create-key', createKey);
   onClick('protect-key', protectKey);
   onClick('pair', pair);
+  onClick('approve-key', createApproveKey);
   onClick('notify', enableNotifications);
   onClick('pair-again', async () => {
     repairing = true;

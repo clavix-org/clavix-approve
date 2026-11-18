@@ -10,11 +10,12 @@
 // memory for the duration of one signature.
 
 import { randomBytes, unb64u, utf8 } from './bytes.js';
-import { p256KeyBlob, p256SignatureBlob } from './ssh.js';
+import { ed25519KeyBlob, ed25519SignatureBlob, p256KeyBlob, p256SignatureBlob } from './ssh.js';
 
 const PRF_SALT = utf8('clavix-approve/v1/ssh-key');
 const WRAP_INFO = utf8('clavix-approve/v1/key-wrap');
 const ECDSA = { name: 'ECDSA', namedCurve: 'P-256' };
+const ED25519 = { name: 'Ed25519' };
 
 // ---- passkey ---------------------------------------------------------------
 
@@ -61,11 +62,56 @@ export async function unlock(credentials, rpId, credentialId) {
 
 // ---- wrapped key --------------------------------------------------------------
 
-async function wrappingKey(secret) {
+async function wrappingKey(secret, info = WRAP_INFO) {
   const ikm = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: WRAP_INFO },
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info },
     ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+async function wrap(secret, info, keyBlob, pkcs8) {
+  const iv = randomBytes(12);
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: keyBlob }, await wrappingKey(secret, info), pkcs8));
+  pkcs8.fill(0);
+  return { keyBlob, iv, ct };
+}
+
+async function unwrap(secret, info, { keyBlob, iv, ct }, what) {
+  try {
+    return new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv, additionalData: keyBlob }, await wrappingKey(secret, info), ct));
+  } catch (_) {
+    throw new Error(`this passkey does not open the ${what}`);
+  }
+}
+
+// ---- approval key (approve mode) ----------------------------------------------
+
+// Approve mode signs approvals with a key of its own, Ed25519, wrapped like
+// the SSH key under the same passkey secret (one user verification opens
+// either) but with its own label. PROTOCOL.md, "Approval key".
+const APPROVE_WRAP_INFO = utf8('clavix-approve/v1/approve-key-wrap');
+
+// Generate the approval key and return it wrapped under `secret`:
+// { keyBlob, iv, ct }, `keyBlob` being its SSH public key blob.
+export async function createWrappedApproveKey(secret) {
+  const pair = await crypto.subtle.generateKey(ED25519, true, ['sign', 'verify']);
+  const raw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey));
+  return wrap(secret, APPROVE_WRAP_INFO, ed25519KeyBlob(raw), pkcs8);
+}
+
+// Unwrap the approval key with `secret`, sign `data`, forget the key.
+// Returns an SSH signature blob.
+export async function approveWithWrappedKey(secret, wrapped, data) {
+  const pkcs8 = await unwrap(secret, APPROVE_WRAP_INFO, wrapped, 'approval key');
+  try {
+    const key = await crypto.subtle.importKey('pkcs8', pkcs8, ED25519, false, ['sign']);
+    return ed25519SignatureBlob(new Uint8Array(await crypto.subtle.sign(ED25519, key, data)));
+  } finally {
+    pkcs8.fill(0);
+  }
 }
 
 // Generate the SSH key and return it wrapped under `secret`:
