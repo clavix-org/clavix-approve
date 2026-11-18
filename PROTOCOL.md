@@ -271,6 +271,10 @@ reuse their SSH code and the format names its algorithm.
   unlocks it.
 - A native app may hold a P-256 key in a secure element (the iPhone's
   Secure Enclave offers only P-256), behind its own biometric control.
+  On the iPhone the approval key is bound to the current biometric
+  enrolment (`.biometryCurrentSet`), as the SSH key is: enrolling a new
+  face or finger makes it unusable, and the phone must be paired again.
+  Nothing changes on the servers, which never see the approval key.
 
 The requester accepts no other key type.
 
@@ -298,6 +302,13 @@ that what the relay could flip is covered by a MAC or by the digits:
 `channel`, `signer id` and `label` are, as in sign mode, the bytes of
 their text (the ids in lowercase hex). Adding a device
 (`POST …/pair/open`) sends an approve-mode hello.
+
+Vectors: `testdata/approve-pairing.json` gives, from fixed pairing
+secret, HPKE and identity keys, the MAC key, the hello MAC, and for each
+approval key type the answer MAC and the six digits, with every
+transcript in hex. Made by `tools/approve-pairing-vectors.mjs`, recomputed
+with Python's standard library and OpenSSL by
+`tools/approve-vectors-check.sh`.
 
 ### Approval request (requester → signer)
 

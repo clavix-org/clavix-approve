@@ -1,9 +1,9 @@
 #!/bin/sh
-# Verifies testdata/approve-proof.json with OpenSSL, independently of the
+# Verifies testdata/approve-proof.json and approve-pairing.json, independently of the
 # Node code that generated it: the SSH blobs are taken apart by Python's
 # standard library, the signatures checked by `openssl`.
 #
-#   tools/approve-vectors-check.sh [testdata/approve-proof.json]
+#   tools/approve-vectors-check.sh [testdata/approve-proof.json [testdata/approve-pairing.json]]
 set -eu
 vectors=${1:-testdata/approve-proof.json}
 work=$(mktemp -d)
@@ -62,3 +62,63 @@ openssl pkey -pubin -inform DER -in "$work/ssh-ed25519.pub.der" -out "$work/ed.p
 openssl pkeyutl -verify -pubin -inkey "$work/ed.pem" -rawin -in "$work/signed" -sigfile "$work/ssh-ed25519.sig"
 openssl pkey -pubin -inform DER -in "$work/ecdsa-sha2-nistp256.pub.der" -out "$work/p256.pem"
 openssl dgst -sha256 -verify "$work/p256.pem" -signature "$work/ecdsa-sha2-nistp256.sig" "$work/signed"
+
+# ---- testdata/approve-pairing.json: MACs and digits, recomputed --------------
+pairing=${2:-testdata/approve-pairing.json}
+python3 -I - "$pairing" "$vectors" "$work" <<'EOF'
+import base64, hashlib, hmac, json, struct, sys
+
+v = json.load(open(sys.argv[1]))
+proofs = json.load(open(sys.argv[2]))
+work = sys.argv[3]
+b64u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+unb64u = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+string = lambda x: struct.pack(">I", len(x)) + x
+transcript = lambda kind, *fields: string(kind.encode()) + b"".join(string(f) for f in fields)
+
+# HKDF-SHA256 (RFC 5869), empty salt = HashLen zero bytes, one block.
+def hkdf(ikm, info):
+    prk = hmac.new(b"\0" * 32, ikm, hashlib.sha256).digest()
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+secret = bytes.fromhex(v["secret"])
+raw = unb64u(v["code"][len("cva1-"):])
+assert v["code"].startswith("cva1-") and raw[:16].hex() == v["channel"] and raw[16:] == secret, "code"
+key = hkdf(secret, b"clavix-approve/v1/pair-mac")
+assert key.hex() == v["mac_key"], "mac key"
+ch, signer, label = v["channel"].encode(), v["signer"].encode(), v["label"].encode()
+akem, asig = bytes.fromhex(v["agent"]["kem"]), bytes.fromhex(v["agent"]["sig"])
+skem, ssig = bytes.fromhex(v["signer_keys"]["kem"]), bytes.fromhex(v["signer_keys"]["sig"])
+assert len(akem) == len(skem) == 65 and akem[0] == skem[0] == 4 and len(asig) == len(ssig) == 32, "key sizes"
+
+t = transcript("approve-hello", ch, akem, asig, label)
+assert t.hex() == v["hello_transcript"], "hello transcript"
+assert b64u(hmac.new(key, t, hashlib.sha256).digest()) == v["hello_mac"], "hello mac"
+
+assert [a["approve"] for a in v["answers"]] == [k["approve"] for k in proofs["keys"]], "approve blobs"
+for a in v["answers"]:
+    blob = unb64u(a["approve"])
+    t = transcript("approve-answer", ch, signer, skem, ssig, blob, akem, asig)
+    assert t.hex() == a["answer_transcript"], a["type"] + " answer transcript"
+    assert b64u(hmac.new(key, t, hashlib.sha256).digest()) == a["answer_mac"], a["type"] + " answer mac"
+    t = transcript("clavix-approve/v1/approve-fingerprint", akem, asig, skem, ssig, blob)
+    assert t.hex() == a["fingerprint_transcript"], a["type"] + " fingerprint transcript"
+    n = struct.unpack(">I", hashlib.sha256(t).digest()[:4])[0] % 1_000_000
+    assert f"{n // 1000:03d} {n % 1000:03d}" == a["digits"], a["type"] + " digits"
+
+# The public keys must come from the fixed private keys: OpenSSL derives them.
+p256 = bytes.fromhex("3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420")
+ed = bytes.fromhex("302e020100300506032b657004220420")
+for side, name in ((v["agent"], "agent"), (v["signer_keys"], "signer")):
+    open(f"{work}/{name}-kem.der", "wb").write(p256 + bytes.fromhex(side["kem_private"]))
+    open(f"{work}/{name}-kem.expect", "w").write(side["kem"])
+    open(f"{work}/{name}-sig.der", "wb").write(ed + bytes.fromhex(side["sig_seed"]))
+    open(f"{work}/{name}-sig.expect", "w").write(side["sig"])
+print("approve-pairing: MACs and digits recomputed")
+EOF
+for k in agent-kem signer-kem agent-sig signer-sig; do
+  got=$(openssl pkey -inform DER -in "$work/$k.der" -pubout -outform DER | od -An -v -tx1 | tr -d ' \n')
+  case $k in *-kem) got=$(printf %s "$got" | tail -c 130) ;; *) got=$(printf %s "$got" | tail -c 64) ;; esac
+  [ "$got" = "$(cat "$work/$k.expect")" ] || { echo "public key mismatch: $k" >&2; exit 1; }
+done
+echo "approve-pairing: public keys match their private keys"
