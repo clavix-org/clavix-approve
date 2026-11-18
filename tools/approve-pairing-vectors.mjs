@@ -35,7 +35,7 @@ function ed25519Public(seed) {
 const secret = Buffer.alloc(16, 0x33);
 const channel = '00112233445566778899aabbccddeeff';
 const signer = '0123456789abcdef';
-const label = 'desktop20';
+const label = 'workstation';
 const agent = { kemPrivate: Buffer.alloc(32, 0x44), sigPrivate: Buffer.alloc(32, 0x55) };
 const phone = { kemPrivate: Buffer.alloc(32, 0x66), sigPrivate: Buffer.alloc(32, 0x77) };
 for (const side of [agent, phone]) {
