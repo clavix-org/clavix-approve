@@ -113,8 +113,9 @@ not cache.
   a device refuses the login.
 - **A request left unanswered expires** after 90 seconds and `ssh` fails
   with `agent refused operation`.
-- **Pairing with a QR code**: `clavix-agent pair` prints the code and a QR
-  code of it. The phone's camera opens the page in the browser, which
+- **Pairing with a QR code**: `clavix-agent pair` prints the code, the
+  same code as a link carrying the relay address (one line, to copy), and
+  a QR code of that link. The phone's camera opens the page in the browser, which
   only offers to copy the code; it must then be pasted in the installed
   app, whose storage is separate.
 

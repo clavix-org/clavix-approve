@@ -104,8 +104,12 @@ fn default_socket() -> Result<PathBuf, String> {
 /// is not the screen this is displayed on, its camera opens the approval
 /// page with the code.
 fn show_code(relay: &str, code: &str) {
+    let url = pairing_url(relay, code);
     println!("Pairing code (valid 15 minutes, works once):\n\n    {code}\n");
-    if let Some(qr) = terminal_qr(&pairing_url(relay, code)) {
+    // The same code with the relay address, on one line to copy: an app
+    // that reads it needs no relay typed in.
+    println!("As a link, with the relay address:\n\n    {url}\n");
+    if let Some(qr) = terminal_qr(&url) {
         println!("Or scan this with the phone's camera, then follow the page:\n\n{qr}");
     }
     println!("Enter the code in the approval app. Waiting…");
