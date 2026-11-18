@@ -239,6 +239,151 @@ exists. A client therefore takes `401` on revocation as "already revoked".
 Revocation cuts the channel, not the key: a revoked device's SSH key still
 opens every server whose `authorized_keys` lists it. Both ends say so.
 
+## Approve mode
+
+Format fixed, not implemented yet. In approve mode the requester holds
+the SSH key and the signer only approves: it returns a signed "yes" that
+the requester checks before signing with its own key. It is meant for
+Clavix desktop ([`DESKTOP_APPROVAL.md`](DESKTOP_APPROVAL.md)), which takes
+the agent's place on its own channel; "requester" below is that agent.
+Everything not stated here is as in sign mode: sealed channel, relay API,
+several devices, revocation.
+
+A channel is in one mode for good, set at pairing; every device on it is
+in that mode.
+
+### Approval key
+
+| Key | Held by | Use |
+|---|---|---|
+| Approval key, `ssh-ed25519` or `ecdsa-sha2-nistp256` | signer, usable only after user verification | signs approvals |
+
+It is a key of its own: neither the SSH key of sign mode nor the
+signer's Ed25519 identity key, which signs every sealed message and is
+usable without user verification (an approval signed with it would prove
+that the signer ran, not that the user verified). On the wire it is an
+SSH public key blob, and a proof is an SSH signature blob, so both ends
+reuse their SSH code and the format names its algorithm.
+
+- The page holds an Ed25519 key, wrapped like the SSH key with
+  `info = "clavix-approve/v1/approve-key-wrap"` and `aad` = its SSH
+  public key blob; the PRF input is the same, so one user verification
+  unlocks it.
+- A native app may hold a P-256 key in a secure element (the iPhone's
+  Secure Enclave offers only P-256), behind its own biometric control.
+
+The requester accepts no other key type.
+
+### Pairing in approve mode
+
+As in "Pairing", with three changes, each one also changing a label so
+that what the relay could flip is covered by a MAC or by the digits:
+
+1. The hello gains `mode: "approve"`, and its MAC uses the label
+   `"approve-hello"` in place of `"hello"`:
+   `HMAC-SHA256(mac key, string("approve-hello") || string(channel) || string(kem) || string(sig) || string(label))`.
+   A signer that does not know approve mode checks the `"hello"` MAC,
+   which fails: it refuses the code instead of pairing in the wrong mode.
+   A relay that strips or adds `mode` breaks the MAC the same way.
+2. The signer's answer is `{ t: "pair", approve, comment, kem, mac }`,
+   with `approve` = `b64u(approval key's SSH public key blob)` and no
+   `key`. Its MAC is
+   `HMAC-SHA256(mac key, string("approve-answer") || string(channel) || string(signer id) || string(signer kem) || string(signer sig) || string(approve blob) || string(agent kem) || string(agent sig))`.
+   The requester accepts only an answer with `approve`, of an accepted
+   type, under this MAC. A sign-mode agent finds no `key` and refuses it.
+3. The six digits are the first four bytes of
+   `SHA-256(string("clavix-approve/v1/approve-fingerprint") || string(agent kem) || string(agent sig) || string(signer kem) || string(signer sig) || string(approve blob))`
+   as a big-endian integer modulo 10⁶.
+
+`channel`, `signer id` and `label` are, as in sign mode, the bytes of
+their text (the ids in lowercase hex). Adding a device
+(`POST …/pair/open`) sends an approve-mode hello.
+
+### Approval request (requester → signer)
+
+Relay envelope and header as for a sign request (header kind `request`:
+the relay does not learn the mode). Content:
+
+```
+{ t: "approve", id, iat, exp,
+  key:     b64u(SSH public key blob the requester would sign with),
+  keyName: key comment,                          unverified
+  data:    b64u(bytes the requester would sign),
+  flags, binds, caller, agent, hints }           as in a sign request
+```
+
+**Telling requests apart.** Every request content carries `t`: `"sign"`
+in sign mode (it always has), `"approve"` here. A signer acts only on the
+`t` of the mode it was paired in, and answers any other request with
+`denied`, reason `malformed`, as signers already do for anything but
+`"sign"`. A requester sends `"approve"` only on an approve-mode channel.
+
+The signer checks it as a sign request ("Sign request", steps 1 to 4),
+except that in step 1 the user-auth request must be made with the key
+named in `key`, not with a key of its own, and may use `ssh-ed25519`,
+`ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`,
+`rsa-sha2-256` or `rsa-sha2-512`, the algorithm matching the key. It
+shows the destination as in sign mode, and the key's comment and
+fingerprint labelled as reported by the requester.
+
+### Approval response (signer → requester)
+
+Sealed, header kind `response`:
+
+```
+{ t: "approved", id, req, proof: b64u(SSH signature blob) }
+{ t: "denied",   id, req, reason }               as in sign mode
+```
+
+`req` is the same in both modes:
+`b64u(SHA-256(the request's msg))`, where the hashed bytes are the `msg`
+field exactly as the relay lists it, that is the base64url text itself
+(ASCII), not the bytes it decodes to. The requester hashes the `msg` it
+posted.
+
+`proof` is a complete SSH signature, `string(algorithm) || string(blob)`,
+made with the approval key over
+
+```
+"clavix-approve/v1 approve" || string(channel) || string(signer id) || string(id) || string(digest)
+```
+
+where the first 25 bytes are that ASCII text with no length in front,
+`channel`, `signer id` and `id` are the bytes of their lowercase hex text,
+and `digest` is the 32 raw bytes of the SHA-256 above (not its base64url
+form). For `ssh-ed25519` the blob is the Ed25519 signature of those bytes
+(RFC 8709); for `ecdsa-sha2-nistp256` it is `mpint(r) || mpint(s)` of an
+ECDSA P-256 signature over their SHA-256 (RFC 5656). Since the digest
+covers the whole request, the proof names the data, key and bindings
+that were shown.
+
+The bare prefix keeps a proof apart from what an SSH key signs
+elsewhere: a user-auth request starts with `string(session id)`, whose
+first four bytes are a small length, and an `SSHSIG` blob with the bytes
+`SSHSIG`; a proof starts with `clav`. Neither can be taken for the other.
+
+The requester checks the sealed envelope, `id` and `req` as in sign mode,
+then `proof` under the approval key recorded for that signer, and only
+then signs. Vectors: `testdata/approve-proof.json`, one per key type,
+made by `tools/approve-vectors.mjs` and checked with OpenSSL by
+`tools/approve-vectors-check.sh`. An ECDSA signature differs on every run:
+verify the vector, do not reproduce it.
+
+### Withdrawing a request
+
+There is no cancel message. When the request is settled elsewhere (the
+local dialog answered first, or it timed out), the requester withdraws it
+with `POST /api/ch/{ch}/requests/{id}/cancel`, as the pickup rule does.
+No new relay entry is created and the signer sends nothing back: the
+request leaves the signer's pending list, so its long-poll (whose `known`
+no longer matches) returns and it drops the request. An answer posted
+meanwhile gets `expired` from the relay; one that got through first is
+ignored by the requester, which no longer waits for it. The relay learns
+that a request was withdrawn, as it already does with pickup.
+
+Withdrawing a notification already shown by a push service is the
+relay's and the app's business, not part of this format.
+
 ## Agent behaviour worth knowing
 
 - Default expiry 90 s (`--timeout`), under sshd's `LoginGraceTime`.

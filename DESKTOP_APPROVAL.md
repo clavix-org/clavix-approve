@@ -67,8 +67,8 @@ treated as unlocked, and the setting says so, like the screen-lock
 auto-lock trigger does.
 
 When both are asked, the **first answer wins**: the other prompt is
-withdrawn (dialog closed; on the phone, a `cancel` message removes the
-request). A deny from either side denies. The desktop's confirmation
+withdrawn (dialog closed; on the phone, the desktop withdraws the
+request on the relay). A deny from either side denies. The desktop's confirmation
 timeout is 30 s today (`commands/ssh.rs`), shorter than the 16 to 29 s
 measured from `ssh` to approval on the phone in phase 0; once the phone
 is asked it becomes 90 s, as in `clavix-agent`, to stay under sshd's
@@ -107,18 +107,16 @@ is a possible later addition, with an explicit "not verified" screen.
 Relay: **none.** The desktop is one more agent on its own channel; the
 relay keeps seeing opaque messages and a constant push.
 
+The wire format is fixed in `PROTOCOL.md`, "Approve mode"; this section
+gives the reasons.
+
 ### Keys
 
-One new key on the phone:
-
-| Key | Held by | Use |
-|---|---|---|
-| Approval key, Ed25519 | signer, wrapped under the passkey's PRF secret | signs approvals |
-
-Wrapped like the SSH key, with its own derivation:
-`HKDF-SHA256(PRF secret, salt = 32 zero bytes, info =
-"clavix-approve/v1/approve-key-wrap")`, `aad` = the raw public key. The
-PRF input stays the same, so one passkey verification unlocks either key.
+One new key on the phone, the **approval key**: Ed25519 on the page,
+wrapped under the passkey's PRF secret like the SSH key; P-256 in the
+Secure Enclave for a native iPhone app, which offers no Ed25519. It
+travels as an SSH public key blob and signs SSH signature blobs, so both
+types fit one format and both ends reuse their SSH code.
 
 Why a separate key: the phone's Ed25519 identity key signs every sealed
 message but is usable without user verification (the page needs it to
@@ -128,56 +126,31 @@ kinds of statement; a key per purpose keeps them apart.
 
 ### Pairing
 
-Same exchange as `PROTOCOL.md`, "Pairing", with:
-
-- the hello gains `role: "desktop"`; the page then pairs in approve mode
-  and creates no SSH key;
-- the signer's `pair` message carries `approve` (the approval public key,
-  32 bytes, b64u) in place of `key`; the MAC and the six-digit fingerprint
-  cover it in place of the SSH key blob;
-- the desktop shows "approval only, nothing to install on servers".
+Same exchange as `PROTOCOL.md`, "Pairing", with the hello marked
+`mode: "approve"` and the approval key in place of the SSH key. Each
+change also changes a MAC or fingerprint label, so the relay cannot pair
+a device in the wrong mode. The desktop shows "approval only, nothing to
+install on servers".
 
 A phone can be paired with a desktop and with `clavix-agent`s; each
 pairing is its own channel.
 
-### Approval request (desktop → signer)
+### Approval request and response
 
-Header kind `request`, as today (the relay does not learn the purpose).
-Content:
+The request is a sign request with `t: "approve"` and the vault key in
+`key`; the response is `approved` with a `proof`, an SSH signature by the
+approval key over the channel, signer id, request id and the SHA-256 of
+the request message as received. The proof thus names the exact data,
+key and bindings that were shown. The desktop checks the sealed envelope
+as today, then the proof under the approval key recorded at pairing, and
+only then signs.
 
-```
-{ t: "approve", id, iat, exp,
-  key:     b64u(SSH public key blob of the vault key),
-  keyName: key comment, unverified,
-  data:    b64u(bytes the vault key would sign),
-  flags, binds, caller, agent, hints }          as in a sign request
-```
+### Withdrawing a request
 
-### Response (signer → desktop)
-
-```
-{ t: "approved", id, req, proof: b64u(Ed25519 signature) }
-{ t: "denied",   id, req, reason }               as today
-```
-
-`proof` signs, under the approval key:
-
-```
-string("clavix-approve/v1 approve") || string(channel) || string(signer id)
-  || string(id) || string(req)
-```
-
-`req` is the SHA-256 of the request message as received, so the proof
-names the exact data, key and bindings that were shown. The desktop
-checks the sealed envelope as today, then the proof under the approval
-key recorded at pairing, and only then signs.
-
-### Cancel (desktop → signer)
-
-New content type `{ t: "cancel", id }`, header kind `request`, sent when
-the local dialog answered first. The page removes the request; a late
-`approved` is ignored by the desktop since the request is no longer
-pending.
+When the local dialog answers first, the desktop withdraws the request on
+the relay (`POST …/requests/{id}/cancel`, added for several devices): the
+phone's page drops it at its next poll. No cancel message is needed; a
+late `approved` is ignored since the request is no longer pending.
 
 ## Clavix desktop changes
 
