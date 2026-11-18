@@ -43,12 +43,14 @@ class Clock:
 class FakePush:
     def __init__(self, gone=False, supports_apns=True):
         self.sent = []
+        self.groups = []
         self.gone = gone
         self.supports_apns = supports_apns
         self.done = threading.Event()
 
-    def send(self, sub, payload):
+    def send(self, sub, payload, group=None):
         self.sent.append((sub.get("endpoint") or sub.get("apns"), payload))
+        self.groups.append(group)
         self.done.set()
         return "fake push", self.gone
 
@@ -417,6 +419,7 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(self.request(), (200, {"state": "queued", "push": True}))
         self.assertTrue(self.push.done.wait(5))
         self.assertEqual(self.push.sent, [(TOKEN, {"t": "sign"})])
+        self.assertEqual(self.push.groups, [CH])
 
     def test_a_relay_without_apns_keeps_the_web_push_subscription(self):
         self.push.supports_apns = False
@@ -451,8 +454,8 @@ class ApnsTest(unittest.TestCase):
         self.apns = R.ApnsPush(pem, "KEYID12345", "TEAMID1234", "org.clavix.approve",
                                client=client, now=self.clock)
 
-    def send(self, sandbox=False):
-        return self.apns.send({"apns": TOKEN, "sandbox": sandbox}, {"t": "sign"})
+    def send(self, sandbox=False, group=None):
+        return self.apns.send({"apns": TOKEN, "sandbox": sandbox}, {"t": "sign"}, group)
 
     def jwt_claims(self, request):
         head, body, sig = request.headers["authorization"].split(" ")[1].split(".")
@@ -475,6 +478,19 @@ class ApnsTest(unittest.TestCase):
             "sound": "default", "interruption-level": "time-sensitive"}})
         self.assertEqual(self.jwt_claims(r), ({"alg": "ES256", "kid": "KEYID12345"},
                                               {"iss": "TEAMID1234", "iat": int(self.clock.t)}))
+
+    def test_a_channel_shows_one_notification_at_most(self):
+        group = R.apns_group(CH)
+        self.assertRegex(group, r"^[0-9a-f]{32}$")
+        self.assertNotIn(CH, group)
+        self.assertNotEqual(group, R.apns_group(CH + "x"))
+        self.send(group=group)
+        r = self.calls[0]
+        self.assertEqual(r.headers["apns-collapse-id"], group)
+        self.assertEqual(json.loads(r.content)["aps"]["thread-id"], group)
+        self.send()
+        self.assertNotIn("apns-collapse-id", self.calls[1].headers)
+        self.assertNotIn("thread-id", json.loads(self.calls[1].content)["aps"])
 
     def test_a_development_build_goes_to_the_sandbox(self):
         self.send(sandbox=True)
@@ -511,9 +527,10 @@ class ApnsTest(unittest.TestCase):
     def test_the_route_follows_the_subscription(self):
         web = FakePush()
         pushers = R.Pushers(web, self.apns)
-        pushers.send({"apns": TOKEN, "sandbox": False}, {"t": "sign"})
-        pushers.send({"endpoint": APPLE, "keys": {}}, {"t": "sign"})
+        pushers.send({"apns": TOKEN, "sandbox": False}, {"t": "sign"}, group=CH)
+        pushers.send({"endpoint": APPLE, "keys": {}}, {"t": "sign"}, group=CH)
         self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0].headers["apns-collapse-id"], R.apns_group(CH))
         self.assertEqual(web.sent, [(APPLE, {"t": "sign"})])
         self.assertTrue(pushers.supports_apns)
         self.assertFalse(R.Pushers(web).supports_apns)

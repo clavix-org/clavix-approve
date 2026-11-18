@@ -220,10 +220,22 @@ APNS_HOSTS = {False: "https://api.push.apple.com", True: "https://api.sandbox.pu
 APNS_TTL = 90               # seconds Apple keeps trying: a request expires in 90 s
 APNS_TOKEN_LIFETIME = 40 * 60   # Apple wants a new one after 20 to 60 minutes
 # Content-free, like the Web Push: the app fetches the request itself.
-APNS_PAYLOAD = json.dumps({"aps": {
-    "alert": {"title": "Clavix", "body": "Une demande de signature attend"},
-    "sound": "default", "interruption-level": "time-sensitive"}},
-    ensure_ascii=False, separators=(",", ":")).encode()
+APNS_ALERT = {"title": "Clavix", "body": "Une demande de signature attend"}
+
+
+def apns_group(ch):
+    """The notification group of a channel, sent as apns-collapse-id and
+    thread-id: a new push replaces the one shown instead of piling up, so a
+    device shows at most one "a request waits" per channel. Derived, so
+    Apple never sees the channel id itself."""
+    return hashlib.sha256(b"clavix-approve/apns-group\0" + ch.encode()).hexdigest()[:32]
+
+
+def apns_payload(group=None):
+    aps = {"alert": APNS_ALERT, "sound": "default", "interruption-level": "time-sensitive"}
+    if group:
+        aps["thread-id"] = group
+    return json.dumps({"aps": aps}, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 class ApnsPush:
@@ -255,8 +267,9 @@ class ApnsPush:
                                  {"iss": self.team_id, "iat": int(now)})
         return self.jwt
 
-    def send(self, sub, payload):
-        """`payload` is the Web Push one; APNs always gets APNS_PAYLOAD."""
+    def send(self, sub, payload, group=None):
+        """`payload` is the Web Push one; APNs always gets the constant
+        alert, grouped by `group` (see apns_group) when given."""
         where = "APNs sandbox" if sub["sandbox"] else "APNs"
         if not self.enabled:
             return f"push disabled, not sent to {where}", False
@@ -266,8 +279,10 @@ class ApnsPush:
                        "apns-topic": self.topic, "apns-push-type": "alert",
                        "apns-priority": "10",
                        "apns-expiration": str(int(self.now()) + APNS_TTL)}
+            if group:
+                headers["apns-collapse-id"] = group
             try:
-                r = self.client.post(url, content=APNS_PAYLOAD, headers=headers)
+                r = self.client.post(url, content=apns_payload(group), headers=headers)
             except Exception as e:  # network
                 return f"push to {where} failed: {type(e).__name__}", False
             try:
@@ -298,11 +313,11 @@ class Pushers:
     def public_key(self):
         return self.webpush.public_key()
 
-    def send(self, sub, payload):
+    def send(self, sub, payload, group=None):
         if "apns" in sub:
             if self.apns is None:
                 return "APNs not configured, not sent", False
-            return self.apns.send(sub, payload)
+            return self.apns.send(sub, payload, apns_group(group) if group else None)
         return self.webpush.send(sub, payload)
 
 
@@ -645,7 +660,7 @@ class Relay:
         return 200, {"state": "cancelled"}
 
     def _wake(self, ch, sid, sub):
-        outcome, gone = self.push.send(sub, {"t": "sign"})   # content-free
+        outcome, gone = self.push.send(sub, {"t": "sign"}, group=ch)   # content-free
         log(f"channel {ch[:8]}: {outcome}")
         if gone:
             with self.cond:
