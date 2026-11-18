@@ -2,12 +2,14 @@
 """clavix-approve relay.
 
 Carries opaque messages between a key-less SSH agent and the phone that
-signs, wakes the phone with a content-free Web Push, and serves the
-approval page from the same origin (the passkey is bound to that host).
+signs, wakes the phone with a content-free Web Push (the page) or APNs
+notification (the iOS app), and serves the approval page from the same
+origin (the passkey is bound to that host).
 
 The relay is untrusted: it never sees a key or a destination, it can only
 delay or drop. It needs nothing but the standard library and
-python3-cryptography.
+python3-cryptography; APNs, which is HTTP/2 only, also needs
+httpx[http2], imported only when APNs is configured.
 
 Meant to run behind a TLS-terminating reverse proxy. Conventions that
 follow from that:
@@ -26,6 +28,11 @@ Configuration (environment):
   RELAY_WEB_DIR        approval page, default ../web next to this file
   RELAY_VAPID_SUB      VAPID contact, default mailto:webpush@example.com
   RELAY_PUSH           "on" (default) or "off" (log instead of sending)
+  RELAY_APNS_KEY_FILE  APNs auth key (.p8) from the Apple developer account;
+                       APNs is off without it
+  RELAY_APNS_KEY_ID    its key id (10 characters)
+  RELAY_APNS_TEAM_ID   the developer team id (10 characters)
+  RELAY_APNS_TOPIC     the app's bundle id, default org.clavix.approve
 
 Usage: relay.py              run the service
        relay.py --selftest   check the push encryption offline
@@ -59,6 +66,9 @@ REQUEST_RE = re.compile(r"^[0-9a-f]{32}$")
 SIGNER_RE = re.compile(r"^[0-9a-f]{16}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 KNOWN_RE = re.compile(r"^([0-9a-f]{32}(,[0-9a-f]{32}){0,31})?$")
+# An APNs device token: 32 bytes today, Apple says the length may grow.
+APNS_TOKEN_RE = re.compile(r"^(?:[0-9a-f]{2}){32,100}$")
+APNS_ID_RE = re.compile(r"^[0-9A-Z]{10}$")
 
 MAX_BODY = 64 * 1024        # one HTTP request body
 MAX_BLOB = 8 * 1024         # pairing hello / answer
@@ -136,14 +146,19 @@ def load_vapid_key(state_dir):
     return k
 
 
+def es256_jwt(key, header, claims):
+    def part(obj):
+        return b64u(json.dumps(obj, separators=(",", ":")).encode())
+    signed = f"{part({'alg': 'ES256', **header})}.{part(claims)}"
+    r, s = decode_dss_signature(key.sign(signed.encode(), ec.ECDSA(hashes.SHA256())))
+    return f"{signed}.{b64u(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
+
+
 def vapid_header(key, endpoint, sub):
     u = urllib.parse.urlsplit(endpoint)
-    head = b64u(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode())
-    body = b64u(json.dumps({"aud": f"{u.scheme}://{u.netloc}", "exp": int(time.time()) + 3600,
-                            "sub": sub}, separators=(",", ":")).encode())
-    r, s = decode_dss_signature(key.sign(f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256())))
-    sig = b64u(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
-    return f"vapid t={head}.{body}.{sig}, k={b64u(raw_pub(key))}"
+    jwt = es256_jwt(key, {"typ": "JWT"}, {"aud": f"{u.scheme}://{u.netloc}",
+                                          "exp": int(time.time()) + 3600, "sub": sub})
+    return f"vapid t={jwt}, k={b64u(raw_pub(key))}"
 
 
 def push_encrypt(payload, p256dh, auth, as_key=None, salt=None):
@@ -197,6 +212,113 @@ class WebPush:
             return f"push rejected by {host} (HTTP {e.code})", e.code in (404, 410)
         except Exception as e:  # network
             return f"push to {host} failed: {type(e).__name__}", False
+
+
+# ---- APNs (the iOS app) -----------------------------------------------------
+
+APNS_HOSTS = {False: "https://api.push.apple.com", True: "https://api.sandbox.push.apple.com"}
+APNS_TTL = 90               # seconds Apple keeps trying: a request expires in 90 s
+APNS_TOKEN_LIFETIME = 40 * 60   # Apple wants a new one after 20 to 60 minutes
+# Content-free, like the Web Push: the app fetches the request itself.
+APNS_ALERT = {"title": "Clavix", "body": "Une demande de signature attend"}
+
+
+def apns_group(ch):
+    """The notification group of a channel, sent as apns-collapse-id and
+    thread-id: a new push replaces the one shown instead of piling up, so a
+    device shows at most one "a request waits" per channel. Derived, so
+    Apple never sees the channel id itself."""
+    return hashlib.sha256(b"clavix-approve/apns-group\0" + ch.encode()).hexdigest()[:32]
+
+
+def apns_payload(group=None):
+    aps = {"alert": APNS_ALERT, "sound": "default", "interruption-level": "time-sensitive"}
+    if group:
+        aps["thread-id"] = group
+    return json.dumps({"aps": aps}, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+class ApnsPush:
+    """Sends the wake-up to the iOS app. Same contract as WebPush.send."""
+
+    def __init__(self, key_pem, key_id, team_id, topic, enabled=True, client=None,
+                 now=time.time):
+        if not (APNS_ID_RE.match(key_id or "") and APNS_ID_RE.match(team_id or "")):
+            raise ValueError("RELAY_APNS_KEY_ID and RELAY_APNS_TEAM_ID must be 10-character ids")
+        self.key = serialization.load_pem_private_key(key_pem, None)
+        if not isinstance(self.key, ec.EllipticCurvePrivateKey):
+            raise ValueError("the APNs key must be an EC (.p8) key")
+        self.key_id, self.team_id, self.topic = key_id, team_id, topic
+        self.enabled = enabled
+        self.now = now
+        self.lock = threading.Lock()
+        self.jwt, self.jwt_at = None, 0
+        if client is None and enabled:
+            import httpx   # only here: the page alone does not need it
+            client = httpx.Client(http2=True, timeout=15)
+        self.client = client
+
+    def _token(self):
+        """The provider token, reused: Apple refuses one renewed too often."""
+        now = self.now()
+        if self.jwt is None or now - self.jwt_at > APNS_TOKEN_LIFETIME:
+            self.jwt_at = now
+            self.jwt = es256_jwt(self.key, {"kid": self.key_id},
+                                 {"iss": self.team_id, "iat": int(now)})
+        return self.jwt
+
+    def send(self, sub, payload, group=None):
+        """`payload` is the Web Push one; APNs always gets the constant
+        alert, grouped by `group` (see apns_group) when given."""
+        where = "APNs sandbox" if sub["sandbox"] else "APNs"
+        if not self.enabled:
+            return f"push disabled, not sent to {where}", False
+        url = f"{APNS_HOSTS[bool(sub['sandbox'])]}/3/device/{sub['apns']}"
+        with self.lock:   # one HTTP/2 connection per host, shared; pushes are rare
+            headers = {"authorization": f"bearer {self._token()}",
+                       "apns-topic": self.topic, "apns-push-type": "alert",
+                       "apns-priority": "10",
+                       "apns-expiration": str(int(self.now()) + APNS_TTL)}
+            if group:
+                headers["apns-collapse-id"] = group
+            try:
+                r = self.client.post(url, content=apns_payload(group), headers=headers)
+            except Exception as e:  # network
+                return f"push to {where} failed: {type(e).__name__}", False
+            try:
+                reason = r.json().get("reason", "")
+            except ValueError:
+                reason = ""
+            if r.status_code == 403 and reason in ("ExpiredProviderToken",
+                                                   "InvalidProviderToken"):
+                self.jwt = None   # the next push signs a new one
+        if r.status_code == 200:
+            return f"push accepted by {where} (HTTP 200)", False
+        # 410: the app is gone from the device; BadDeviceToken: never valid
+        # for this environment. Either way the subscription is dead.
+        gone = r.status_code == 410 or reason == "BadDeviceToken"
+        return f"push rejected by {where} (HTTP {r.status_code} {reason})".rstrip(), gone
+
+
+class Pushers:
+    """Routes a wake-up to Web Push or APNs, after the subscription's kind."""
+
+    def __init__(self, webpush, apns=None):
+        self.webpush, self.apns = webpush, apns
+
+    @property
+    def supports_apns(self):
+        return self.apns is not None
+
+    def public_key(self):
+        return self.webpush.public_key()
+
+    def send(self, sub, payload, group=None):
+        if "apns" in sub:
+            if self.apns is None:
+                return "APNs not configured, not sent", False
+            return self.apns.send(sub, payload, apns_group(group) if group else None)
+        return self.webpush.send(sub, payload)
 
 
 # ---- Relay logic (HTTP-independent) ---------------------------------------
@@ -416,16 +538,29 @@ class Relay:
     # -- signer side --
 
     def put_subscription(self, ch, token, body):
-        keys = body.get("keys")
-        if not (push_host_allowed(body.get("endpoint")) and isinstance(keys, dict)
-                and isinstance(keys.get("p256dh"), str) and isinstance(keys.get("auth"), str)):
-            return self.BAD
+        """Store how to wake this signer: a Web Push subscription
+        `{endpoint, keys: {p256dh, auth}}` or an APNs device token
+        `{apns: hex, sandbox: bool}`. A relay without APNs answers
+        `unsupported` to the latter and keeps what it had."""
+        if "apns" in body:
+            if not (isinstance(body["apns"], str) and APNS_TOKEN_RE.match(body["apns"])
+                    and isinstance(body.get("sandbox"), bool)):
+                return self.BAD
+            sub = {"apns": body["apns"], "sandbox": body["sandbox"]}
+        else:
+            keys = body.get("keys")
+            if not (push_host_allowed(body.get("endpoint")) and isinstance(keys, dict)
+                    and isinstance(keys.get("p256dh"), str) and isinstance(keys.get("auth"), str)):
+                return self.BAD
+            sub = {"endpoint": body["endpoint"],
+                   "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
         with self.cond:
             c, sid = self._channel(ch, token, "signer")
             if c is None:
                 return self.DENIED
-            c["signers"][sid]["sub"] = {"endpoint": body["endpoint"],
-                                        "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
+            if "apns" in sub and not getattr(self.push, "supports_apns", False):
+                return 200, {"state": "unsupported"}
+            c["signers"][sid]["sub"] = sub
             self._save()
         return 200, {"state": "stored"}
 
@@ -525,7 +660,7 @@ class Relay:
         return 200, {"state": "cancelled"}
 
     def _wake(self, ch, sid, sub):
-        outcome, gone = self.push.send(sub, {"t": "sign"})   # content-free
+        outcome, gone = self.push.send(sub, {"t": "sign"}, group=ch)   # content-free
         log(f"channel {ch[:8]}: {outcome}")
         if gone:
             with self.cond:
@@ -730,9 +865,20 @@ def make_handler(relay, static, vapid_public):
     return Handler
 
 
-def serve(bind, port, state_dir, enroll_secret, web_dir, contact, push_enabled):
+def load_apns(env, enabled):
+    """An ApnsPush from the environment, or None when no key is given."""
+    path = env.get("RELAY_APNS_KEY_FILE")
+    if not path:
+        return None
+    with open(path, "rb") as f:
+        pem = f.read()
+    return ApnsPush(pem, env.get("RELAY_APNS_KEY_ID"), env.get("RELAY_APNS_TEAM_ID"),
+                    env.get("RELAY_APNS_TOPIC", "org.clavix.approve"), enabled)
+
+
+def serve(bind, port, state_dir, enroll_secret, web_dir, contact, push_enabled, apns=None):
     os.makedirs(state_dir, exist_ok=True)
-    push = WebPush(state_dir, contact, push_enabled)
+    push = Pushers(WebPush(state_dir, contact, push_enabled), apns)
     relay = Relay(state_dir, enroll_secret, push)
     static = load_static(web_dir)
     server = ThreadingHTTPServer((bind, port), make_handler(relay, static, push.public_key()))
@@ -769,11 +915,13 @@ def main():
     if not secret or not state_dir:
         sys.exit("RELAY_ENROLL_SECRET and RELAY_STATE_DIR must be set")
     bind = os.environ.get("RELAY_BIND", "127.0.0.1")
+    push_enabled = os.environ.get("RELAY_PUSH", "on") != "off"
+    apns = load_apns(os.environ, push_enabled)
     server = serve(bind, port, state_dir, secret,
                    os.environ.get("RELAY_WEB_DIR", os.path.join(HERE, "..", "web")),
                    os.environ.get("RELAY_VAPID_SUB", "mailto:webpush@example.com"),
-                   os.environ.get("RELAY_PUSH", "on") != "off")
-    log(f"listening on {bind}:{port}")
+                   push_enabled, apns)
+    log(f"listening on {bind}:{port}, APNs {'on' if apns else 'off'}")
     server.serve_forever()
 
 

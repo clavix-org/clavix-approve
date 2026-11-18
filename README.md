@@ -25,7 +25,7 @@ phone yet, and nothing here has been audited. Do not rely on it.
 | Path | What |
 |---|---|
 | `agent/` | `clavix-agent` (Rust): the SSH agent protocol on a Unix socket, no private key; forwards each signature request to the paired device through the relay |
-| `relay/` | the relay (Python, standard library + `cryptography`): opaque messages, Web Push wake-up, serves the page |
+| `relay/` | the relay (Python, standard library + `cryptography`, plus `httpx[http2]` for APNs): opaque messages, Web Push or APNs wake-up, serves the page |
 | `web/` | the approval page (plain ES modules, no build step, no third-party code); `web/lib` holds everything security-relevant |
 | `tools/fake-phone.mjs` | command-line stand-in for the phone, running the page's own modules |
 | `tools/page-e2e.mjs` | drives the real page in headless Chrome with a virtual passkey |
@@ -82,6 +82,9 @@ passkey is bound to it, and nothing else should be served there.
 | `RELAY_VAPID_SUB` | contact sent to the push service, `mailto:` or `https:` |
 | `RELAY_PUSH` | `off` logs instead of sending |
 | `RELAY_WEB_DIR` | the page, default `../web` |
+| `RELAY_APNS_KEY_FILE` | APNs auth key (`.p8`) from the Apple developer account, to wake the iOS app; APNs is off without it |
+| `RELAY_APNS_KEY_ID`, `RELAY_APNS_TEAM_ID` | that key's id and the developer team id |
+| `RELAY_APNS_TOPIC` | the app's bundle id, default `org.clavix.approve` |
 
 The `Dockerfile` builds an image that runs as an unprivileged user on a
 read-only root filesystem, with `/state` as its volume and `GET /healthz`
