@@ -100,12 +100,12 @@ async function approveScene(type = 'ed25519', overrides = {}) {
   const host = await hostKey('ed25519');
   const inner = {
     t: 'approve', id: ID, iat: NOW - 1, exp: NOW + 90,
-    key: b64u(key.blob), keyName: 'jeriel@desktop20',
+    key: b64u(key.blob), keyName: 'user@workstation',
     data: b64u(userAuth({ sessionId: SID, keyBlob: key.blob, hostKey: host.blob, algorithm: key.algorithm })),
     flags: 0,
     binds: [await bind(host, SID)],
     caller: { pid: 7, name: 'ssh' },
-    agent: 'desktop20',
+    agent: 'workstation',
     hints: {},
     ...overrides,
   };
@@ -120,7 +120,7 @@ test('an approval request is checked with the key it names, of any agent key typ
     assert.equal(view.user, 'deploy');
     assert.equal(view.hops[0].fingerprint, await fingerprint(host.blob));
     assert.equal(view.keyFingerprint, await fingerprint(key.blob));
-    assert.equal(view.keyName, 'jeriel@desktop20');
+    assert.equal(view.keyName, 'user@workstation');
   }
   // RSA with SHA-256 too, never SHA-1.
   const rsa = await approveScene('rsa');
@@ -168,7 +168,7 @@ test('requester and signer pair in approve mode, and an approval goes through', 
   const secret = offer.secret;
 
   // Pairing: the hello says approve; the page answers with its approval key.
-  const hello = await readHello(await buildHello({ ch: offer.ch, secret, me: desktop, label: 'desktop20' }), offer.ch, secret);
+  const hello = await readHello(await buildHello({ ch: offer.ch, secret, me: desktop, label: 'workstation' }), offer.ch, secret);
   assert.equal(hello.mode, 'approve');
   const passkeySecret = crypto.getRandomValues(new Uint8Array(32));
   const approveKey = await createWrappedApproveKey(passkeySecret);
@@ -196,8 +196,8 @@ test('requester and signer pair in approve mode, and an approval goes through', 
   const sid = utf8('session');
   const data = userAuth({ sessionId: sid, keyBlob: key.blob, hostKey: host.blob, algorithm: 'ssh-ed25519' });
   const envelope = await approvalRequest({ ch: offer.ch, me: desktop, device, fields: {
-    key: b64u(key.blob), keyName: 'jeriel@desktop20', data: b64u(data), flags: 0,
-    binds: [await bind(host, sid)], caller: { pid: 1, name: 'ssh' }, agent: 'desktop20', hints: {},
+    key: b64u(key.blob), keyName: 'user@workstation', data: b64u(data), flags: 0,
+    binds: [await bind(host, sid)], caller: { pid: 1, name: 'ssh' }, agent: 'workstation', hints: {},
   } });
 
   const ctx = { ch: offer.ch, signer, me: phone, agent: hello.agent, mode: 'approve' };

@@ -25,8 +25,8 @@ the matching addition.
   choice is nearly permanent. The relying-party ID is a dedicated host,
   never the bare `clavix.org`, so that no other page of the domain can
   ask the passkey for anything; nothing else is served on that host.
-  `approve.clavix.org` is reserved for a possible public service; the
-  prototype uses `approve-dev.clavix.org`.
+  `approve.clavix.org` is reserved for a possible public service; a
+  separate host serves the prototype.
 
 ## Problem
 

@@ -73,7 +73,7 @@ async function main() {
   const phone = join(dir, 'phone.json');
 
   // 1. Pairing in approve mode.
-  const pairing = node('fake-desktop.mjs', ['pair', '--relay', relay, '--state', desk, '--label', 'desktop20'],
+  const pairing = node('fake-desktop.mjs', ['pair', '--relay', relay, '--state', desk, '--label', 'workstation'],
     { ...process.env, CLAVIX_ENROLL_SECRET: 'approve-e2e' });
   const { code } = await until('the pairing code', () => event(pairing, 'code'));
   const device = node('fake-phone.mjs', ['pair', '--relay', relay, '--state', phone, '--code', code]);
