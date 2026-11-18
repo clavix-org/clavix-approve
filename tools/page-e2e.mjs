@@ -351,6 +351,12 @@ try {
 } finally {
   for (const child of children) child.kill();
   await sleep(200);
-  rmSync(dir, { recursive: true, force: true });
+  // Chrome may still be writing its profile after the kill: retry, and never
+  // let the cleanup turn a passing run into a failure.
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (e) {
+    console.error(`page-e2e: could not remove ${dir}: ${e.message}`);
+  }
 }
 process.exit(failed ? 1 : 0);
