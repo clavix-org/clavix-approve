@@ -24,7 +24,8 @@ phone yet, and nothing here has been audited. Do not rely on it.
 
 | Path | What |
 |---|---|
-| `agent/` | `clavix-agent` (Rust): the SSH agent protocol on a Unix socket, no private key; forwards each signature request to the paired device through the relay |
+| `core/` | `clavix-approve-core` (Rust library): the sealed channel, pairing in both modes, the relay client, and the approve-mode requester that Clavix desktop uses |
+| `agent/` | `clavix-agent` (Rust, on `core/`): the SSH agent protocol on a Unix socket, no private key; forwards each signature request to the paired device through the relay |
 | `relay/` | the relay (Python, standard library + `cryptography`, plus `httpx[http2]` for APNs): opaque messages, Web Push or APNs wake-up, serves the page |
 | `web/` | the approval page (plain ES modules, no build step, no third-party code); `web/lib` holds everything security-relevant |
 | `tools/fake-phone.mjs` | command-line stand-in for the phone, running the page's own modules |
@@ -42,15 +43,15 @@ Needs Rust, Python 3 with `cryptography`, Node 22 and OpenSSH.
 RELAY_ENROLL_SECRET=dev RELAY_STATE_DIR=./state RELAY_PUSH=off python3 relay/relay.py
 
 # 2. pair: the agent prints a code…
-cargo build --manifest-path agent/Cargo.toml
-CLAVIX_ENROLL_SECRET=dev agent/target/debug/clavix-agent pair --relay http://127.0.0.1:8765
+cargo build -p clavix-agent
+CLAVIX_ENROLL_SECRET=dev target/debug/clavix-agent pair --relay http://127.0.0.1:8765
 
 # …which the stand-in enters (or the page, at http://localhost:8765)
 node tools/fake-phone.mjs pair --relay http://127.0.0.1:8765 --state ./state/phone.json --code cva1-…
 
 # 3. run both, then use ssh with the agent's socket
 node tools/fake-phone.mjs run --state ./state/phone.json &
-agent/target/debug/clavix-agent run --socket ./state/agent.sock &
+target/debug/clavix-agent run --socket ./state/agent.sock &
 ssh -o IdentityAgent=./state/agent.sock user@host
 ```
 
@@ -60,8 +61,9 @@ a test tool, never give its key access to a real server.
 ## Tests
 
 ```sh
-cargo test --manifest-path agent/Cargo.toml     # protocol core, channel, pairing, and end to end:
+cargo test --workspace                          # channel, pairing, requester, agent, and end to end:
                                                 #   ssh → agent → relay → fake phone → sshd
+                                                #   requester → relay → fake phone (approve mode)
 python3 -m unittest discover -s relay           # relay logic and HTTP
 npm test                                        # the page's modules under Node
 node tools/approve-e2e.mjs                      # approve mode: relay → fake desktop ↔ fake phone

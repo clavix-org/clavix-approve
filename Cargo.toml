@@ -1,0 +1,4 @@
+# The key-less agent and the protocol code it shares with Clavix desktop.
+[workspace]
+members = ["core", "agent"]
+resolver = "2"

@@ -174,16 +174,33 @@ name = "clavix-agent"
 version = "0.1.8"
 dependencies = [
  "base64 0.22.1",
+ "clavix-approve-core",
+ "ed25519-dalek",
+ "hmac 0.12.1",
+ "qrcode",
+ "rand 0.8.8",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "signature",
+ "ssh-key",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "clavix-approve-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
  "ed25519-dalek",
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "hpke",
- "qrcode",
  "rand 0.8.8",
  "reqwest",
  "serde",
  "serde_json",
- "sha1",
  "sha2 0.10.9",
  "signature",
  "ssh-key",

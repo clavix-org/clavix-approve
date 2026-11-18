@@ -1,27 +1,22 @@
-//! The relay client, and the [`Signer`] built on it: every signature
-//! request goes to the paired device through the relay and comes back
-//! approved, denied or not at all.
-//!
-//! Rules of conduct towards the relay (it may sit behind a proxy that
-//! bans misbehaving clients):
-//!
-//! - nothing is sent while idle: the agent only talks to the relay while
-//!   one of its own requests is waiting;
-//! - one POST per request, then long-poll GETs;
-//! - a 4xx answer is never retried — it means our configuration is wrong
-//!   — except 429, which is retried slowly.
+//! The [`Signer`] built on the relay client: every signature request goes
+//! to the paired device through the relay and comes back approved, denied
+//! or not at all. The client itself, and its rules of conduct towards the
+//! relay, are in `clavix-approve-core` (re-exported here).
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
 use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+
+pub use clavix_approve_core::bytes::{b64u, hex, random, token_auth, unb64u, unhex};
+pub use clavix_approve_core::relay::{revoke, revoke_device, RelayClient, RelayError};
+use clavix_approve_core::relay::{state_of, unix_now, POLL_SECONDS, RETRY_PAUSE, THROTTLED_PAUSE};
 
 use crate::channel::{self, request_header, response_header, Peer};
 use crate::proto::{CallerInfo, Identity, SignError, SignFuture, SignJob, Signer};
@@ -29,198 +24,11 @@ use crate::proto::{CallerInfo, Identity, SignError, SignFuture, SignJob, Signer}
 /// How long the user has to approve. Must stay under the server's
 /// `LoginGraceTime` (120 s by default), which starts before we are asked.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
-/// Long-poll duration asked of the relay.
-const POLL_SECONDS: u64 = 25;
 /// Requests waiting for the user at the same time.
 const MAX_IN_FLIGHT: usize = 4;
 /// After a denial, further requests fail at once for this long: a tool
 /// that retries in a loop must not turn into a stream of notifications.
 const BACKOFF_AFTER_DENIAL: Duration = Duration::from_secs(5);
-/// Pause before retrying after a network error or a 5xx.
-const RETRY_PAUSE: Duration = Duration::from_secs(2);
-/// Pause after the relay (or a proxy in front) said "too many requests".
-const THROTTLED_PAUSE: Duration = Duration::from_secs(10);
-
-pub fn b64u(bytes: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-pub fn unb64u(text: &str) -> Option<Vec<u8>> {
-    URL_SAFE_NO_PAD.decode(text).ok()
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn random<const N: usize>() -> [u8; N] {
-    let mut out = [0u8; N];
-    rand::rngs::OsRng.fill_bytes(&mut out);
-    out
-}
-
-pub fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
-        .collect()
-}
-
-/// What the relay stores of a bearer token.
-pub fn token_auth(token: &str) -> String {
-    hex(&Sha256::digest(token.as_bytes()))
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-#[derive(Debug)]
-pub enum RelayError {
-    /// The relay (or a proxy in front of it) answered with this status.
-    Status(u16),
-    /// The relay could not be reached.
-    Transport(String),
-    /// The relay answered something we do not understand.
-    Protocol(String),
-}
-
-impl RelayError {
-    /// Worth trying again? Never for a 4xx, except "too many requests".
-    fn is_transient(&self) -> bool {
-        match self {
-            Self::Status(code) => *code >= 500 || *code == 429,
-            Self::Transport(_) => true,
-            Self::Protocol(_) => false,
-        }
-    }
-}
-
-impl std::fmt::Display for RelayError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Status(code) => write!(f, "relay answered HTTP {code}"),
-            Self::Transport(reason) => write!(f, "relay unreachable: {reason}"),
-            Self::Protocol(reason) => write!(f, "unexpected relay answer: {reason}"),
-        }
-    }
-}
-
-/// HTTP access to one relay.
-#[derive(Clone)]
-pub struct RelayClient {
-    http: reqwest::Client,
-    base: String,
-}
-
-impl RelayClient {
-    /// `base` must be HTTPS, except for a loopback address (tests): the
-    /// bearer tokens travel in a header.
-    pub fn new(base: &str) -> Result<Self, String> {
-        let base = base.trim_end_matches('/').to_string();
-        let url = reqwest::Url::parse(&base).map_err(|e| format!("invalid relay URL: {e}"))?;
-        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
-        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-            return Err("the relay URL must use https".into());
-        }
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(POLL_SECONDS + 15))
-            .build()
-            .map_err(|e| format!("HTTP client: {e}"))?;
-        Ok(Self { http, base })
-    }
-
-    /// `Ok(None)` is HTTP 204: nothing yet.
-    async fn send(
-        &self,
-        request: reqwest::RequestBuilder,
-        token: &str,
-    ) -> Result<Option<Value>, RelayError> {
-        let response = request
-            .bearer_auth(token)
-            .send()
-            .await
-            // The error's Display may include the URL, never the token.
-            .map_err(|e| RelayError::Transport(e.without_url().to_string()))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        if !status.is_success() {
-            return Err(RelayError::Status(status.as_u16()));
-        }
-        // A proxy may answer 200 with a page of its own: not JSON.
-        response
-            .json::<Value>()
-            .await
-            .map(Some)
-            .map_err(|_| RelayError::Protocol("not JSON".into()))
-    }
-
-    pub async fn post(&self, path: &str, token: &str, body: &Value) -> Result<Value, RelayError> {
-        let request = self.http.post(format!("{}{path}", self.base)).json(body);
-        self.send(request, token)
-            .await?
-            .ok_or_else(|| RelayError::Protocol("empty answer".into()))
-    }
-
-    pub async fn get(&self, path: &str, token: &str) -> Result<Option<Value>, RelayError> {
-        self.send(self.http.get(format!("{}{path}", self.base)), token)
-            .await
-    }
-}
-
-/// Delete the pairing on the relay. `Ok(true)` when this call deleted it,
-/// `Ok(false)` when the relay no longer knew it (already revoked from the
-/// other end, or the relay lost its state).
-pub async fn revoke(client: &RelayClient, ch: &str, token: &str) -> Result<bool, RelayError> {
-    match client
-        .post(&format!("/api/ch/{ch}/revoke"), token, &json!({}))
-        .await
-    {
-        Ok(value) if state_of(&value) == "revoked" => Ok(true),
-        Ok(value) => Err(RelayError::Protocol(format!(
-            "revocation not confirmed ({})",
-            state_of(&value)
-        ))),
-        Err(RelayError::Status(401)) => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// Revoke one device of the pairing. `Ok(true)` when this call removed it,
-/// `Ok(false)` when the relay no longer knew it (or the whole pairing).
-pub async fn revoke_device(
-    client: &RelayClient,
-    ch: &str,
-    token: &str,
-    signer: &str,
-) -> Result<bool, RelayError> {
-    match client
-        .post(
-            &format!("/api/ch/{ch}/revoke"),
-            token,
-            &json!({ "signer": signer }),
-        )
-        .await
-    {
-        Ok(value) if state_of(&value) == "revoked" => Ok(true),
-        Ok(value) if state_of(&value) == "unknown-signer" => Ok(false),
-        Ok(value) => Err(RelayError::Protocol(format!(
-            "revocation not confirmed ({})",
-            state_of(&value)
-        ))),
-        Err(RelayError::Status(401)) => Ok(false),
-        Err(e) => Err(e),
-    }
-}
 
 /// A relay failure as the agent reports it. A 401 on a paired channel
 /// means the pairing is gone, most likely revoked from the device.
@@ -233,10 +41,6 @@ fn relay_failure(e: RelayError) -> SignError {
         ),
         e => SignError::Backend(e.to_string()),
     }
-}
-
-fn state_of(value: &Value) -> &str {
-    value.get("state").and_then(Value::as_str).unwrap_or("")
 }
 
 /// Names a host key, for display only. The caller is the process that

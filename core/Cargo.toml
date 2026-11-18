@@ -1,0 +1,30 @@
+[package]
+name = "clavix-approve-core"
+version = "0.1.0"
+description = "Clavix Approve protocol: sealed channel, pairing, relay client, and the requester of approve mode"
+edition = "2021"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# Public keys and signatures only: no private SSH key is ever handled here.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "rsa", "p256", "p384", "p521"] }
+signature = "2"
+tokio = { version = "1", features = ["time", "sync", "macros", "rt"] }
+# Relay client.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+# End-to-end channel with the device.
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "nistp", "aes"] }
+ed25519-dalek = "2"
+hmac = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
