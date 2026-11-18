@@ -106,3 +106,13 @@ export async function openMessage(me, from, hdr, msg) {
 export async function sealIntroduction(me, to, hdr, obj) {
   return b64u(concat(me.sigPublic, await sealBytes(me, to, hdr, obj)));
 }
+
+// The other end of sealIntroduction(): returns { sigPublic, obj }. The
+// signing key is only the one the message names: authenticate it before
+// trusting anything in `obj`.
+export async function openIntroduction(me, hdr, msg) {
+  const raw = unb64u(msg);
+  if (raw.length < SIG_KEY_LENGTH) throw new Error('message too short');
+  const sigPublic = raw.slice(0, SIG_KEY_LENGTH);
+  return { sigPublic, obj: await openBytes(me, sigPublic, hdr, raw.subarray(SIG_KEY_LENGTH)) };
+}

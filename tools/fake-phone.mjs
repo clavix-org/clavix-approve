@@ -6,19 +6,24 @@
 // test tool: never use it with a key that opens a real server.
 //
 //   fake-phone.mjs pair --relay URL --state FILE --code CODE
-//   fake-phone.mjs run  --state FILE [--deny] [--once]
+//   fake-phone.mjs run  --state FILE [--deny] [--once] [--delay SECONDS]
 //   fake-phone.mjs revoke --state FILE
 //
 // Each prints one JSON line per event on standard output. `run` ends with
-// a `revoked` event when the relay no longer knows the pairing.
+// a `revoked` event when the relay no longer knows the pairing. `--delay`
+// waits before answering, as a user who takes their time would.
+//
+// The pairing's mode comes from the code: in sign mode the stand-in signs
+// with its SSH key, in approve mode it returns a proof made with its
+// approval key (Ed25519, as the page). PROTOCOL.md, "Approve mode".
 
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import { b64u, unb64u } from '../web/lib/bytes.js';
 import { generateIdentity, peer, withPublicBytes } from '../web/lib/channel.js';
 import { RelayClient, RelayError } from '../web/lib/relay.js';
-import { approve, deny, pairWithAgent, readRequest } from '../web/lib/signer.js';
-import { p256KeyBlob, p256SignatureBlob, publicKeyLine } from '../web/lib/ssh.js';
+import { approvalData, approve, deny, pairWithAgent, readRequest, sendApproval } from '../web/lib/signer.js';
+import { ed25519KeyBlob, ed25519SignatureBlob, p256KeyBlob, p256SignatureBlob, publicKeyLine } from '../web/lib/ssh.js';
 
 const ECDSA = { name: 'ECDSA', namedCurve: 'P-256' };
 const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
@@ -45,8 +50,13 @@ async function pair({ relay, state: file, code }) {
   const ssh = await crypto.subtle.generateKey(ECDSA, true, ['sign']);
   const sshJwk = await exportJwk(ssh.privateKey);
   const keyBlob = p256KeyBlob(unb64u(sshJwk.x), unb64u(sshJwk.y));
+  const approveKey = await crypto.subtle.generateKey(ED25519, true, ['sign', 'verify']);
+  const approveJwk = await exportJwk(approveKey.privateKey);
+  const approveBlob = ed25519KeyBlob(unb64u(approveJwk.x));
 
-  const paired = await pairWithAgent({ base: relay, code, me, keyBlob, comment: 'fake-phone' });
+  const paired = await pairWithAgent({
+    base: relay, code, me, comment: 'fake-phone', keyFor: (mode) => (mode === 'approve' ? approveBlob : keyBlob),
+  });
   save(file, {
     relay,
     ch: paired.ch,
@@ -57,11 +67,14 @@ async function pair({ relay, state: file, code }) {
     sig: await exportJwk(me.sig.privateKey),
     ssh: sshJwk,
     key: b64u(keyBlob),
+    mode: paired.mode,
+    approve: approveJwk,
+    approveKey: b64u(approveBlob),
     pins: {},
   });
   say({
-    event: 'paired', agent: paired.label, fingerprint: paired.fingerprint,
-    publicKey: publicKeyLine(keyBlob, 'fake-phone'),
+    event: 'paired', agent: paired.label, fingerprint: paired.fingerprint, mode: paired.mode,
+    publicKey: publicKeyLine(paired.mode === 'approve' ? approveBlob : keyBlob, 'fake-phone'),
   });
 }
 
@@ -80,19 +93,21 @@ async function load(file) {
   return {
     state,
     sshKey: await crypto.subtle.importKey('jwk', state.ssh, ECDSA, false, ['sign']),
+    approveKey: state.approve ? await crypto.subtle.importKey('jwk', state.approve, ED25519, false, ['sign']) : null,
     ctx: {
       ch: state.ch,
       signer: state.signer,
       me,
       agent: peer(unb64u(state.agent.kem), unb64u(state.agent.sig)),
+      mode: state.mode ?? 'sign',
       keyBlob: unb64u(state.key),
     },
   };
 }
 
-async function run({ state: file, deny: denyAll, once }) {
+async function run({ state: file, deny: denyAll, once, delay }) {
   if (!file) throw new Error('run needs --state');
-  const { state, sshKey, ctx } = await load(file);
+  const { state, sshKey, approveKey, ctx } = await load(file);
   const relay = new RelayClient(state.relay, state.ch, state.token);
   say({ event: 'ready' });
 
@@ -118,9 +133,12 @@ async function run({ state: file, deny: denyAll, once }) {
         const state = await deny(ctx, relay, entry, view.reason);
         if (state === 'ignored') ignored.add(id);
         say({ event: 'refused', id, reason: view.reason, state });
-      } else if (denyAll) {
-        await deny(ctx, relay, entry, 'user');
-        say({ event: 'denied', id });
+        if (once) return;
+        continue;
+      }
+      if (delay) await new Promise((r) => setTimeout(r, Number(delay) * 1000));
+      if (denyAll) {
+        say({ event: 'denied', id, state: await deny(ctx, relay, entry, 'user') });
       } else {
         // Trust on first use, as the page does after an explicit tap.
         const dest = view.hops[view.hops.length - 1];
@@ -129,13 +147,21 @@ async function run({ state: file, deny: denyAll, once }) {
           state.pins[dest.fingerprint] = view.hints[dest.fingerprint] ?? 'unnamed';
           save(file, state);
         }
-        const raw = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, sshKey, view.data));
-        say({
-          event: 'signed', id, state: await approve(ctx, relay, entry, p256SignatureBlob(raw)),
+        const seen = {
           user: view.user, host: dest.fingerprint, known,
           chain: view.hops.map((h) => ({ host: h.fingerprint, forwarded: h.forwarded })),
           caller: view.caller, agent: view.agent,
-        });
+        };
+        if (ctx.mode === 'approve') {
+          const raw = new Uint8Array(await crypto.subtle.sign(ED25519, approveKey, await approvalData(ctx, entry)));
+          say({
+            event: 'approved', id, state: await sendApproval(ctx, relay, entry, ed25519SignatureBlob(raw)), ...seen,
+            key: view.keyFingerprint, keyType: view.keyType, keyName: view.keyName,
+          });
+        } else {
+          const raw = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, sshKey, view.data));
+          say({ event: 'signed', id, state: await approve(ctx, relay, entry, p256SignatureBlob(raw)), ...seen });
+        }
       }
       if (once) return;
     }

@@ -190,10 +190,12 @@ each one still needs a verification on the phone.
 
 ## Steps
 
-1. **In this repository:** the approve mode in the page and in
-   `tools/fake-phone.mjs`, and a test requester (a `clavix-agent`
-   subcommand or test binary) that plays the desktop. End-to-end test as
-   for phase 0, with Ed25519 and RSA vault keys.
+1. **In this repository (done):** the approve mode in the page and in
+   `tools/fake-phone.mjs`, and a test requester that plays the desktop:
+   `tools/fake-desktop.mjs`, in Node on the page's modules
+   (`web/lib/requester.js`) rather than in Rust, until the shared crate of
+   step 2 exists. End to end with Ed25519 and RSA requester keys:
+   `tools/approve-e2e.mjs`, and the real page in `tools/page-e2e.mjs`.
 2. **Shared crate:** extract the channel, pairing and relay client; make
    `clavix-agent` use it.
 3. **Clavix PR:** the backend, the settings and pairing UI, the threat

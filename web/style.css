@@ -114,6 +114,9 @@ input {
 .request .countdown { float: right; color: var(--muted); font-variant-numeric: tabular-nums; }
 .request .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .request .progress { color: var(--muted); min-height: 1.2em; }
+/* Settled elsewhere while the user answered: kept a moment, greyed out. */
+.request.late { opacity: 0.6; }
+.request.late .progress { color: inherit; font-weight: 600; }
 
 /* A host this device has never approved: unmistakably different. */
 .request.unknown { border: 2px solid var(--warn-line); }

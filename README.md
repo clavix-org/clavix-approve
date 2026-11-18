@@ -28,7 +28,9 @@ phone yet, and nothing here has been audited. Do not rely on it.
 | `relay/` | the relay (Python, standard library + `cryptography`, plus `httpx[http2]` for APNs): opaque messages, Web Push or APNs wake-up, serves the page |
 | `web/` | the approval page (plain ES modules, no build step, no third-party code); `web/lib` holds everything security-relevant |
 | `tools/fake-phone.mjs` | command-line stand-in for the phone, running the page's own modules |
+| `tools/fake-desktop.mjs` | command-line stand-in for Clavix desktop in approve mode ([`DESKTOP_APPROVAL.md`](DESKTOP_APPROVAL.md)): holds the SSH key, asks the device for an approval |
 | `tools/page-e2e.mjs` | drives the real page in headless Chrome with a virtual passkey |
+| `tools/approve-e2e.mjs` | approve mode end to end: relay, fake desktop, fake phone |
 | `testdata/` | vectors shared by the Rust and JavaScript sides |
 
 ## Trying it locally, without a phone
@@ -62,7 +64,8 @@ cargo test --manifest-path agent/Cargo.toml     # protocol core, channel, pairin
                                                 #   ssh → agent → relay → fake phone → sshd
 python3 -m unittest discover -s relay           # relay logic and HTTP
 npm test                                        # the page's modules under Node
-node tools/page-e2e.mjs                         # the page itself in headless Chrome
+node tools/approve-e2e.mjs                      # approve mode: relay → fake desktop ↔ fake phone
+node tools/page-e2e.mjs                         # the page itself in headless Chrome, both modes
 ```
 
 The end-to-end tests start a scratch `sshd` on a loopback port and are
