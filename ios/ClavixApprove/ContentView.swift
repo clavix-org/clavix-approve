@@ -35,14 +35,22 @@ struct PairView: View {
     @State private var relay = ""
     @State private var working = false
     @State private var error: String?
+    @State private var scanning = false
 
     private var needsRelay: Bool { !code.contains("#" + PairingCode.prefix) }
 
     var body: some View {
         Form {
             Section {
-                Text("Sur la machine, lancez `clavix-agent pair` (ou `pair --add` pour garder la page web comme second appareil), puis collez ici le code ou le lien qu’il affiche.")
+                Text("Sur la machine, lancez `clavix-agent pair` (ou `pair --add` pour garder la page web comme second appareil), puis scannez le QR code qu’il affiche, ou collez le code.")
                     .font(.callout)
+                if QRScanner.isAvailable {
+                    Button {
+                        scanning = true
+                    } label: {
+                        Label("Scanner le QR code", systemImage: "qrcode.viewfinder")
+                    }
+                }
             }
             Section("Code d’appairage") {
                 TextField("cva1-… ou https://…/#cva1-…", text: $code, axis: .vertical)
@@ -84,6 +92,12 @@ struct PairView: View {
             }
         }
         .onAppear { if relay.isEmpty { relay = model.remembered.lastRelay?.absoluteString ?? "" } }
+        .sheet(isPresented: $scanning) {
+            ScanSheet { link in
+                code = link
+                Task { await pair() }
+            }
+        }
     }
 
     private func pair() async {
