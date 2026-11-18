@@ -254,7 +254,10 @@ opens every server whose `authorized_keys` lists it. Both ends say so.
 
 ## Approve mode
 
-Format fixed, not implemented yet. In approve mode the requester holds
+Implemented in the page (`web/lib/{pairing,protocol,signer,lock}.js`) and,
+on the requester's side, in `web/lib/requester.js`, which the test
+stand-in `tools/fake-desktop.mjs` runs; not yet in Clavix desktop nor in
+`clavix-agent`, which stays in sign mode. In approve mode the requester holds
 the SSH key and the signer only approves: it returns a signed "yes" that
 the requester checks before signing with its own key. It is meant for
 Clavix desktop ([`DESKTOP_APPROVAL.md`](DESKTOP_APPROVAL.md)), which takes

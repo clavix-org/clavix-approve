@@ -48,5 +48,7 @@ jobs:
         run: python3 -m unittest discover -s relay
       - name: Page modules — tests
         run: npm test
+      - name: Approve mode — end to end (relay, fake desktop, fake phone)
+        run: node tools/approve-e2e.mjs
       - name: Page — end to end in headless Chrome
         run: node tools/page-e2e.mjs

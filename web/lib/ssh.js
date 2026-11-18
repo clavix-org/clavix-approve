@@ -153,6 +153,41 @@ export async function verifySignature(keyBlob, data, sigBlob) {
   }
 }
 
+// The type named at the start of a key blob, or null if it has none.
+export function keyType(keyBlob) {
+  try {
+    return new Reader(keyBlob).text();
+  } catch (_) {
+    return null;
+  }
+}
+
+// The signature algorithms that may go with a key type in a user-auth
+// request; null for a key type we do not handle.
+const SIGNATURE_ALGORITHMS = {
+  'ssh-ed25519': ['ssh-ed25519'],
+  'ecdsa-sha2-nistp256': ['ecdsa-sha2-nistp256'],
+  'ecdsa-sha2-nistp384': ['ecdsa-sha2-nistp384'],
+  'ecdsa-sha2-nistp521': ['ecdsa-sha2-nistp521'],
+  'ssh-rsa': ['rsa-sha2-256', 'rsa-sha2-512'],
+};
+
+export function signatureAlgorithms(keyBlob) {
+  return SIGNATURE_ALGORITHMS[keyType(keyBlob)] ?? null;
+}
+
+// Public key blob of an Ed25519 key from its 32 raw bytes.
+export function ed25519KeyBlob(raw) {
+  if (raw.length !== 32) throw new Error('not an Ed25519 key');
+  return concat(sshString(utf8('ssh-ed25519')), sshString(raw));
+}
+
+// An Ed25519 signature (64 bytes) as an SSH signature blob.
+export function ed25519SignatureBlob(raw) {
+  if (raw.length !== 64) throw new Error('not an Ed25519 signature');
+  return concat(sshString(utf8('ssh-ed25519')), sshString(raw));
+}
+
 // Public key blob of a P-256 key from its JWK coordinates.
 export function p256KeyBlob(x, y) {
   if (x.length !== 32 || y.length !== 32) throw new Error('not a P-256 point');
