@@ -9,11 +9,12 @@ enum Links {
 
 struct ContentView: View {
     @EnvironmentObject private var model: Model
+    @State private var addingMachine = false
 
     var body: some View {
         NavigationStack {
             Group {
-                if model.pairing == nil {
+                if model.pairings.isEmpty {
                     PairView()
                 } else {
                     RequestsView()
@@ -26,6 +27,12 @@ struct ContentView: View {
                         Text("Clavix Approve").font(.headline)
                     }
                 }
+                if !model.pairings.isEmpty {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { addingMachine = true } label: { Image(systemName: "plus") }
+                            .accessibilityLabel("Appairer une autre machine")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
                         .accessibilityLabel("Réglages")
@@ -33,12 +40,17 @@ struct ContentView: View {
             }
             .navigationBarTitleDisplayMode(.inline)
         }
+        .sheet(isPresented: $addingMachine) {
+            NavigationStack {
+                PairView()
+                    .navigationTitle("Autre machine")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar { Button("Annuler") { addingMachine = false } }
+            }
+        }
         .sheet(item: $model.justPaired) { record in PairedView(record: record) }
+        .onChange(of: model.justPaired?.id) { _, id in if id != nil { addingMachine = false } }
     }
-}
-
-extension PairingRecord: @retroactive Identifiable {
-    public var id: String { ch + signer }
 }
 
 // ---- brand ----
@@ -94,7 +106,7 @@ struct PairView: View {
             Section {
                 Step(number: 1, text: "Sur la machine, lancez :")
                 CommandBox(text: "clavix-agent pair --add")
-                Text("Sans `--add`, l’appairage remplace l’appareil déjà appairé.")
+                Text("Sans `--add`, l’appairage remplace l’appareil déjà appairé. Pour Clavix sur l’ordinateur, ouvrez plutôt l’appairage dans ses réglages.")
                     .font(.footnote).foregroundStyle(.secondary)
             } header: {
                 Text("Appairer une machine")
@@ -141,7 +153,7 @@ struct PairView: View {
                     Task { await pair() }
                 } label: {
                     HStack {
-                        Text(model.keyBlob == nil ? "Créer la clé et appairer" : "Appairer")
+                        Text("Appairer")
                         if working { Spacer(); ProgressView() }
                     }
                 }
@@ -156,8 +168,8 @@ struct PairView: View {
                     if Keys.simulated {
                         Text("Simulateur : la clé est logicielle, pas dans la Secure Enclave. Pour essai seulement.")
                             .foregroundStyle(.orange)
-                    } else if model.keyBlob == nil {
-                        Text("La clé SSH sera créée dans la puce sécurisée de cet iPhone et ne la quittera jamais. Chaque signature demandera le verrou de l’appareil.")
+                    } else {
+                        Text("Les clés sont créées dans la puce sécurisée de cet iPhone et ne la quittent jamais. Chaque réponse demande le verrou de l’appareil.")
                     }
                 }
             }
@@ -248,17 +260,27 @@ struct PairedView: View {
                 } footer: {
                     Text("La machine doit afficher les mêmes six chiffres. S’ils diffèrent, refusez sur la machine : quelqu’un s’est placé entre les deux.")
                 }
-                Section {
-                    if let line = model.publicKeyLine { PublicKeyView(line: line) }
-                } header: {
-                    Text("Clé à installer sur les serveurs")
-                } footer: {
-                    Text("Ajoutez cette ligne au fichier authorized_keys de chaque compte que cet iPhone doit ouvrir.")
+                if record.mode == .approve {
+                    Section {
+                        Label("Validation seulement", systemImage: "checkmark.shield")
+                            .font(.headline)
+                        Text("L’ordinateur garde ses clés et signe lui-même, une fois que cet iPhone a validé. Rien à installer sur les serveurs.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Section {
+                        if let line = model.publicKeyLine { PublicKeyView(line: line) }
+                    } header: {
+                        Text("Clé à installer sur les serveurs")
+                    } footer: {
+                        Text("Ajoutez cette ligne au fichier authorized_keys de chaque compte que cet iPhone doit ouvrir.")
+                    }
                 }
             }
             .navigationTitle(record.label.isEmpty ? "Appairé" : "Appairé à \(record.label)")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("Terminé") { dismiss() }.bold() }
+            .toolbar { Button("Terminé") { model.justPaired = nil; dismiss() }.bold() }
         }
     }
 }
@@ -292,8 +314,8 @@ struct RequestsView: View {
 
     var body: some View {
         List {
-            if let p = model.pairing {
-                Section { MachineCard(pairing: p) }
+            Section {
+                ForEach(model.pairings) { p in MachineCard(pairing: p) }
             }
             if model.requests.isEmpty {
                 Section {
@@ -302,7 +324,7 @@ struct RequestsView: View {
                             .font(.system(size: 48, weight: .light))
                             .foregroundStyle(Color.accentColor)
                         Text("Aucune demande en attente").font(.headline)
-                        Text("Lancez ssh depuis la machine : la demande apparaîtra ici, et ne passera qu’avec le verrou de cet iPhone.")
+                        Text("Les demandes de vos machines apparaîtront ici, et ne passeront qu’avec le verrou de cet iPhone.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -325,30 +347,32 @@ struct MachineCard: View {
     @EnvironmentObject private var model: Model
     let pairing: PairingRecord
 
+    private var state: MachineState { model.state(of: pairing) }
+    private var waiting: Int { model.requests.filter { $0.record.id == pairing.id }.count }
     private var stateText: String {
-        if !model.status.isEmpty { return model.status }
-        return model.requests.isEmpty ? "Prêt" : "Demande en attente"
+        if !state.text.isEmpty { return state.text }
+        return waiting == 0 ? "Prêt" : waiting == 1 ? "1 demande en attente" : "\(waiting) demandes en attente"
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "desktopcomputer")
+            Image(systemName: pairing.mode == .approve ? "macbook.and.iphone" : "desktopcomputer")
                 .font(.title2)
                 .foregroundStyle(Color.accentColor)
                 .frame(width: 36)
             VStack(alignment: .leading, spacing: 4) {
                 Text(pairing.label.isEmpty ? "Machine sans nom" : pairing.label).font(.headline)
+                Text(pairing.mode == .approve ? "Clavix — validation des signatures" : "clavix-agent — signature par cet iPhone")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Circle()
-                        .fill(model.statusIsError ? Color.red : Color.green)
+                        .fill(state.isError ? Color.red : Color.green)
                         .frame(width: 8, height: 8)
                     Text(stateText)
                         .font(.subheadline)
-                        .foregroundStyle(model.statusIsError ? .red : .secondary)
+                        .foregroundStyle(state.isError ? .red : .secondary)
                 }
-                Text("Relais \(pairing.relay.host ?? pairing.relay.absoluteString)")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
             }
         }
         .padding(.vertical, 4)
@@ -376,7 +400,10 @@ struct RequestCard: View {
                     .foregroundStyle(known == nil ? Color.orange : Color.accentColor)
                     .frame(width: 36)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Connexion SSH").font(.caption).foregroundStyle(.secondary)
+                    Text(request.record.mode == .approve
+                         ? "Connexion SSH depuis Clavix — \(Model.machineName(request.record))"
+                         : "Connexion SSH — \(Model.machineName(request.record))")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text(known.map { "\(user)@\($0)" } ?? "\(user)@ hôte inconnu")
                         .font(.title3.weight(.semibold))
                         .lineLimit(2)
@@ -389,6 +416,16 @@ struct RequestCard: View {
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
+
+            if let key = view.requesterKey {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Clé : \(key.name ?? "sans nom") (\(key.type))", systemImage: "key.horizontal")
+                    Text(key.fingerprint).font(.system(.caption2, design: .monospaced))
+                    Text("Indiquée par l’ordinateur, qui signera lui-même après votre validation.")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.footnote)
+            }
 
             if known == nil { unknownHost }
 
@@ -416,7 +453,7 @@ struct RequestCard: View {
                 Button {
                     run { try await model.approve(request, newName: newName) }
                 } label: {
-                    Label(known == nil ? "Approuver et retenir" : "Approuver", systemImage: "lock.open.fill")
+                    Label(approveTitle, systemImage: "lock.open.fill")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
@@ -425,6 +462,11 @@ struct RequestCard: View {
             .disabled(busy)
         }
         .padding(.vertical, 6)
+    }
+
+    private var approveTitle: String {
+        let verb = request.record.mode == .approve ? "Valider" : "Approuver"
+        return known == nil ? "\(verb) et retenir" : verb
     }
 
     private var callerText: String {
@@ -490,7 +532,7 @@ struct Countdown: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var model: Model
-    @State private var confirmForget = false
+    @State private var forgetting: PairingRecord?
 
     var body: some View {
         Form {
@@ -505,17 +547,23 @@ struct SettingsView: View {
                          : "Dans la puce sécurisée de l’iPhone ; chaque signature demande le verrou de l’appareil.")
                 }
             }
-            if let p = model.pairing {
-                Section {
-                    LabeledContent("Machine", value: p.label.isEmpty ? "sans nom" : p.label)
-                    LabeledContent("Chiffres de vérification", value: p.fingerprint)
-                    LabeledContent("Relais", value: p.relay.host ?? p.relay.absoluteString)
-                    Button("Oublier cette machine", role: .destructive) { confirmForget = true }
-                } header: {
-                    Text("Appairage")
-                } footer: {
-                    Text("Oublier retire cet iPhone du relais : il ne recevra plus de demandes. La clé reste valable sur les serveurs qui la listent ; retirez-la aussi de leur authorized_keys.")
+            Section {
+                if model.pairings.isEmpty { Text("Aucune.").foregroundStyle(.secondary) }
+                ForEach(model.pairings) { p in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(Model.machineName(p)).bold()
+                        Text(p.mode == .approve ? "Validation (Clavix)" : "Signature (clavix-agent)")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text("Chiffres \(p.fingerprint) · relais \(p.relay.host ?? p.relay.absoluteString)")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .swipeActions { Button("Oublier", role: .destructive) { forgetting = p } }
+                    .contextMenu { Button("Oublier cette machine", role: .destructive) { forgetting = p } }
                 }
+            } header: {
+                Text("Machines appairées")
+            } footer: {
+                Text("Glissez vers la gauche pour oublier une machine : cet iPhone est retiré du relais et n’en reçoit plus de demandes. En mode signature, la clé reste valable sur les serveurs qui la listent ; retirez-la aussi de leur authorized_keys.")
             }
             Section("Serveurs retenus") {
                 if model.remembered.pins.isEmpty { Text("Aucun.").foregroundStyle(.secondary) }
@@ -556,8 +604,12 @@ struct SettingsView: View {
         }
         .navigationTitle("Réglages")
         .navigationBarTitleDisplayMode(.inline)
-        .confirmationDialog("Oublier cette machine ?", isPresented: $confirmForget, titleVisibility: .visible) {
-            Button("Oublier", role: .destructive) { Task { await model.forgetMachine() } }
+        .confirmationDialog("Oublier \(forgetting.map(Model.machineName) ?? "cette machine") ?",
+                            isPresented: Binding(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
+                            titleVisibility: .visible) {
+            Button("Oublier", role: .destructive) {
+                if let p = forgetting { Task { await model.forget(machine: p) } }
+            }
         } message: {
             Text("Elle ne pourra plus rien demander à cet iPhone. Pour la retrouver, il faudra appairer à nouveau.")
         }

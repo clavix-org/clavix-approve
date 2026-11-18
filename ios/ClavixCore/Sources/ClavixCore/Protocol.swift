@@ -9,6 +9,9 @@
 import Foundation
 
 public let keyAlgorithm = "ecdsa-sha2-nistp256"
+/// Approval keys a requester accepts (PROTOCOL.md, "Approval key").
+public let approveKeyTypes = ["ssh-ed25519", "ecdsa-sha2-nistp256"]
+private let approvePrefix = "clavix-approve/v1 approve"
 private let maxHops = 16
 
 /// The relay stores only the SHA-256 of a bearer token.
@@ -49,7 +52,18 @@ public struct Caller: Equatable {
 /// outermost first, the last one being the host to authenticate to. A hop
 /// carries the host key and its fingerprint, never a name: naming is done
 /// from the signer's own pinned list.
+/// In approve mode, the key the requester would sign with. Its comment is
+/// the requester's word only.
+public struct RequesterKey: Equatable {
+    public let blob: Data
+    public let type: String
+    public let fingerprint: String
+    public let name: String?
+}
+
 public struct VerifiedRequest {
+    /// Approve mode only.
+    public let requesterKey: RequesterKey?
     public let data: Data
     public let exp: Double
     public let user: String?
@@ -82,7 +96,20 @@ private func jsonInteger(_ v: Any?) -> Int? {
 /// Check a decoded sign request. `id` is the request id the relay gave,
 /// `keyBlob` our own SSH public key, `now` the current time in seconds.
 public func checkSignRequest(_ inner: [String: Any], id: String, keyBlob: Data, now: Double) -> Result<VerifiedRequest, Refusal> {
-    guard inner["t"] as? String == "sign", inner["id"] as? String == id else { return .failure(.malformed) }
+    // Only our own key, with the one algorithm we sign with.
+    checkRequest(inner, id: id, now: now, t: "sign") { equal($0, keyBlob) ? [keyAlgorithm] : nil }
+}
+
+/// Check a decoded approval request (approve mode). The requester signs
+/// with its own key, named in `key`: the same checks as for a sign
+/// request, made with that key.
+public func checkApproveRequest(_ inner: [String: Any], id: String, now: Double) -> Result<VerifiedRequest, Refusal> {
+    checkRequest(inner, id: id, now: now, t: "approve", algorithms: SSH.signatureAlgorithms)
+}
+
+private func checkRequest(_ inner: [String: Any], id: String, now: Double, t: String,
+                          algorithms: (Data) -> [String]?) -> Result<VerifiedRequest, Refusal> {
+    guard inner["t"] as? String == t, inner["id"] as? String == id else { return .failure(.malformed) }
     guard let exp = jsonNumber(inner["exp"]), exp > now else { return .failure(.expired) }
 
     let key: Data, data: Data
@@ -101,11 +128,11 @@ public func checkSignRequest(_ inner: [String: Any], id: String, keyBlob: Data, 
     } catch {
         return .failure(.malformed)
     }
-    guard equal(key, keyBlob) else { return .failure(.unknownKey) }
+    guard let allowed = algorithms(key) else { return .failure(.unknownKey) }
 
-    // 1. The bytes to sign are a public-key login made with our key.
+    // 1. The bytes to sign are a public-key login made with that key.
     guard let request = SSH.parseUserAuthRequest(data), request.service == "ssh-connection",
-          request.algorithm == keyAlgorithm, equal(request.keyBlob, keyBlob) else {
+          allowed.contains(request.algorithm), equal(request.keyBlob, key) else {
         return .failure(.unverified)
     }
 
@@ -139,8 +166,11 @@ public func checkSignRequest(_ inner: [String: Any], id: String, keyBlob: Data, 
         }
     }
 
+    let requesterKey = t == "approve"
+        ? RequesterKey(blob: key, type: SSH.keyType(key) ?? "?", fingerprint: SSH.fingerprint(key), name: label(inner["keyName"]))
+        : nil
     return .success(VerifiedRequest(
-        data: data, exp: exp, user: String(data: request.user, encoding: .utf8).flatMap { label($0) },
+        requesterKey: requesterKey, data: data, exp: exp, user: String(data: request.user, encoding: .utf8).flatMap { label($0) },
         hops: hops, caller: caller, agent: label(inner["agent"]), hints: hints))
 }
 
@@ -157,4 +187,25 @@ public func signedResponse(requestMsg: String, id: String, signatureBlob: Data) 
 
 public func deniedResponse(requestMsg: String, id: String, reason: String) -> [String: Any] {
     response(requestMsg, id, ["t": "denied", "reason": reason])
+}
+
+public func approvedResponse(requestMsg: String, id: String, proofBlob: Data) -> [String: Any] {
+    response(requestMsg, id, ["t": "approved", "proof": proofBlob.b64u])
+}
+
+// ---- approve mode ----
+
+/// What the approval key signs (PROTOCOL.md, "Approval response"): a bare
+/// prefix, then the channel, the signer id, the request id and the raw
+/// SHA-256 of the request's `msg` as the relay lists it.
+public func approvalBytes(ch: String, signer: String, id: String, requestMsg: String) -> Data {
+    utf8(approvePrefix) + sshString(utf8(ch)) + sshString(utf8(signer)) + sshString(utf8(id))
+        + sshString(utf8(requestMsg).sha256)
+}
+
+/// Does `proofBlob` approve those bytes under `approveBlob`, an approval
+/// key of an accepted type?
+public func verifyApproval(approveBlob: Data, bytes: Data, proofBlob: Data) -> Bool {
+    guard let type = SSH.keyType(approveBlob), approveKeyTypes.contains(type) else { return false }
+    return SSH.verifySignature(keyBlob: approveBlob, data: bytes, sigBlob: proofBlob)
 }

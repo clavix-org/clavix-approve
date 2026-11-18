@@ -5,6 +5,9 @@
 //   enrolment makes the key unusable (pair again and install the new key).
 //   It never leaves the chip; the keychain only holds the chip's own
 //   encrypted handle, useless on any other device.
+// - The approval key (approve mode, for Clavix desktop) is another P-256
+//   key in the Secure Enclave, under the same biometric control: a key per
+//   purpose, so that an approval can never pass for an SSH login.
 // - The channel's HPKE key is in the Secure Enclave too, usable without a
 //   prompt once the device has been unlocked after a restart: a request
 //   must be decrypted before it can be shown.
@@ -76,7 +79,27 @@ enum Keys {
     static var sshKeyBlob: Data? { Keychain.read("ssh-public") }
 
     /// Make the SSH key; replaces any previous one.
-    static func createSSHKey() throws -> Data {
+    static func createSSHKey() throws -> Data { try createLockedKey("ssh") }
+
+    /// Sign `data` with the SSH key after the device's lock; `reason` is
+    /// shown with the prompt. Blocks while the prompt is up: call it off
+    /// the main thread.
+    static func sign(_ data: Data, reason: String) throws -> Data { try signLocked("ssh", data, reason: reason) }
+
+    // ---- the approval key ----
+
+    static var approveKeyBlob: Data? { Keychain.read("approve-public") }
+
+    static func createApproveKey() throws -> Data { try createLockedKey("approve") }
+
+    /// The proof of approve mode: the approval key's SSH signature of `data`.
+    static func approve(_ data: Data, reason: String) throws -> Data { try signLocked("approve", data, reason: reason) }
+
+    // ---- keys behind the biometric lock ----
+
+    /// A P-256 key behind the biometric lock as enrolled now; its handle is
+    /// kept as "<name>-key", its public blob as "<name>-public".
+    private static func createLockedKey(_ name: String) throws -> Data {
         let point: Data
         let handle: Data
         if simulated {
@@ -91,15 +114,13 @@ enum Keys {
             (point, handle) = (k.publicKey.x963Representation, k.dataRepresentation)
         }
         let blob = try SSH.p256KeyBlob(point: point)
-        try Keychain.write("ssh-key", handle)
-        try Keychain.write("ssh-public", blob)
+        try Keychain.write("\(name)-key", handle)
+        try Keychain.write("\(name)-public", blob)
         return blob
     }
 
-    /// Sign `data` after the device's lock; `reason` is shown with the prompt.
-    /// Blocks while the prompt is up: call it off the main thread.
-    static func sign(_ data: Data, reason: String) throws -> Data {
-        guard let handle = Keychain.read("ssh-key") else { throw KeyError.noKey }
+    private static func signLocked(_ name: String, _ data: Data, reason: String) throws -> Data {
+        guard let handle = Keychain.read("\(name)-key") else { throw KeyError.noKey }
         let raw: Data
         if simulated {
             raw = try P256.Signing.PrivateKey(rawRepresentation: handle).signature(for: data).rawRepresentation
@@ -151,17 +172,19 @@ enum Keys {
         return Identity(kem: kemKey, sig: sig)
     }
 
-    // ---- the pairing ----
+    // ---- the pairings ----
 
-    static var pairing: PairingRecord? {
-        Keychain.read("pairing").flatMap { try? JSONDecoder().decode(PairingRecord.self, from: $0) }
+    /// Every machine this device is paired with. A record kept by a version
+    /// that had a single pairing is taken over.
+    static var pairings: [PairingRecord] {
+        if let data = Keychain.read("pairings") {
+            return (try? JSONDecoder().decode([PairingRecord].self, from: data)) ?? []
+        }
+        return Keychain.read("pairing").flatMap { try? JSONDecoder().decode(PairingRecord.self, from: $0) }.map { [$0] } ?? []
     }
 
-    static func save(pairing: PairingRecord?) throws {
-        if let pairing {
-            try Keychain.write("pairing", try JSONEncoder().encode(pairing))
-        } else {
-            Keychain.delete("pairing")
-        }
+    static func save(pairings: [PairingRecord]) throws {
+        try Keychain.write("pairings", try JSONEncoder().encode(pairings))
+        Keychain.delete("pairing")
     }
 }

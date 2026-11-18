@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         UNUserNotificationCenter.current().delegate = self
         // Asked once a machine is paired, not at first launch.
-        if Keys.pairing != nil { Self.askForPush() }
+        if !Keys.pairings.isEmpty { Self.askForPush() }
         return true
     }
 

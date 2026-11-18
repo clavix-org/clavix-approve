@@ -16,7 +16,8 @@ The native signer: the same protocol and relay as the approval page
 
 | Key | Where | Lock |
 |---|---|---|
-| SSH key, P-256 | Secure Enclave | biometry as enrolled when the key was made, at every signature; a new enrolment makes it unusable (pair again, install the new key) |
+| SSH key, P-256 (sign mode) | Secure Enclave | biometry as enrolled when the key was made, at every signature; a new enrolment makes it unusable (pair again, install the new key) |
+| Approval key, P-256 (approve mode) | Secure Enclave | same, at every approval |
 | Channel HPKE key, P-256 | Secure Enclave | none once the device was unlocked after a restart (a request must be decrypted to be shown) |
 | Channel Ed25519 key | keychain, this device only | same |
 | Pairing record, bearer token | keychain, this device only | same |
@@ -24,6 +25,29 @@ The native signer: the same protocol and relay as the approval page
 The app's SSH key is a new key: install its line (Réglages → Clé SSH) in
 `authorized_keys` next to the page's. Pair it as a second device with
 `clavix-agent pair --add`; the page stays in service.
+
+## Modes and machines
+
+The app holds one pairing per machine, each in the mode its hello names
+(`PROTOCOL.md`, "Approve mode"):
+
+- sign mode, with `clavix-agent`: the iPhone signs with its SSH key;
+- approve mode, with Clavix on a computer: the computer keeps its own keys
+  and signs once the iPhone has answered with a proof made by the approval
+  key. Nothing goes on the servers.
+
+Add a machine with the + button. The pairing code is read from the QR code
+(camera) or pasted, as a bare `cva1-…` code or as a link. Pairing again
+with the same channel replaces that machine only; Réglages → Machines
+appairées forgets one.
+
+To try approve mode without Clavix, against a local relay:
+
+```sh
+RELAY_ENROLL_SECRET=dev RELAY_STATE_DIR=/tmp/relay RELAY_PUSH=off python3 relay/relay.py
+CLAVIX_ENROLL_SECRET=dev node tools/fake-desktop.mjs pair --relay http://127.0.0.1:8765 --state /tmp/desktop.json
+node tools/fake-desktop.mjs request --state /tmp/desktop.json --key-type rsa
+```
 
 On the simulator there is no Secure Enclave: software keys stand in, and
 the app says so on screen. Signing for real needs an iPhone.
@@ -70,4 +94,4 @@ and time-sensitive (entitlement in `ClavixApprove.entitlements`).
 
 - A notification extension that would show the destination on the lock
   screen.
-- Several machines paired at once (the page has one pairing too).
+- The paid team, hence push on the real bundle id (`org.clavix.approve`).

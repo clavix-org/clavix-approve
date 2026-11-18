@@ -32,7 +32,7 @@ final class InteropTests: XCTestCase {
 
         // 1. A request sealed by the page's channel, checked here.
         let record = PairingRecord(relay: URL(string: "https://relay.invalid")!, ch: ch, signer: signer, token: "t",
-                                   agent: peer(of: agent), label: "build-box", fingerprint: "")
+                                   agent: peer(of: agent), label: "build-box", fingerprint: "", mode: .sign)
         let ctx = SignerContext(record: record, me: phone, keyBlob: keyBlob)
         let entry = RequestEntry(id: id, exp: exp, msg: s("request"))
         let view = try Signer.read(ctx, entry, now: now).get()

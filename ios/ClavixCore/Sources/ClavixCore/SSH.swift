@@ -121,6 +121,25 @@ public enum SSH {
         return sshString("ecdsa-sha2-nistp256") + sshString("nistp256") + sshString(point)
     }
 
+    /// The type named at the start of a key blob, nil if it has none.
+    public static func keyType(_ keyBlob: Data) -> String? {
+        var r = Reader(keyBlob)
+        return (try? r.string()).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    /// The signature algorithms that may go with a key type in a user-auth
+    /// request; nil for a key type not handled.
+    public static func signatureAlgorithms(_ keyBlob: Data) -> [String]? {
+        switch keyType(keyBlob) {
+        case "ssh-ed25519": return ["ssh-ed25519"]
+        case "ecdsa-sha2-nistp256": return ["ecdsa-sha2-nistp256"]
+        case "ecdsa-sha2-nistp384": return ["ecdsa-sha2-nistp384"]
+        case "ecdsa-sha2-nistp521": return ["ecdsa-sha2-nistp521"]
+        case "ssh-rsa": return ["rsa-sha2-256", "rsa-sha2-512"]
+        default: return nil
+        }
+    }
+
     /// A raw ECDSA P-256 signature (r || s) as an SSH signature blob.
     public static func p256SignatureBlob(raw: Data) throws -> Data {
         guard raw.count == 64 else { throw CoreError.malformed("not a P-256 signature") }
