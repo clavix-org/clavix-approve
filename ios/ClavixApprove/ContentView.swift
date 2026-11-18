@@ -1,6 +1,12 @@
 import ClavixCore
 import SwiftUI
 
+enum Links {
+    static let site = URL(string: "https://clavix.org")!
+    static let source = URL(string: "https://github.com/clavix-org/clavix-approve")!
+    static let threatModel = URL(string: "https://github.com/clavix-org/clavix-approve/blob/master/THREAT_MODEL.md")!
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: Model
 
@@ -13,11 +19,19 @@ struct ContentView: View {
                     RequestsView()
                 }
             }
-            .navigationTitle("Clavix")
             .toolbar {
-                NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
-                    .accessibilityLabel("Réglages")
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 8) {
+                        Logo(size: 24)
+                        Text("Clavix Approve").font(.headline)
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
+                        .accessibilityLabel("Réglages")
+                }
             }
+            .navigationBarTitleDisplayMode(.inline)
         }
         .sheet(item: $model.justPaired) { record in PairedView(record: record) }
     }
@@ -25,6 +39,37 @@ struct ContentView: View {
 
 extension PairingRecord: @retroactive Identifiable {
     public var id: String { ch + signer }
+}
+
+// ---- brand ----
+
+struct Logo: View {
+    var size: CGFloat
+    var body: some View {
+        Image("Logo")
+            .resizable()
+            .interpolation(.high)
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
+    }
+}
+
+struct BrandHeader: View {
+    var subtitle: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Logo(size: 84)
+                .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+            Text("Clavix Approve").font(.title.weight(.bold))
+            Text(subtitle)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+    }
 }
 
 // ---- pairing ----
@@ -42,36 +87,56 @@ struct PairView: View {
     var body: some View {
         Form {
             Section {
-                Text("Sur la machine, lancez `clavix-agent pair` (ou `pair --add` pour garder la page web comme second appareil), puis scannez le QR code qu’il affiche, ou collez le code.")
-                    .font(.callout)
+                BrandHeader(subtitle: "Vos connexions SSH, approuvées une à une sur cet iPhone. La clé ne quitte jamais l’appareil.")
+            }
+            .listRowBackground(Color.clear)
+
+            Section {
+                Step(number: 1, text: "Sur la machine, lancez :")
+                CommandBox(text: "clavix-agent pair --add")
+                Text("Sans `--add`, l’appairage remplace l’appareil déjà appairé.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            } header: {
+                Text("Appairer une machine")
+            }
+
+            Section {
+                Step(number: 2, text: "Scannez le QR code qu’elle affiche.")
                 if QRScanner.isAvailable {
                     Button {
                         scanning = true
                     } label: {
                         Label("Scanner le QR code", systemImage: "qrcode.viewfinder")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(working)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                 }
             }
-            Section("Code d’appairage") {
-                TextField("cva1-… ou https://…/#cva1-…", text: $code, axis: .vertical)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .font(.system(.body, design: .monospaced))
-                Button("Coller") { code = UIPasteboard.general.string ?? code }
-            }
-            if needsRelay {
-                Section {
-                    TextField("relais.example.org", text: $relay)
+
+            Section {
+                HStack(alignment: .top) {
+                    TextField("cva1-…", text: $code, axis: .vertical)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.system(.body, design: .monospaced))
+                    Button {
+                        code = UIPasteboard.general.string ?? code
+                    } label: {
+                        Image(systemName: "doc.on.clipboard")
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Coller")
+                }
+                if needsRelay && !code.isEmpty {
+                    TextField("Adresse du relais", text: $relay)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                } header: {
-                    Text("Adresse du relais")
-                } footer: {
-                    Text("Inutile si vous collez le lien complet.")
                 }
-            }
-            Section {
                 Button {
                     Task { await pair() }
                 } label: {
@@ -81,13 +146,19 @@ struct PairView: View {
                     }
                 }
                 .disabled(working || code.isEmpty)
-                if let error { Text(error).foregroundStyle(.red) }
+            } header: {
+                Text("Ou collez le code")
             } footer: {
-                if Keys.simulated {
-                    Text("Simulateur : la clé est logicielle, pas dans la Secure Enclave. Pour essai seulement.")
-                        .foregroundStyle(.orange)
-                } else if model.keyBlob == nil {
-                    Text("La clé SSH sera créée dans la puce sécurisée de cet iPhone et ne la quittera jamais. Chaque signature demandera le verrou de l’appareil.")
+                VStack(alignment: .leading, spacing: 6) {
+                    if let error {
+                        Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                    }
+                    if Keys.simulated {
+                        Text("Simulateur : la clé est logicielle, pas dans la Secure Enclave. Pour essai seulement.")
+                            .foregroundStyle(.orange)
+                    } else if model.keyBlob == nil {
+                        Text("La clé SSH sera créée dans la puce sécurisée de cet iPhone et ne la quittera jamais. Chaque signature demandera le verrou de l’appareil.")
+                    }
                 }
             }
         }
@@ -113,6 +184,46 @@ struct PairView: View {
     }
 }
 
+struct Step: View {
+    let number: Int
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("\(number)")
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(.background)
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(Color.accentColor))
+            Text(text)
+        }
+    }
+}
+
+struct CommandBox: View {
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        HStack {
+            Text(text)
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+            Spacer()
+            Button {
+                UIPasteboard.general.string = text
+                copied = true
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Copier la commande")
+        }
+        .padding(10)
+        .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 struct PairedView: View {
     @EnvironmentObject private var model: Model
     @Environment(\.dismiss) private var dismiss
@@ -122,14 +233,20 @@ struct PairedView: View {
         NavigationStack {
             Form {
                 Section {
-                    Text(record.fingerprint)
-                        .font(.system(size: 44, weight: .semibold, design: .monospaced))
-                        .frame(maxWidth: .infinity)
-                        .accessibilityLabel(record.fingerprint.map { String($0) }.joined(separator: " "))
+                    VStack(spacing: 8) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.system(size: 44))
+                            .foregroundStyle(Color.accentColor)
+                        Text(record.fingerprint)
+                            .font(.system(size: 44, weight: .semibold, design: .monospaced))
+                            .accessibilityLabel(record.fingerprint.map { String($0) }.joined(separator: " "))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
                 } header: {
                     Text("Chiffres de vérification")
                 } footer: {
-                    Text("L’agent doit afficher les mêmes six chiffres. S’ils diffèrent, refusez sur l’agent : quelqu’un s’est placé entre les deux.")
+                    Text("La machine doit afficher les mêmes six chiffres. S’ils diffèrent, refusez sur la machine : quelqu’un s’est placé entre les deux.")
                 }
                 Section {
                     if let line = model.publicKeyLine { PublicKeyView(line: line) }
@@ -141,7 +258,7 @@ struct PairedView: View {
             }
             .navigationTitle(record.label.isEmpty ? "Appairé" : "Appairé à \(record.label)")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("Terminé") { dismiss() } }
+            .toolbar { Button("Terminé") { dismiss() }.bold() }
         }
     }
 }
@@ -153,8 +270,18 @@ struct PublicKeyView: View {
         Text(line)
             .font(.system(.footnote, design: .monospaced))
             .textSelection(.enabled)
-        Button("Copier la clé") { UIPasteboard.general.string = line }
-        ShareLink(item: line) { Text("Partager la clé") }
+            .lineLimit(4)
+        HStack {
+            Button {
+                UIPasteboard.general.string = line
+            } label: {
+                Label("Copier", systemImage: "doc.on.doc")
+            }
+            .buttonStyle(.bordered)
+            Spacer()
+            ShareLink(item: line) { Label("Partager", systemImage: "square.and.arrow.up") }
+                .buttonStyle(.bordered)
+        }
     }
 }
 
@@ -165,17 +292,66 @@ struct RequestsView: View {
 
     var body: some View {
         List {
-            if !model.status.isEmpty {
-                Text(model.status)
-                    .font(.callout)
-                    .foregroundStyle(model.statusIsError ? .red : .secondary)
+            if let p = model.pairing {
+                Section { MachineCard(pairing: p) }
             }
             if model.requests.isEmpty {
-                Text("Aucune demande en attente.").foregroundStyle(.secondary)
+                Section {
+                    VStack(spacing: 12) {
+                        Image(systemName: "checkmark.shield")
+                            .font(.system(size: 48, weight: .light))
+                            .foregroundStyle(Color.accentColor)
+                        Text("Aucune demande en attente").font(.headline)
+                        Text("Lancez ssh depuis la machine : la demande apparaîtra ici, et ne passera qu’avec le verrou de cet iPhone.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 24)
+                }
+                .listRowBackground(Color.clear)
             }
-            ForEach(model.requests) { r in RequestCard(request: r) }
+            ForEach(model.requests) { r in
+                Section { RequestCard(request: r) }
+            }
         }
+        .listSectionSpacing(.compact)
         .refreshable { model.start() }
+    }
+}
+
+struct MachineCard: View {
+    @EnvironmentObject private var model: Model
+    let pairing: PairingRecord
+
+    private var stateText: String {
+        if !model.status.isEmpty { return model.status }
+        return model.requests.isEmpty ? "Prêt" : "Demande en attente"
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "desktopcomputer")
+                .font(.title2)
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 36)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(pairing.label.isEmpty ? "Machine sans nom" : pairing.label).font(.headline)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Circle()
+                        .fill(model.statusIsError ? Color.red : Color.green)
+                        .frame(width: 8, height: 8)
+                    Text(stateText)
+                        .font(.subheadline)
+                        .foregroundStyle(model.statusIsError ? .red : .secondary)
+                }
+                Text("Relais \(pairing.relay.host ?? pairing.relay.absoluteString)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -190,53 +366,76 @@ struct RequestCard: View {
     private var known: String? { model.name(of: dest.fingerprint) }
     private var user: String { view.user ?? "(utilisateur illisible)" }
     private var busy: Bool { model.busy.contains(request.id) }
-    private var secondsLeft: Int { max(0, Int((Double(request.entry.exp) - model.now.timeIntervalSince1970).rounded(.up))) }
+    private var remaining: Double { max(0, Double(request.entry.exp) - model.now.timeIntervalSince1970) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(known.map { "\(user)@\($0)" } ?? "\(user)@ hôte inconnu")
-                    .font(.title3.weight(.semibold))
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: known == nil ? "questionmark.diamond.fill" : "server.rack")
+                    .font(.title2)
+                    .foregroundStyle(known == nil ? Color.orange : Color.accentColor)
+                    .frame(width: 36)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Connexion SSH").font(.caption).foregroundStyle(.secondary)
+                    Text(known.map { "\(user)@\($0)" } ?? "\(user)@ hôte inconnu")
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(2)
+                }
                 Spacer()
-                Text("\(secondsLeft) s").monospacedDigit().foregroundStyle(.secondary)
+                Countdown(remaining: remaining)
             }
-            Text(dest.fingerprint).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+
+            Text(dest.fingerprint)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
 
             if known == nil { unknownHost }
 
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(view.hops.dropLast().enumerated()), id: \.offset) { _, hop in
-                    Text("Via l’agent transféré à \(model.name(of: hop.fingerprint) ?? "hôte inconnu \(hop.fingerprint)")")
+                    Label("Via l’agent transféré à \(model.name(of: hop.fingerprint) ?? "hôte inconnu \(hop.fingerprint)")",
+                          systemImage: "arrow.triangle.branch")
                 }
-                Text("Demandé par \(callerText), sur \(view.agent ?? "machine sans nom") — non vérifié")
+                Label("\(callerText), sur \(view.agent ?? "machine sans nom") — non vérifié", systemImage: "terminal")
                     .foregroundStyle(.secondary)
             }
             .font(.footnote)
 
-            if let error { Text(error).font(.footnote).foregroundStyle(.red) }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red)
+            }
 
-            HStack {
-                Button("Refuser", role: .destructive) { run { try await model.deny(request) } }
-                    .buttonStyle(.bordered)
-                Spacer()
-                Button(known == nil ? "Faire confiance et approuver" : "Approuver") {
+            HStack(spacing: 12) {
+                Button(role: .destructive) {
+                    run { try await model.deny(request) }
+                } label: {
+                    Text("Refuser").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                Button {
                     run { try await model.approve(request, newName: newName) }
+                } label: {
+                    Label(known == nil ? "Approuver et retenir" : "Approuver", systemImage: "lock.open.fill")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
             }
+            .controlSize(.large)
             .disabled(busy)
         }
         .padding(.vertical, 6)
     }
 
     private var callerText: String {
-        guard let c = view.caller, c.name != nil || c.pid != nil else { return "inconnu" }
-        return (c.name ?? "processus") + (c.pid.map { " (pid \($0))" } ?? "")
+        guard let c = view.caller, c.name != nil || c.pid != nil else { return "Demandé par un processus inconnu" }
+        return "Demandé par " + (c.name ?? "un processus") + (c.pid.map { " (pid \($0))" } ?? "")
     }
 
     @ViewBuilder private var unknownHost: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Cet iPhone n’a jamais approuvé ce serveur.").bold()
+            Label("Cet iPhone n’a jamais approuvé ce serveur.", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline.weight(.semibold))
             Text("Vérifiez l’empreinte ci-dessus avant de continuer. Si vous approuvez, ce serveur sera retenu sous le nom que vous lui donnez.")
                 .font(.footnote)
             if let hint = view.hints[dest.fingerprint] {
@@ -252,8 +451,8 @@ struct RequestCard: View {
                 .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)
         }
-        .padding(10)
-        .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 10))
+        .padding(12)
+        .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func run(_ work: @escaping () async throws -> Void) {
@@ -261,6 +460,29 @@ struct RequestCard: View {
         Task {
             do { try await work() } catch { self.error = "Échec : \(describe(error))." }
         }
+    }
+}
+
+/// Seconds left before the request expires. The ring is drawn against
+/// the agent's default expiry, 90 s.
+struct Countdown: View {
+    let remaining: Double
+    private var fraction: Double { min(1, remaining / 90) }
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color(.tertiarySystemFill), lineWidth: 4)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(remaining < 15 ? Color.red : Color.accentColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.linear(duration: 1), value: fraction)
+            Text("\(Int(remaining.rounded(.up)))")
+                .font(.caption.weight(.semibold))
+                .monospacedDigit()
+        }
+        .frame(width: 40, height: 40)
+        .accessibilityLabel("\(Int(remaining.rounded(.up))) secondes restantes")
     }
 }
 
@@ -273,7 +495,15 @@ struct SettingsView: View {
     var body: some View {
         Form {
             if let line = model.publicKeyLine {
-                Section("Clé SSH de cet iPhone") { PublicKeyView(line: line) }
+                Section {
+                    PublicKeyView(line: line)
+                } header: {
+                    Text("Clé SSH de cet iPhone")
+                } footer: {
+                    Text(Keys.simulated
+                         ? "Clé logicielle (simulateur)."
+                         : "Dans la puce sécurisée de l’iPhone ; chaque signature demande le verrou de l’appareil.")
+                }
             }
             if let p = model.pairing {
                 Section {
@@ -291,7 +521,7 @@ struct SettingsView: View {
                 if model.remembered.pins.isEmpty { Text("Aucun.").foregroundStyle(.secondary) }
                 ForEach(model.remembered.pins.sorted(by: { $0.value < $1.value }), id: \.key) { fp, name in
                     VStack(alignment: .leading) {
-                        Text(name).bold()
+                        Label(name, systemImage: "server.rack").bold()
                         Text(fp).font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary)
                     }
                     .swipeActions { Button("Oublier", role: .destructive) { model.forget(pin: fp) } }
@@ -307,10 +537,25 @@ struct SettingsView: View {
                 }
             }
             Section {
-                Text(versionText).font(.footnote).foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    Logo(size: 52)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Clavix Approve").font(.headline)
+                        Text(versionText).font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
+                Link(destination: Links.site) { Label("Site de Clavix", systemImage: "globe") }
+                Link(destination: Links.source) { Label("Code source", systemImage: "chevron.left.forwardslash.chevron.right") }
+                Link(destination: Links.threatModel) { Label("Modèle de menace", systemImage: "shield.lefthalf.filled") }
+            } header: {
+                Text("À propos")
+            } footer: {
+                Text("Clavix Approve fait partie de Clavix, client de bureau pour Vaultwarden et Bitwarden.")
             }
         }
         .navigationTitle("Réglages")
+        .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("Oublier cette machine ?", isPresented: $confirmForget, titleVisibility: .visible) {
             Button("Oublier", role: .destructive) { Task { await model.forgetMachine() } }
         } message: {
@@ -321,6 +566,6 @@ struct SettingsView: View {
     private var versionText: String {
         let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        return "Clavix Approve \(v) (\(b))" + (Keys.simulated ? " — simulateur, clé logicielle" : "")
+        return "Version \(v) (\(b))" + (Keys.simulated ? " — simulateur" : "")
     }
 }

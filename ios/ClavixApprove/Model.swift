@@ -6,6 +6,7 @@
 import ClavixCore
 import Foundation
 import SwiftUI
+import UserNotifications
 
 struct PendingRequest: Identifiable {
     let entry: RequestEntry
@@ -136,6 +137,9 @@ final class Model: ObservableObject {
 
     /// The app comes to the front, or a notification was tapped.
     func start() {
+        // The relay keeps at most one notification per channel; once the
+        // app is in front it is stale.
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
         if ticker == nil {
             ticker = Task { [weak self] in
                 while !Task.isCancelled {
