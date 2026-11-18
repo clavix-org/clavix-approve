@@ -88,6 +88,7 @@ final class Model: ObservableObject {
         }
         requests = []
         seen = []
+        AppDelegate.askForPush()
         await registerPush()
         start()
     }
