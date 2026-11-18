@@ -22,8 +22,7 @@ use hpke::kem::{DhP256HkdfSha256, Kem as KemTrait};
 use hpke::{Deserializable, OpModeR, OpModeS, Serializable};
 use serde_json::Value;
 
-use crate::proto::write_string;
-use crate::relay::{b64u, random, unb64u};
+use crate::bytes::{b64u, random, unb64u, write_string};
 
 type Kem = DhP256HkdfSha256;
 type KemPrivate = <Kem as KemTrait>::PrivateKey;

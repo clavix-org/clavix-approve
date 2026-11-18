@@ -14,18 +14,72 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::bytes::{b64u, hex, random, token_auth, unb64u, unhex, write_string};
 use crate::channel::{open_introduction, pair_header, Identity, Peer};
-use crate::proto::write_string;
-use crate::relay::{b64u, hex, random, token_auth, unb64u, RelayClient};
+use crate::relay::{RelayClient, RelayError};
 use crate::state;
 
 pub const CODE_PREFIX: &str = "cva1-";
 /// The relay forgets a channel nobody joined after 15 minutes.
 pub const PAIRING_WINDOW: Duration = Duration::from_secs(14 * 60);
 const KEY_ALGORITHM: &str = "ecdsa-sha2-nistp256";
+/// Approval keys a requester accepts (PROTOCOL.md, "Approval key").
+pub const APPROVE_KEY_TYPES: [&str; 2] = ["ssh-ed25519", "ecdsa-sha2-nistp256"];
+
+/// What a channel is for, set at pairing and for good (PROTOCOL.md,
+/// "Approve mode"). Each mode has its own labels, so that a relay flipping
+/// the mode breaks a MAC or the digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// The device holds the SSH key and signs (`clavix-agent`).
+    Sign,
+    /// The requester holds the SSH key; the device only approves, with
+    /// its approval key (Clavix desktop).
+    Approve,
+}
+
+impl Mode {
+    fn hello_label(self) -> &'static str {
+        match self {
+            Self::Sign => "hello",
+            Self::Approve => "approve-hello",
+        }
+    }
+
+    fn answer_label(self) -> &'static str {
+        match self {
+            Self::Sign => "answer",
+            Self::Approve => "approve-answer",
+        }
+    }
+
+    fn fingerprint_label(self) -> &'static str {
+        match self {
+            Self::Sign => "clavix-approve/v1/fingerprint",
+            Self::Approve => "clavix-approve/v1/approve-fingerprint",
+        }
+    }
+
+    /// The field of the device's answer that carries its key.
+    fn key_field(self) -> &'static str {
+        match self {
+            Self::Sign => "key",
+            Self::Approve => "approve",
+        }
+    }
+
+    fn accepts(self, algorithm: &str) -> bool {
+        match self {
+            Self::Sign => algorithm == KEY_ALGORITHM,
+            Self::Approve => APPROVE_KEY_TYPES.contains(&algorithm),
+        }
+    }
+}
 
 fn derive(secret: &[u8], purpose: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -56,10 +110,16 @@ fn mac(secret: &[u8], transcript: &[u8]) -> Hmac<Sha256> {
     mac
 }
 
-/// Six digits both ends display once paired, e.g. "042 917".
+/// Six digits both ends display once paired, e.g. "042 917" (sign mode).
 pub fn fingerprint(agent: &Identity, signer: &Peer, key_blob: &[u8]) -> String {
+    fingerprint_in(Mode::Sign, agent, signer, key_blob)
+}
+
+/// The six digits of a pairing in `mode`; `key_blob` is the device's SSH
+/// key (sign mode) or approval key (approve mode).
+pub fn fingerprint_in(mode: Mode, agent: &Identity, signer: &Peer, key_blob: &[u8]) -> String {
     let digest = Sha256::digest(transcript(
-        "clavix-approve/v1/fingerprint",
+        mode.fingerprint_label(),
         &[
             agent.kem_public(),
             &agent.sig_public(),
@@ -82,63 +142,120 @@ pub struct Offer {
     pub agent_token: String,
     /// The agent's new long-term keys.
     pub identity: Identity,
+    /// What the channel is for.
+    pub mode: Mode,
     secret: [u8; 16],
 }
 
-/// A completed pairing, not yet confirmed by the user.
+/// A completed sign-mode pairing, not yet confirmed by the user.
 pub struct Paired {
     pub signer: state::Signer,
     /// To compare with the device's display before trusting the pairing.
     pub fingerprint: String,
 }
 
+/// A device's answer, authenticated by the pairing secret, in either mode.
+#[derive(Debug, Clone)]
+pub struct Answer {
+    /// Signer id on the channel (16 hex digits).
+    pub id: String,
+    /// The device's channel keys.
+    pub peer: Peer,
+    /// Its SSH key (sign mode) or approval key (approve mode), as an SSH
+    /// public key blob of an accepted type.
+    pub key_blob: Vec<u8>,
+    /// The name it gives itself, reduced to `[A-Za-z0-9-_.@]`, never empty.
+    pub comment: String,
+    /// To compare with the device's display before trusting the pairing.
+    pub fingerprint: String,
+}
+
+impl Answer {
+    /// The key as an `authorized_keys`-style line.
+    pub fn public_key_line(&self) -> Result<String, String> {
+        let key = ssh_key::PublicKey::from_bytes(&self.key_blob)
+            .map_err(|e| format!("invalid device key: {e}"))?;
+        Ok(format!(
+            "{} {} {}",
+            key.algorithm().as_str(),
+            STANDARD.encode(&self.key_blob),
+            self.comment
+        ))
+    }
+}
+
 impl Offer {
+    /// A new sign-mode channel.
     pub fn new() -> Self {
-        Self::from_parts(random::<16>(), random::<16>(), random::<32>())
+        Self::new_in(Mode::Sign)
     }
 
-    fn from_parts(ch: [u8; 16], secret: [u8; 16], token: [u8; 32]) -> Self {
+    /// A new channel in `mode`.
+    pub fn new_in(mode: Mode) -> Self {
+        Self::from_parts(random::<16>(), random::<16>(), random::<32>(), mode)
+    }
+
+    fn from_parts(ch: [u8; 16], secret: [u8; 16], token: [u8; 32], mode: Mode) -> Self {
         Self {
             ch: hex(&ch),
             code: format!("{CODE_PREFIX}{}", b64u(&[ch, secret].concat())),
             agent_token: b64u(&token),
             identity: Identity::generate(),
+            mode,
             secret,
         }
     }
 
-    /// A pairing of one more device on an existing channel: same channel,
-    /// same agent keys and token, a fresh one-time secret.
+    /// A pairing of one more device on an existing sign-mode channel: same
+    /// channel, same agent keys and token, a fresh one-time secret.
     pub fn for_channel(existing: &state::State) -> Result<Self, String> {
         let field = |b64: &str| unb64u(b64).ok_or("corrupt state: bad base64");
         let identity = Identity::from_secrets(
             &field(&existing.kem_private)?,
             &field(&existing.sig_private)?,
         )?;
-        let ch: [u8; 16] = crate::relay::unhex(&existing.ch)
+        Self::for_existing(&existing.ch, &existing.agent_token, identity, Mode::Sign)
+    }
+
+    /// One more device on the channel `ch`, whose keys and token we hold.
+    pub fn for_existing(
+        ch: &str,
+        agent_token: &str,
+        identity: Identity,
+        mode: Mode,
+    ) -> Result<Self, String> {
+        let raw: [u8; 16] = unhex(ch)
             .and_then(|v| v.try_into().ok())
             .ok_or("corrupt state: bad channel id")?;
         let secret = random::<16>();
         Ok(Self {
-            ch: existing.ch.clone(),
-            code: format!("{CODE_PREFIX}{}", b64u(&[ch, secret].concat())),
-            agent_token: existing.agent_token.clone(),
+            ch: ch.to_string(),
+            code: format!("{CODE_PREFIX}{}", b64u(&[raw, secret].concat())),
+            agent_token: agent_token.to_string(),
             identity,
+            mode,
             secret,
         })
     }
 
-    /// Our public keys, authenticated by the pairing secret.
+    /// Our public keys, authenticated by the pairing secret. An
+    /// approve-mode hello says so, under its own MAC label.
     fn hello(&self, label: &str) -> String {
         let (kem, sig) = (self.identity.kem_public(), self.identity.sig_public());
         let tag = mac(
             &self.secret,
-            &transcript("hello", &[self.ch.as_bytes(), kem, &sig, label.as_bytes()]),
+            &transcript(
+                self.mode.hello_label(),
+                &[self.ch.as_bytes(), kem, &sig, label.as_bytes()],
+            ),
         )
         .finalize()
         .into_bytes();
-        let hello =
+        let mut hello =
             json!({ "label": label, "kem": b64u(kem), "sig": b64u(&sig), "mac": b64u(&tag) });
+        if self.mode == Mode::Approve {
+            hello["mode"] = json!("approve");
+        }
         b64u(hello.to_string().as_bytes())
     }
 
@@ -183,7 +300,7 @@ impl Offer {
             )
             .await
             .map_err(|e| match e {
-                crate::relay::RelayError::Status(401) => {
+                RelayError::Status(401) => {
                     "the relay no longer knows this pairing; run `clavix-agent pair` without --add"
                         .to_string()
                 }
@@ -201,12 +318,21 @@ impl Offer {
         }
     }
 
-    /// Wait for the device to answer, at most `max`.
+    /// Wait for the device to answer, at most `max` (sign mode).
     pub async fn wait_for_signer(
         &self,
         client: &RelayClient,
         max: Duration,
     ) -> Result<Paired, String> {
+        self.wait_for_answer(client, max).await.map(Self::paired)
+    }
+
+    /// Wait for the device to answer, at most `max`, in the offer's mode.
+    pub async fn wait_for_answer(
+        &self,
+        client: &RelayClient,
+        max: Duration,
+    ) -> Result<Answer, String> {
         let deadline = Instant::now() + max;
         let path = format!("/api/ch/{}/pair/answer?wait=25", self.ch);
         loop {
@@ -221,12 +347,36 @@ impl Offer {
                 .map_err(|e| e.to_string())?
             {
                 None => continue,
-                Some(answer) => return self.read_answer(&answer),
+                Some(answer) => return self.read_reply(&answer),
             }
         }
     }
 
+    /// A sign-mode answer, as the agent stores it.
+    fn paired(answer: Answer) -> Paired {
+        Paired {
+            signer: state::Signer {
+                public_key: format!(
+                    "{KEY_ALGORITHM} {} {}",
+                    STANDARD.encode(&answer.key_blob),
+                    answer.comment
+                ),
+                kem_public: b64u(answer.peer.kem_public()),
+                sig_public: b64u(&answer.peer.sig_public()),
+                id: answer.id,
+            },
+            fingerprint: answer.fingerprint,
+        }
+    }
+
+    #[cfg(test)]
     fn read_answer(&self, answer: &Value) -> Result<Paired, String> {
+        self.read_reply(answer).map(Self::paired)
+    }
+
+    /// Read the device's answer (`{ signer, msg }` from the relay) and
+    /// authenticate it with the pairing secret, in the offer's mode.
+    pub fn read_reply(&self, answer: &Value) -> Result<Answer, String> {
         let text = |v: &Value, name: &str| v.get(name).and_then(Value::as_str).map(str::to_string);
         let bytes = |v: &Value, name: &str| text(v, name).and_then(|s| unb64u(&s));
 
@@ -238,7 +388,10 @@ impl Offer {
             open_introduction(&self.identity, &pair_header(&self.ch, &id), &msg)
                 .map_err(|e| format!("unreadable pairing answer: {e}"))?;
 
-        let blob = bytes(&inner, "key").ok_or("pairing answer without a key")?;
+        let blob = bytes(&inner, self.mode.key_field()).ok_or(match self.mode {
+            Mode::Sign => "pairing answer without a key",
+            Mode::Approve => "pairing answer without an approval key: not an approve-mode device",
+        })?;
         let kem = bytes(&inner, "kem").ok_or("pairing answer without an HPKE key")?;
         let tag = bytes(&inner, "mac").ok_or("pairing answer without a MAC")?;
         let signer = Peer::new(&kem, &sender_sig)?;
@@ -247,7 +400,7 @@ impl Offer {
         mac(
             &self.secret,
             &transcript(
-                "answer",
+                self.mode.answer_label(),
                 &[
                     self.ch.as_bytes(),
                     id.as_bytes(),
@@ -264,7 +417,7 @@ impl Offer {
 
         let key = ssh_key::PublicKey::from_bytes(&blob)
             .map_err(|e| format!("invalid signer key: {e}"))?;
-        if key.algorithm().as_str() != KEY_ALGORITHM {
+        if !self.mode.accepts(key.algorithm().as_str()) {
             return Err(format!(
                 "unsupported signer key type {}",
                 key.algorithm().as_str()
@@ -282,14 +435,12 @@ impl Offer {
         } else {
             comment
         };
-        Ok(Paired {
-            fingerprint: fingerprint(&self.identity, &signer, &blob),
-            signer: state::Signer {
-                id,
-                public_key: format!("{KEY_ALGORITHM} {} {comment}", STANDARD.encode(&blob)),
-                kem_public: b64u(signer.kem_public()),
-                sig_public: b64u(&signer.sig_public()),
-            },
+        Ok(Answer {
+            fingerprint: fingerprint_in(self.mode, &self.identity, &signer, &blob),
+            id,
+            peer: signer,
+            key_blob: blob,
+            comment,
         })
     }
 }
@@ -299,20 +450,6 @@ impl Offer {
 /// is never sent to the server.
 pub fn pairing_url(relay: &str, code: &str) -> String {
     format!("{}/#{code}", relay.trim_end_matches('/'))
-}
-
-/// A QR code drawn with half-block characters, for a terminal. Drawn for a
-/// dark background (the usual case): the light modules are the inked ones.
-pub fn terminal_qr(text: &str) -> Option<String> {
-    use qrcode::render::unicode::Dense1x2;
-    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
-    Some(
-        code.render::<Dense1x2>()
-            .dark_color(Dense1x2::Light)
-            .light_color(Dense1x2::Dark)
-            .quiet_zone(true)
-            .build(),
-    )
 }
 
 impl Default for Offer {
@@ -368,7 +505,7 @@ mod tests {
 
     #[test]
     fn the_code_carries_the_channel_and_the_secret_but_not_the_token() {
-        let offer = Offer::from_parts([0xab; 16], [0xcd; 16], [0xef; 32]);
+        let offer = Offer::from_parts([0xab; 16], [0xcd; 16], [0xef; 32], Mode::Sign);
         assert_eq!(offer.ch, "ab".repeat(16));
         let raw = unb64u(offer.code.strip_prefix(CODE_PREFIX).unwrap()).unwrap();
         assert_eq!(raw, [[0xab; 16], [0xcd; 16]].concat());
@@ -448,20 +585,9 @@ mod tests {
     }
 
     #[test]
-    fn the_qr_link_puts_the_code_in_the_fragment() {
+    fn the_link_puts_the_code_in_the_fragment() {
         let url = pairing_url("https://approve.example/", "cva1-abc");
         assert_eq!(url, "https://approve.example/#cva1-abc");
-        let offer = Offer::new();
-        let qr = terminal_qr(&pairing_url("https://approve.example", &offer.code)).unwrap();
-        let lines: Vec<&str> = qr.lines().collect();
-        // Small enough for an 80-column terminal, and rectangular.
-        assert!(
-            lines.len() >= 15 && lines.len() <= 30,
-            "{} lines",
-            lines.len()
-        );
-        let width = lines[0].chars().count();
-        assert!(width <= 60 && lines.iter().all(|l| l.chars().count() == width));
     }
 
     #[test]
@@ -483,5 +609,87 @@ mod tests {
         let tag = unb64u(hello["mac"].as_str().unwrap()).unwrap();
         assert!(mac(&offer.secret, &expected).verify_slice(&tag).is_ok());
         assert!(mac(&[0u8; 16], &expected).verify_slice(&tag).is_err());
+        assert!(hello.get("mode").is_none());
+    }
+
+    /// The approve-mode vector shared with the page and the iOS app
+    /// (testdata/approve-pairing.json): same MACs, same digits.
+    #[test]
+    fn approve_mode_matches_the_shared_vector() {
+        let v: Value =
+            serde_json::from_str(include_str!("../../testdata/approve-pairing.json")).unwrap();
+        let s = |path: &[&str]| {
+            path.iter()
+                .fold(&v, |v, k| &v[*k])
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let identity = |who: &str| {
+            Identity::from_secrets(
+                &unhex(&s(&[who, "kem_private"])).unwrap(),
+                &unhex(&s(&[who, "sig_seed"])).unwrap(),
+            )
+            .unwrap()
+        };
+        let phone = identity("signer_keys");
+        let secret: [u8; 16] = unhex(&s(&["secret"])).unwrap().try_into().unwrap();
+        let ch = s(&["channel"]);
+        let offer_in = |mode| Offer {
+            code: s(&["code"]),
+            ch: ch.clone(),
+            agent_token: "t".into(),
+            identity: identity("agent"),
+            mode,
+            secret,
+        };
+        let offer = offer_in(Mode::Approve);
+        assert_eq!(hex(offer.identity.kem_public()), s(&["agent", "kem"]));
+        assert_eq!(
+            offer.code,
+            format!(
+                "{CODE_PREFIX}{}",
+                b64u(&[unhex(&ch).unwrap(), secret.to_vec()].concat())
+            )
+        );
+
+        // The hello: its MAC, and the mode it announces.
+        let hello: Value =
+            serde_json::from_slice(&unb64u(&offer.hello(&s(&["label"]))).unwrap()).unwrap();
+        assert_eq!(hello["mac"], s(&["hello_mac"]));
+        assert_eq!(hello["mode"], "approve");
+
+        let signer = s(&["signer"]);
+        let agent = Peer::new(offer.identity.kem_public(), &offer.identity.sig_public()).unwrap();
+        for case in v["answers"].as_array().unwrap() {
+            let blob = unb64u(case["approve"].as_str().unwrap()).unwrap();
+            // A device answering with the vector's MAC is accepted, and both
+            // ends show the vector's digits.
+            let inner = json!({
+                "t": "pair", "approve": case["approve"], "comment": "phone",
+                "kem": b64u(phone.kem_public()), "mac": case["answer_mac"],
+            });
+            let sealed = seal(&phone, &agent, &pair_header(&ch, &signer), &inner).unwrap();
+            let intro = [&phone.sig_public()[..], &unb64u(&sealed).unwrap()].concat();
+            let reply = json!({ "signer": signer, "msg": b64u(&intro) });
+            let answer = offer.read_reply(&reply).unwrap();
+            assert_eq!(answer.fingerprint, case["digits"].as_str().unwrap());
+            assert_eq!(answer.key_blob, blob);
+            assert_eq!(answer.comment, "phone");
+            // The same answer is no sign-mode one: no `key`, other labels.
+            assert!(offer_in(Mode::Sign).read_reply(&reply).is_err());
+        }
+    }
+
+    #[test]
+    fn an_approve_mode_answer_needs_an_approval_key_under_its_own_mac() {
+        let offer = Offer::new_in(Mode::Approve);
+        let phone = Identity::generate();
+        let blob = blob_of(P256_LINE);
+        // A sign-mode answer (`key`, label "answer") to an approve-mode offer.
+        let sign_answer = answer(&offer, &phone, &offer.secret, &blob, "x");
+        assert!(offer
+            .read_reply(&sign_answer)
+            .is_err_and(|e| e.contains("approval key")));
     }
 }

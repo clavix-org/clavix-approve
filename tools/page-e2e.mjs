@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
-const AGENT = join(repo, 'agent/target/debug/clavix-agent');
+const AGENT = join(repo, 'target/debug/clavix-agent');
 const CHROME = process.env.CHROME ?? 'google-chrome';
 const dir = mkdtempSync(join(tmpdir(), 'clavix-page-e2e-'));
 const children = [];

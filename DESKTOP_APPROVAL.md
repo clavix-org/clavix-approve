@@ -196,8 +196,14 @@ each one still needs a verification on the phone.
    (`web/lib/requester.js`) rather than in Rust, until the shared crate of
    step 2 exists. End to end with Ed25519 and RSA requester keys:
    `tools/approve-e2e.mjs`, and the real page in `tools/page-e2e.mjs`.
-2. **Shared crate:** extract the channel, pairing and relay client; make
-   `clavix-agent` use it.
+2. **Shared crate (done):** `core/` (`clavix-approve-core`) holds the
+   channel, pairing in both modes and the relay client, which
+   `clavix-agent` now uses, and the requester (`requester` module):
+   pair devices in approve mode, ask every device at once (first answer
+   wins, a refusal is final, the others are withdrawn), verify the proof,
+   withdraw by the caller's own request id. Its rustdoc maps it onto
+   Clavix's `PhoneApprover`. End to end against the fake phone:
+   `core/tests/e2e_approve.rs`.
 3. **Clavix PR:** the backend, the settings and pairing UI, the threat
    model additions, behind a setting that defaults to off.
 
