@@ -1,7 +1,7 @@
 [package]
 name = "clavix-approve-core"
 version = "0.1.0"
-description = "Clavix Approve protocol: sealed channel, pairing, relay client, and the requester of approve mode"
+description = "Clavix Approve protocol: sealed channel, pairing, relay client, and the requesters of approve and sign mode"
 edition = "2021"
 rust-version = "1.95"
 license = "GPL-3.0-or-later"

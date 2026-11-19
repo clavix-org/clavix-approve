@@ -1,45 +1,54 @@
-//! The [`Signer`] built on the relay client: every signature request goes
-//! to the paired device through the relay and comes back approved, denied
-//! or not at all. The client itself, and its rules of conduct towards the
-//! relay, are in `clavix-approve-core` (re-exported here).
+//! The [`Signer`] built on the relay: a thin adapter over the sign-mode
+//! requester of `clavix-approve-core`, which sends every signature request
+//! to the paired device through the relay and gets it back approved,
+//! denied or not at all. The relay client itself, and its rules of conduct
+//! towards the relay, are in `clavix-approve-core` too (re-exported here).
+//! What stays here is agent-side: naming host keys from `known_hosts` and
+//! the caller's command line, and the agent's wording of failures.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use serde_json::{json, Value};
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
 
 pub use clavix_approve_core::bytes::{b64u, hex, random, token_auth, unb64u, unhex};
 pub use clavix_approve_core::relay::{revoke, revoke_device, RelayClient, RelayError};
-use clavix_approve_core::relay::{state_of, unix_now, POLL_SECONDS, RETRY_PAUSE, THROTTLED_PAUSE};
+use clavix_approve_core::sign_requester::{
+    self as core_sign, Caller, SessionBind, SignRequest, SignRequester,
+};
+pub use clavix_approve_core::sign_requester::{SignDevice as Device, DEFAULT_TIMEOUT};
 
-use crate::channel::{self, request_header, response_header, Peer};
+use crate::channel;
 use crate::proto::{CallerInfo, Identity, SignError, SignFuture, SignJob, Signer};
 
-/// How long the user has to approve. Must stay under the server's
-/// `LoginGraceTime` (120 s by default), which starts before we are asked.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
-/// Requests waiting for the user at the same time.
-const MAX_IN_FLIGHT: usize = 4;
-/// After a denial, further requests fail at once for this long: a tool
-/// that retries in a loop must not turn into a stream of notifications.
-const BACKOFF_AFTER_DENIAL: Duration = Duration::from_secs(5);
-
-/// A relay failure as the agent reports it. A 401 on a paired channel
-/// means the pairing is gone, most likely revoked from the device.
-fn relay_failure(e: RelayError) -> SignError {
+/// A sign-mode failure as the agent logs it: what the core reports, plus
+/// what to do about it with this command line tool.
+fn agent_error(e: core_sign::SignError) -> SignError {
+    use core_sign::SignError as E;
     match e {
-        RelayError::Status(401) => SignError::Backend(
+        E::Denied => SignError::Denied,
+        E::Expired => SignError::Expired,
+        E::Revoked => SignError::Backend(
             "the relay no longer knows this pairing (revoked from the device?); \
              run `clavix-agent pair` again"
                 .into(),
         ),
-        e => SignError::Backend(e.to_string()),
+        E::UnknownDevice(to) => SignError::Backend(format!(
+            "device {to} is no longer paired (forgotten on the device?); \
+             run `clavix-agent unpair --device {to}`"
+        )),
+        E::NotPickedUp { device, after } => SignError::Backend(format!(
+            "device {device} did not pick the request up within {} s; \
+             ssh may try the next device's key",
+            after.as_secs()
+        )),
+        e @ (E::Refused(_) | E::BackingOff | E::Busy | E::Relay(_) | E::Invalid(_)) => {
+            SignError::Backend(e.to_string())
+        }
     }
 }
 
@@ -48,41 +57,13 @@ fn relay_failure(e: RelayError) -> SignError {
 /// is the only one in the request (no forwarded agent in between).
 type HintFn = Arc<dyn Fn(&[u8], Option<&CallerInfo>, bool) -> Option<String> + Send + Sync>;
 
-/// A paired device, as given to `RelaySigner::new`.
-pub struct Device {
-    /// Signer id on the channel.
-    pub id: String,
-    /// Its SSH public key, as an `authorized_keys` line.
-    pub public_key: String,
-    /// Its channel keys, agreed at pairing.
-    pub peer: Peer,
-}
-
-struct DeviceKeys {
-    id: String,
-    identity: Identity,
-    peer: Arc<Peer>,
-}
-
 /// Sends each sign job to the device holding the requested key and waits
 /// for its answer.
 pub struct RelaySigner {
-    client: RelayClient,
-    ch: String,
-    token: String,
-    label: String,
-    /// In the order their keys are offered to `ssh`.
-    devices: Vec<DeviceKeys>,
-    /// Our channel keys.
-    me: Arc<channel::Identity>,
-    timeout: Duration,
-    /// With more than one device: how long a device may take to fetch a
-    /// request before the agent gives up on it, so that `ssh` moves on to
-    /// the next key instead of waiting for the full timeout.
-    pickup: Option<Duration>,
+    requester: SignRequester,
+    /// The offered keys, in order: computed once.
+    identities: Vec<Identity>,
     hints: HintFn,
-    slots: Arc<Semaphore>,
-    backoff_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl RelaySigner {
@@ -97,38 +78,20 @@ impl RelaySigner {
         devices: Vec<Device>,
         timeout: Duration,
     ) -> Result<Self, String> {
-        if devices.is_empty() {
-            return Err("no paired device".into());
-        }
-        let devices = devices
+        let requester = SignRequester::new(client, ch, token, label, me, devices, timeout)
+            .map_err(|e| e.to_string())?;
+        let identities = requester
+            .keys()
             .into_iter()
-            .map(|d| {
-                let key = ssh_key::PublicKey::from_openssh(&d.public_key)
-                    .map_err(|e| format!("invalid signer public key: {e}"))?;
-                Ok(DeviceKeys {
-                    id: d.id,
-                    identity: Identity {
-                        key_blob: key
-                            .to_bytes()
-                            .map_err(|e| format!("signer public key: {e}"))?,
-                        comment: key.comment().to_string(),
-                    },
-                    peer: Arc::new(d.peer),
-                })
+            .map(|k| Identity {
+                key_blob: k.key_blob,
+                comment: k.comment,
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect();
         Ok(Self {
-            client,
-            ch: ch.to_string(),
-            token: token.to_string(),
-            label: label.to_string(),
-            devices,
-            me: Arc::new(me),
-            timeout,
-            pickup: None,
+            requester,
+            identities,
             hints: Arc::new(|_, _, _| None),
-            slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-            backoff_until: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -136,7 +99,7 @@ impl RelaySigner {
     /// (zero: never). Only with more than one device: alone, there is no
     /// other key to fall back on.
     pub fn with_pickup(mut self, pickup: Duration) -> Self {
-        self.pickup = (!pickup.is_zero()).then_some(pickup);
+        self.requester = self.requester.with_pickup(pickup);
         self
     }
 
@@ -151,207 +114,47 @@ impl RelaySigner {
         self
     }
 
-    fn request_body(&self, job: &SignJob, id: &str, now: u64, exp: u64) -> Value {
-        let mut hints = serde_json::Map::new();
+    /// The core's request for `job`, with the host-key names suggested.
+    fn request(&self, job: SignJob) -> SignRequest {
+        let mut hints = BTreeMap::new();
         let sole = job.hops.len() == 1;
         for hop in &job.hops {
             if let Some(name) = (self.hints)(&hop.key_blob, job.caller.as_ref(), sole) {
-                hints.insert(hop.fingerprint.clone(), Value::String(name));
+                hints.insert(hop.fingerprint.clone(), name);
             }
         }
-        let binds: Vec<Value> = job
-            .hops
-            .iter()
-            .map(|hop| {
-                json!({
-                    "hostkey": b64u(&hop.key_blob),
-                    "sid": b64u(&hop.session_id),
-                    "sig": b64u(&hop.signature),
-                    "fwd": hop.forwarded,
+        SignRequest {
+            key: job.key_blob,
+            data: job.data,
+            flags: job.flags,
+            binds: job
+                .hops
+                .into_iter()
+                .map(|hop| SessionBind {
+                    host_key: hop.key_blob,
+                    session_id: hop.session_id,
+                    signature: hop.signature,
+                    forwarded: hop.forwarded,
                 })
-            })
-            .collect();
-        json!({
-            "t": "sign",
-            "id": id,
-            "iat": now,
-            "exp": exp,
-            "key": b64u(&job.key_blob),
-            "data": b64u(&job.data),
-            "flags": job.flags,
-            "binds": binds,
-            "caller": job.caller.as_ref().map(|c| json!({ "pid": c.pid, "name": c.name })),
-            "agent": self.label,
-            "hints": hints,
-        })
-    }
-}
-
-/// Read the device's (already opened) answer to the request `id` whose
-/// wire form was `sent`.
-fn read_response(inner: &Value, id: &str, sent: &str) -> Result<Vec<u8>, SignError> {
-    let bad = |what: &str| SignError::Backend(format!("unusable answer from the signer: {what}"));
-    let field = |name: &str| inner.get(name).and_then(Value::as_str);
-    // The answer must be for this very request, not a replay of another.
-    if field("id") != Some(id) || field("req") != Some(&b64u(&Sha256::digest(sent.as_bytes()))) {
-        return Err(bad("it answers another request"));
-    }
-    match field("t") {
-        // A complete SSH signature blob: it names its own algorithm.
-        Some("signed") => field("sig")
-            .and_then(unb64u)
-            .ok_or_else(|| bad("no signature")),
-        Some("denied") => match field("reason") {
-            Some("user") | None => Err(SignError::Denied),
-            Some(reason) => Err(SignError::Backend(format!(
-                "the signer refused the request ({})",
-                reason
-                    .chars()
-                    .filter(char::is_ascii_graphic)
-                    .take(24)
-                    .collect::<String>()
-            ))),
-        },
-        _ => Err(bad("unknown type")),
+                .collect(),
+            // A name that could not be read goes out as unknown (`null`).
+            caller: job.caller.map(|c| Caller {
+                pid: c.pid,
+                name: c.name.unwrap_or_default(),
+            }),
+            hints,
+        }
     }
 }
 
 impl Signer for RelaySigner {
     fn identities(&self) -> Vec<Identity> {
-        self.devices.iter().map(|d| d.identity.clone()).collect()
+        self.identities.clone()
     }
 
     fn sign(&self, job: SignJob) -> SignFuture {
-        let Some(device) = self
-            .devices
-            .iter()
-            .find(|d| d.identity.key_blob == job.key_blob)
-        else {
-            return Box::pin(async {
-                Err(SignError::Backend("no paired device holds this key".into()))
-            });
-        };
-        let pickup = self.pickup.filter(|_| self.devices.len() > 1);
-        let id = hex(&random::<16>());
-        let now = unix_now();
-        let exp = now + self.timeout.as_secs();
-        let sealed = channel::seal(
-            &self.me,
-            &device.peer,
-            &request_header(&self.ch, &device.id, &id, exp),
-            &self.request_body(&job, &id, now, exp),
-        );
-        let answer_header = response_header(&self.ch, &device.id, &id);
-        let (me, peer) = (self.me.clone(), device.peer.clone());
-        let to = device.id.clone();
-
-        let client = self.client.clone();
-        let token = self.token.clone();
-        let base = format!("/api/ch/{}", self.ch);
-        let deadline = Instant::now() + self.timeout;
-        let slots = self.slots.clone();
-        let backoff_until = self.backoff_until.clone();
-
-        Box::pin(async move {
-            let sent = sealed.map_err(SignError::Backend)?;
-            let envelope = json!({ "id": id, "to": to, "exp": exp, "msg": sent });
-            if backoff_until
-                .lock()
-                .unwrap()
-                .is_some_and(|until| Instant::now() < until)
-            {
-                return Err(SignError::Backend(
-                    "a request was just denied; backing off".into(),
-                ));
-            }
-            let Ok(_slot) = slots.try_acquire_owned() else {
-                return Err(SignError::Backend(
-                    "too many requests already waiting".into(),
-                ));
-            };
-
-            let queued = client
-                .post(&format!("{base}/requests"), &token, &envelope)
-                .await
-                .map_err(relay_failure)?;
-            if state_of(&queued) == "unknown-signer" {
-                return Err(SignError::Backend(format!(
-                    "device {to} is no longer paired (forgotten on the device?); \
-                     run `clavix-agent unpair --device {to}`"
-                )));
-            }
-            if state_of(&queued) != "queued" {
-                return Err(SignError::Backend(format!(
-                    "relay did not queue the request ({})",
-                    state_of(&queued)
-                )));
-            }
-
-            let pickup_at = pickup.map(|p| (Instant::now() + p, p));
-            let mut seen = false;
-            let answer = loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(SignError::Expired);
-                }
-                // Never ask the relay to hold the connection past the expiry.
-                let mut wait = (left.as_secs() + 1).min(POLL_SECONDS);
-                if let (Some((at, allowed)), false) = (pickup_at, seen) {
-                    let until = at.saturating_duration_since(Instant::now());
-                    if until.is_zero() {
-                        // The device never fetched it: give up, so that
-                        // ssh tries the next key, and take it off the relay.
-                        let _ = client
-                            .post(&format!("{base}/requests/{id}/cancel"), &token, &json!({}))
-                            .await;
-                        return Err(SignError::Backend(format!(
-                            "device {to} did not pick the request up within {} s; \
-                             ssh may try the next device's key",
-                            allowed.as_secs()
-                        )));
-                    }
-                    wait = wait.min(until.as_secs().max(1));
-                }
-                let report = if pickup_at.is_some() { "&seen=1" } else { "" };
-                let poll = format!("{base}/responses/{id}?wait={wait}{report}");
-                match client.get(&poll, &token).await {
-                    Ok(None) => continue,
-                    Ok(Some(value)) => match state_of(&value) {
-                        "pending" => {
-                            seen |= value.get("seen").and_then(Value::as_bool) == Some(true);
-                            continue;
-                        }
-                        "answered" => match value.get("msg").and_then(Value::as_str) {
-                            Some(msg) => break msg.to_string(),
-                            None => {
-                                return Err(SignError::Backend("answer without content".into()))
-                            }
-                        },
-                        "expired" => return Err(SignError::Expired),
-                        other => {
-                            return Err(SignError::Backend(format!(
-                                "relay lost the request ({other})"
-                            )))
-                        }
-                    },
-                    // Throttled: back off for real, each 429 counts
-                    // against us at a proxy that bans.
-                    Err(RelayError::Status(429)) => tokio::time::sleep(THROTTLED_PAUSE).await,
-                    Err(e) if e.is_transient() => tokio::time::sleep(RETRY_PAUSE).await,
-                    Err(e) => return Err(relay_failure(e)),
-                }
-            };
-
-            // Only the paired device can have produced this.
-            let inner = channel::open(&me, &peer, &answer_header, &answer).map_err(|e| {
-                SignError::Backend(format!("unauthentic answer from the relay: {e}"))
-            })?;
-            let result = read_response(&inner, &id, &sent);
-            if result == Err(SignError::Denied) {
-                *backoff_until.lock().unwrap() = Some(Instant::now() + BACKOFF_AFTER_DENIAL);
-            }
-            result
-        })
+        let signature = self.requester.sign(&self.request(job));
+        Box::pin(async move { signature.await.map_err(agent_error) })
     }
 }
 
@@ -547,73 +350,118 @@ pub fn ssh_destination(args: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::HostHop;
 
     #[test]
-    fn relay_url_must_be_https_unless_loopback() {
-        assert!(RelayClient::new("https://relay.example").is_ok());
-        assert!(RelayClient::new("http://127.0.0.1:8765/").is_ok());
-        assert!(RelayClient::new("http://localhost:8765").is_ok());
-        assert!(RelayClient::new("http://relay.example").is_err());
-        assert!(RelayClient::new("ftp://relay.example").is_err());
-        assert!(RelayClient::new("not a url").is_err());
-    }
-
-    #[test]
-    fn only_server_errors_and_network_errors_are_retried() {
-        assert!(RelayError::Status(502).is_transient());
-        assert!(RelayError::Transport("reset".into()).is_transient());
-        assert!(RelayError::Status(429).is_transient());
-        for code in [400, 401, 403, 404] {
-            assert!(!RelayError::Status(code).is_transient(), "{code}");
-        }
-        assert!(!RelayError::Protocol("html".into()).is_transient());
-    }
-
-    fn answer(sent: &str, fields: Value) -> Value {
-        let mut inner = json!({ "id": "id-1", "req": b64u(&Sha256::digest(sent.as_bytes())) });
-        inner
-            .as_object_mut()
-            .unwrap()
-            .extend(fields.as_object().unwrap().clone());
-        inner
-    }
-
-    #[test]
-    fn a_signed_answer_yields_the_signature() {
-        let msg = answer("sent", json!({ "t": "signed", "sig": b64u(b"signature") }));
+    fn failures_keep_the_agents_wording() {
+        use core_sign::SignError as E;
+        let backend = |e: E| match agent_error(e) {
+            SignError::Backend(reason) => reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(agent_error(E::Denied), SignError::Denied);
+        assert_eq!(agent_error(E::Expired), SignError::Expired);
+        assert!(backend(E::Revoked).contains("no longer knows this pairing"));
+        assert!(backend(E::Revoked).contains("`clavix-agent pair`"));
+        assert!(backend(E::UnknownDevice("ab12".into()))
+            .ends_with("run `clavix-agent unpair --device ab12`"));
         assert_eq!(
-            read_response(&msg, "id-1", "sent"),
-            Ok(b"signature".to_vec())
+            backend(E::NotPickedUp {
+                device: "ab12".into(),
+                after: Duration::from_secs(3)
+            }),
+            "device ab12 did not pick the request up within 3 s; \
+             ssh may try the next device's key"
+        );
+        assert_eq!(
+            backend(E::Refused("unverified".into())),
+            "the signer refused the request (unverified)"
+        );
+        assert_eq!(
+            backend(E::BackingOff),
+            "a request was just denied; backing off"
+        );
+        assert_eq!(backend(E::Busy), "too many requests already waiting");
+        assert_eq!(
+            backend(E::Relay(RelayError::Transport("x".into()))),
+            RelayError::Transport("x".into()).to_string()
+        );
+        assert_eq!(
+            backend(E::Invalid("no paired device holds this key".into())),
+            "no paired device holds this key"
         );
     }
 
-    #[test]
-    fn a_denial_is_told_apart_from_a_refusal_to_even_ask() {
-        let msg = answer("sent", json!({ "t": "denied", "reason": "user" }));
-        assert_eq!(read_response(&msg, "id-1", "sent"), Err(SignError::Denied));
-        let msg = answer("sent", json!({ "t": "denied", "reason": "unverified" }));
-        assert!(matches!(
-            read_response(&msg, "id-1", "sent"),
-            Err(SignError::Backend(reason)) if reason.contains("unverified")
-        ));
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g phone";
+
+    fn signer() -> RelaySigner {
+        let phone = channel::Identity::generate();
+        RelaySigner::new(
+            RelayClient::new("http://127.0.0.1:9").unwrap(),
+            &"ab".repeat(16),
+            "token",
+            "desk",
+            channel::Identity::generate(),
+            vec![Device {
+                id: "01".into(),
+                public_key: KEY.into(),
+                peer: channel::Peer::new(phone.kem_public(), &phone.sig_public()).unwrap(),
+            }],
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap()
+    }
+
+    fn hop(name: &str, forwarded: bool) -> HostHop {
+        HostHop {
+            key_blob: format!("{name}-key").into_bytes(),
+            fingerprint: format!("SHA256:{name}"),
+            forwarded,
+            session_id: format!("{name}-sid").into_bytes(),
+            signature: format!("{name}-sig").into_bytes(),
+        }
     }
 
     #[test]
-    fn an_answer_to_another_request_is_rejected() {
-        let msg = answer("sent", json!({ "t": "signed", "sig": b64u(b"s") }));
-        assert!(matches!(
-            read_response(&msg, "id-2", "sent"),
-            Err(SignError::Backend(_))
-        ));
-        assert!(matches!(
-            read_response(&msg, "id-1", "other"),
-            Err(SignError::Backend(_))
-        ));
-        let msg = answer("sent", json!({ "t": "signed" }));
-        assert!(matches!(
-            read_response(&msg, "id-1", "sent"),
-            Err(SignError::Backend(_))
-        ));
+    fn a_job_becomes_the_cores_request() {
+        let signer = signer();
+        assert_eq!(signer.identities().len(), 1);
+        assert_eq!(signer.identities()[0].comment, "phone");
+        let signer = signer.with_hints(|key, caller, sole| {
+            assert_eq!(caller.map(|c| c.pid), Some(42));
+            (key == b"auth-key").then(|| format!("named, sole={sole}"))
+        });
+        let job = SignJob {
+            key_blob: b"key".to_vec(),
+            data: b"data".to_vec(),
+            flags: 2,
+            hops: vec![hop("jump", true), hop("auth", false)],
+            caller: Some(CallerInfo {
+                pid: 42,
+                name: None,
+            }),
+        };
+        let request = signer.request(job);
+        assert_eq!(request.key, b"key");
+        assert_eq!(request.data, b"data");
+        assert_eq!(request.flags, 2);
+        assert_eq!(request.binds.len(), 2);
+        assert!(request.binds[0].forwarded && !request.binds[1].forwarded);
+        assert_eq!(request.binds[1].host_key, b"auth-key");
+        assert_eq!(request.binds[1].session_id, b"auth-sid");
+        assert_eq!(request.binds[1].signature, b"auth-sig");
+        assert_eq!(
+            request.caller,
+            Some(Caller {
+                pid: 42,
+                name: String::new()
+            })
+        );
+        assert_eq!(
+            request.hints,
+            BTreeMap::from([("SHA256:auth".to_string(), "named, sole=false".to_string())])
+        );
     }
 
     #[test]

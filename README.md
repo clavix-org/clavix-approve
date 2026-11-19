@@ -24,7 +24,7 @@ phone yet, and nothing here has been audited. Do not rely on it.
 
 | Path | What |
 |---|---|
-| `core/` | `clavix-approve-core` (Rust library): the sealed channel, pairing in both modes, the relay client, and the approve-mode requester that Clavix desktop uses |
+| `core/` | `clavix-approve-core` (Rust library): the sealed channel, pairing in both modes, the relay client, and both requesters: approve mode (Clavix desktop) and sign mode (the agent, and Clavix desktop while its vault is locked) |
 | `agent/` | `clavix-agent` (Rust, on `core/`): the SSH agent protocol on a Unix socket, no private key; forwards each signature request to the paired device through the relay |
 | `relay/` | the relay (Python, standard library + `cryptography`, plus `httpx[http2]` for APNs): opaque messages, Web Push or APNs wake-up, serves the page |
 | `web/` | the approval page (plain ES modules, no build step, no third-party code); `web/lib` holds everything security-relevant |
