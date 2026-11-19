@@ -123,6 +123,25 @@ victim's APNs token on its own channel (no proof of possession yet) to
 send it at most the push budget of notifications per day. Per-account
 quotas and App Attest are the next steps.
 
+### A user who does not pay (hosted relay with subscriptions)
+
+A relay started with `RELAY_ENTITLEMENT=on` serves a request only on a
+channel linked to a current App Store subscription. The proof is the
+transaction JWS StoreKit 2 hands the app, verified offline up to Apple
+Root CA - G3, which is built into the relay: a forged or altered
+transaction, one for another app or product, a Sandbox (TestFlight)
+transaction where the relay does not accept them, an expired or a revoked
+one are all refused. A JWS older than the one the relay holds for the same
+subscription changes nothing, so replaying a pre-refund transaction does
+not undo the refund. What remains: one subscription is shared by at most
+`RELAY_MACHINES_PER_SUBSCRIPTION` channels (10), whoever holds them — the
+JWS is a bearer proof, and a subscriber could hand theirs to friends up to
+that limit; a refund is learnt from App Store Server Notifications, or at
+the expiry if a notification is lost; requests keep being served during
+the grace after expiry (48 hours by default). The notification route takes
+anything that verifies, so its cost per call is a few signature checks;
+the proxy's ban on repeated 4xx answers and the body cap bound it.
+
 ### Someone who hands the user a pairing code (phishing)
 
 A QR code or link from an attacker ("re-pair your device") would pair
@@ -197,6 +216,15 @@ and a short `ControlPersist` on the server side are outside this project.
   in a header.
 - **Metadata**: the relay and the push service (Apple's for the app)
   learn when the user authenticates, and how often.
+- **Subscriptions** (hosted relay only): the relay learns, per
+  subscription, an App Store `originalTransactionId`, the product, its
+  expiry, the environment (Production or Sandbox) and which channels it
+  covers — so which machines share one subscription. Not an Apple ID, a
+  name or an e-mail address: the transaction JWS carries none. It does
+  carry the storefront (country), price and currency, which the relay
+  reads past and does not store; only the fields above are kept. Apple, for its part, learns
+  nothing from the relay (verification is offline); it knows the
+  purchase, as for any App Store subscription.
 - **Revocation cuts the channel, not the key.** Either end can delete
   the pairing on the relay (`clavix-agent unpair`, "Oublier cette
   machine"): a lost phone then receives nothing, a decommissioned machine

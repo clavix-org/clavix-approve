@@ -46,6 +46,18 @@ fn agent_error(e: core_sign::SignError) -> SignError {
              ssh may try the next device's key",
             after.as_secs()
         )),
+        // Never retried: requests fail at once for a while, without
+        // asking the relay again (a proxy in front bans on 4xx bursts).
+        E::Relay(RelayError::SubscriptionRequired) => SignError::Backend(
+            "abonnement requis : ouvrez Clavix Approve sur l'iPhone \
+             (this relay serves subscribers only; requests fail at once for 30 s)"
+                .into(),
+        ),
+        E::Relay(RelayError::MachineLimit) => SignError::Backend(
+            "l'abonnement couvre déjà le nombre maximal de machines : \
+             dissociez-en une (`clavix-agent unpair`) ou ouvrez Clavix Approve sur l'iPhone"
+                .into(),
+        ),
         e @ (E::Refused(_) | E::BackingOff | E::Busy | E::Relay(_) | E::Invalid(_)) => {
             SignError::Backend(e.to_string())
         }
@@ -386,6 +398,9 @@ mod tests {
             backend(E::Relay(RelayError::Transport("x".into()))),
             RelayError::Transport("x".into()).to_string()
         );
+        assert!(backend(E::Relay(RelayError::SubscriptionRequired))
+            .starts_with("abonnement requis : ouvrez Clavix Approve sur l'iPhone"));
+        assert!(backend(E::Relay(RelayError::MachineLimit)).contains("nombre maximal de machines"));
         assert_eq!(
             backend(E::Invalid("no paired device holds this key".into())),
             "no paired device holds this key"

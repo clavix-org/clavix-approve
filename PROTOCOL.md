@@ -227,6 +227,8 @@ Same origin as the page, unless the relay does not serve it (`RELAY_SERVE_WEB=of
 | `POST /api/ch/{ch}/pair/open` | agent | let one more device pair |
 | `POST /api/ch/{ch}/requests/{id}/cancel` | agent | withdraw a request (body `{}`) |
 | `POST /api/ch/{ch}/revoke` | agent or signer | revoke the pairing or one device |
+| `POST /api/ch/{ch}/dev/{dev}/entitlement` | signer `dev` | hand over its App Store subscription (`{ jws }`, see "Subscriptions") |
+| `POST /api/appstore/notifications` | none (signed by Apple) | App Store Server Notifications v2 |
 | `GET /api/vapid-public-key`, `GET /healthz` | none | |
 
 `wait` is a long-poll in seconds, capped at 25 and at the request's
@@ -236,7 +238,9 @@ pending set differs from it, so a request that stays on screen does not
 make the long-poll return in a loop. "Nothing yet" is `204`. Normal outcomes are `200` with a `state`
 (`queued`, `busy`, `duplicate`, `expired`, `unknown`, `accepted`, …);
 `401` and `400` mean a wrong token or a malformed call and are never
-retried by a client; a channel that was revoked or has expired answers
+retried by a client; `402` means the relay serves subscribers only and no
+current subscription covers the channel (see "Subscriptions"), never
+retried either; a channel that was revoked or has expired answers
 `401` to everything, and its clients stop polling it. `429` and `5xx`
 (from the relay or a proxy in front, whose body may be HTML, as may a
 proxy's `413`) are retried with a growing pause, never shorter than
@@ -299,6 +303,77 @@ the request. If it has not after `--pickup` seconds (default 20), the
 agent withdraws the request with `POST …/requests/{id}/cancel` (the device
 no longer receives it; a late answer gets `expired`) and fails it, so that
 `ssh` tries the next key at once instead of after the full timeout.
+
+## Subscriptions
+
+A relay may serve paying (or trialling) users only (`RELAY_ENTITLEMENT=on`;
+off by default, so a self-hosted relay is unchanged). Creating a channel
+and pairing stay free: the user pairs, then subscribes in the iPhone app.
+
+**Enforcement.** On such a relay, `POST /api/ch/{ch}/requests` on a
+channel that no current subscription covers answers
+`402 {"error":"subscription_required"}`, and nothing is queued or pushed.
+A subscription covers the channel until its expiry plus a grace
+(`RELAY_ENTITLEMENT_GRACE_HOURS`, 48 h by default) for a renewal the phone
+has not sent yet; a subscription Apple reported ended, refunded or
+revoked gets no grace. Every other route behaves as before.
+
+**The device's subscription.** The app subscribes through StoreKit 2
+(products `org.clavix.approve.personal.monthly` and `…personal.yearly`,
+with a 14-day free trial as introductory offer) and sends the latest
+`Transaction.jwsRepresentation` of that subscription, with its own signer
+token, at launch and after each renewal:
+
+    POST /api/ch/{ch}/dev/{dev}/entitlement
+    Authorization: Bearer <the token of signer dev>
+    {"jws": "<StoreKit 2 Transaction.jwsRepresentation>"}
+
+`dev` is the device's own signer id on that channel; another device's
+token answers `401`. The relay verifies the JWS offline: `alg` ES256; the
+header's `x5c` is [leaf, intermediate, root], the leaf issued by the
+intermediate and the intermediate by Apple Root CA - G3 (built into the
+relay; a root in `x5c` must be that one), each signature checked, each
+certificate valid at the payload's `signedDate`, which may not be in the
+future; the leaf carries the marker extension 1.2.840.113635.100.6.11.1,
+the intermediate 1.2.840.113635.100.6.2.1 and is a CA; the JWS signature
+is the leaf's. Then the payload: `bundleId` is the app's, `productId` one
+of the accepted products, `environment` is `Production` (or `Sandbox` when
+the relay accepts it, for TestFlight), `expiresDate` is in the future and
+there is no `revocationDate`. A JWS older (by `signedDate`) than what the
+relay holds for the same `originalTransactionId` changes nothing: it can
+undo neither a renewal nor a refund.
+
+| Answer | Meaning |
+|---|---|
+| `200 {"ok":true,"expires":<s>,"required":true}` | current; this channel now counts against the subscription. `expires`: Unix time in **seconds** |
+| `200 {"ok":true,"expires":null,"required":false}` | this relay does not check subscriptions; the JWS was not looked at |
+| `402 {"error":"subscription_required","state":"expired"\|"revoked","expires":<s>}` | genuine, but expired, refunded or revoked |
+| `403 {"error":"machine_limit","limit":10}` | the subscription already covers that many channels; unpairing one frees its place |
+| `403 {"error":"invalid_transaction","reason":…}` | not a transaction Apple signed for this app: `reason` is `format`, `algorithm`, `chain`, `signature`, `date`, `validity`, `bundle`, `product` or `environment` |
+| `401`, `400` | not this device's token; malformed body |
+
+One subscription covers up to `RELAY_MACHINES_PER_SUBSCRIPTION` channels
+(10). A channel is linked to one subscription at a time: the last one a
+device of it sent. A channel that is revoked or expires frees its place.
+
+**Notifications.** `POST /api/appstore/notifications` takes App Store
+Server Notifications v2 (`{"signedPayload": …}`), verified like the
+device's JWS, the `signedTransactionInfo` inside too. `DID_RENEW` extends
+the subscription; `EXPIRED` and `GRACE_PERIOD_EXPIRED` end it (no grace);
+`REFUND` and `REVOKE` revoke it. Only a subscription some device already
+sent is updated, and only by a notification signed after what the relay
+holds; anything else verified is acknowledged with `200` so that Apple
+does not retry. Answers `404` on a relay that does not check
+subscriptions.
+
+**Clients.** The agent maps `402` to an error of its own, never retried:
+it logs « abonnement requis : ouvrez Clavix Approve sur l'iPhone », and
+for 30 seconds fails further requests at once without asking the relay
+again (a proxy in front may ban an address after a burst of 4xx). It maps
+`403 machine_limit` likewise.
+
+Team licences (sold on the website) will be another kind of entitlement
+linked to channels the same way; not implemented.
 
 ## Revocation
 
@@ -477,7 +552,7 @@ relay's and the app's business, not part of this format.
   before contacting anyone, and logs why.
 - Default expiry 90 s (`--timeout`), under sshd's `LoginGraceTime`.
 - At most 4 requests wait at once; after a denial, requests fail
-  immediately for 5 s.
+  immediately for 5 s; after a `402` (subscription required), for 30 s.
 - It contacts the relay only while one of its own requests is pending.
 - It logs one line per request: host key fingerprint, outcome, seconds
   waited.

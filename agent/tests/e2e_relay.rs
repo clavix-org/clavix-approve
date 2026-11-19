@@ -114,6 +114,11 @@ impl Bench {
     }
 
     fn new() -> Self {
+        Self::with_relay_env(&[])
+    }
+
+    /// The bench, with these settings added to the relay's environment.
+    fn with_relay_env(env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = |name: &str| dir.path().join(name);
 
@@ -122,6 +127,7 @@ impl Bench {
         let relay_log = path("relay.log");
         let relay = Command::new("python3")
             .arg(repo().join("relay/relay.py"))
+            .envs(env.iter().copied())
             .env("RELAY_PORT", port.to_string())
             .env("RELAY_STATE_DIR", path("relay-state"))
             .env("RELAY_ENROLL_SECRET", ENROLL_SECRET)
@@ -343,6 +349,31 @@ fn a_denial_fails_the_login_and_silences_immediate_retries() {
     let (ok, _, _) = ssh(&socket, bench.sshd.port);
     assert!(!ok);
     assert!(bench.agent_log().contains("backing off"));
+    assert!(phone.nothing_more());
+}
+
+#[test]
+fn a_relay_that_wants_a_subscription_fails_fast_and_says_so() {
+    if !available() {
+        return;
+    }
+    // Pairing stays free; requests need a subscription nobody sent.
+    let bench = Bench::with_relay_env(&[("RELAY_ENTITLEMENT", "on")]);
+    let (_agent, socket) = bench.agent("30");
+    let phone = bench.phone(&[]);
+
+    let started = Instant::now();
+    let (ok, _, _) = ssh(&socket, bench.sshd.port);
+    assert!(!ok, "no subscription, no login");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let log = bench.agent_log();
+    assert!(
+        log.contains("abonnement requis : ouvrez Clavix Approve sur l'iPhone"),
+        "{log}"
+    );
+    // Retrying at once fails at once too, and nothing reached the phone.
+    let (ok, _, _) = ssh(&socket, bench.sshd.port);
+    assert!(!ok);
     assert!(phone.nothing_more());
 }
 

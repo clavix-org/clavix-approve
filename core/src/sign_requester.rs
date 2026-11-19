@@ -52,6 +52,11 @@ const MAX_IN_FLIGHT: usize = 4;
 /// After a denial, further requests fail at once for this long: a tool
 /// that retries in a loop must not turn into a stream of notifications.
 const BACKOFF_AFTER_DENIAL: Duration = Duration::from_secs(5);
+/// After the relay said a subscription is required (HTTP 402), further
+/// requests fail at once for this long without asking it again: only the
+/// user can fix that, on the phone, and a tool retrying in a loop must not
+/// pile up 4xx answers at a proxy that bans on them.
+const BACKOFF_AFTER_UNPAID: Duration = Duration::from_secs(30);
 
 /// Why no signature came back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +205,7 @@ pub struct SignRequester {
     pickup: Option<Duration>,
     slots: Arc<Semaphore>,
     backoff_until: Arc<Mutex<Option<Instant>>>,
+    unpaid_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl SignRequester {
@@ -246,6 +252,7 @@ impl SignRequester {
             pickup: None,
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             backoff_until: Arc::new(Mutex::new(None)),
+            unpaid_until: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -331,6 +338,7 @@ impl SignRequester {
         let deadline = Instant::now() + self.timeout;
         let slots = self.slots.clone();
         let backoff_until = self.backoff_until.clone();
+        let unpaid_until = self.unpaid_until.clone();
 
         Box::pin(async move {
             let sent = sealed.map_err(SignError::Invalid)?;
@@ -342,13 +350,28 @@ impl SignRequester {
             {
                 return Err(SignError::BackingOff);
             }
+            if unpaid_until
+                .lock()
+                .unwrap()
+                .is_some_and(|until| Instant::now() < until)
+            {
+                return Err(SignError::Relay(RelayError::SubscriptionRequired));
+            }
             let Ok(_slot) = slots.try_acquire_owned() else {
                 return Err(SignError::Busy);
             };
 
-            let queued = client
+            let queued = match client
                 .post(&format!("{base}/requests"), &token, &envelope)
-                .await?;
+                .await
+            {
+                Ok(queued) => queued,
+                Err(RelayError::SubscriptionRequired) => {
+                    *unpaid_until.lock().unwrap() = Some(Instant::now() + BACKOFF_AFTER_UNPAID);
+                    return Err(SignError::Relay(RelayError::SubscriptionRequired));
+                }
+                Err(e) => return Err(e.into()),
+            };
             match state_of(&queued) {
                 "queued" => {}
                 "unknown-signer" => return Err(SignError::UnknownDevice(to)),
@@ -663,6 +686,13 @@ mod tests {
             Err(SignError::BackingOff)
         );
         *r.backoff_until.lock().unwrap() = None;
+        // Just after the relay asked for a subscription.
+        *r.unpaid_until.lock().unwrap() = Some(Instant::now() + BACKOFF_AFTER_UNPAID);
+        assert_eq!(
+            r.sign(&SignRequest::new(key.clone(), vec![])).await,
+            Err(SignError::Relay(RelayError::SubscriptionRequired))
+        );
+        *r.unpaid_until.lock().unwrap() = None;
         // All slots taken.
         let held = r.slots.clone().try_acquire_many_owned(MAX_IN_FLIGHT as u32);
         assert!(held.is_ok());

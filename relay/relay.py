@@ -17,7 +17,9 @@ follow from that:
 - a normal situation never answers 4xx (a proxy may ban a client after a
   burst of them): "nothing yet" is 204, "expired" or "unknown" is 200 with
   a `state` field; 4xx is kept for real errors (bad token, bad request)
-  and for a client over its limits (429, with Retry-After);
+  and for a client over its limits (429, with Retry-After), or without
+  the subscription a hosted relay requires (402, which clients do not
+  retry);
 - identifiers in URLs are lowercase hexadecimal, nothing free-form;
 - the service sends its own Content-Security-Policy and Permissions-Policy.
 
@@ -41,6 +43,21 @@ Configuration (environment):
   RELAY_APNS_KEY_ID    its key id (10 characters)
   RELAY_APNS_TEAM_ID   the developer team id (10 characters)
   RELAY_APNS_TOPIC     the app's bundle id, default org.clavix.approve
+
+Subscriptions (a hosted relay serves paying or trialling users only;
+everything is off by default, so a self-hosted relay stays free):
+  RELAY_ENTITLEMENT    "on" makes a request need a subscription linked to
+                       its channel (402 otherwise); "off" (default)
+  RELAY_APPSTORE_BUNDLE_ID  the app's bundle id, default org.clavix.approve
+  RELAY_APPSTORE_PRODUCTS   comma-separated product ids accepted, default
+                       org.clavix.approve.personal.monthly,
+                       org.clavix.approve.personal.yearly
+  RELAY_APPSTORE_SANDBOX    "on" also accepts Sandbox transactions
+                       (TestFlight); "off" (default)
+  RELAY_MACHINES_PER_SUBSCRIPTION  channels one subscription covers (10)
+  RELAY_ENTITLEMENT_GRACE_HOURS    hours a request is still served after
+                       the subscription's expiry, for a renewal the
+                       phone has not re-sent yet (48; 0 for none)
 
 Client address (what the per-address limits count against):
   RELAY_CLIENT_IP_HEADER      a header set by the reverse proxy to the
@@ -78,7 +95,8 @@ Limits (environment, positive integers; see Limits below for each default):
   RELAY_SOCKET_TIMEOUT        seconds a client may stay silent mid-request (30)
 
 State: RELAY_STATE_DIR/state.db (SQLite, WAL), one row per channel,
-written when that channel changes. A state.json left by an older version
+written when that channel changes, plus the subscriptions (one row per
+App Store original transaction id) and which channel uses which. A state.json left by an older version
 is imported on first start and renamed state.json.migrated. Pending
 requests live in memory only.
 
@@ -90,6 +108,7 @@ import base64
 import binascii
 import collections
 import dataclasses
+import datetime
 import hashlib
 import hmac
 import ipaddress
@@ -108,9 +127,12 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    decode_dss_signature, encode_dss_signature)
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -544,6 +566,246 @@ def sub_key(sub):
     return "apns:" + sub["apns"] if "apns" in sub else "web:" + sub["endpoint"]
 
 
+# ---- Subscriptions (App Store, StoreKit 2) ----------------------------------
+#
+# The phone sends the JWS StoreKit 2 gives it for its subscription
+# (Transaction.jwsRepresentation). It is verified here, offline: signed
+# ES256 by the leaf of an x5c chain that ends at Apple Root CA - G3,
+# pinned below (it is public). What is kept: the original transaction id,
+# the product, the expiry and the environment; nothing about the person.
+#
+# An entitlement is keyed "<kind>:<id>". The App Store is the only kind
+# for now ("appstore:<originalTransactionId>"); team licences sold on the
+# website would be another kind ("licence:<key id>") with its own seat
+# count, linked to channels the same way.
+
+# Apple Root CA - G3, https://www.apple.com/certificateauthority/
+# SHA-256 63:34:3A:BF:B8:9A:6A:03:EB:B5:7E:9B:3F:5F:A7:BE:7C:4F:5C:75:6F:30:17:B3:A8:C4:88:C3:65:3E:91:79
+APPLE_ROOT_CA_G3_PEM = b"""-----BEGIN CERTIFICATE-----
+MIICQzCCAcmgAwIBAgIILcX8iNLFS5UwCgYIKoZIzj0EAwMwZzEbMBkGA1UEAwwS
+QXBwbGUgUm9vdCBDQSAtIEczMSYwJAYDVQQLDB1BcHBsZSBDZXJ0aWZpY2F0aW9u
+IEF1dGhvcml0eTETMBEGA1UECgwKQXBwbGUgSW5jLjELMAkGA1UEBhMCVVMwHhcN
+MTQwNDMwMTgxOTA2WhcNMzkwNDMwMTgxOTA2WjBnMRswGQYDVQQDDBJBcHBsZSBS
+b290IENBIC0gRzMxJjAkBgNVBAsMHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9y
+aXR5MRMwEQYDVQQKDApBcHBsZSBJbmMuMQswCQYDVQQGEwJVUzB2MBAGByqGSM49
+AgEGBSuBBAAiA2IABJjpLz1AcqTtkyJygRMc3RCV8cWjTnHcFBbZDuWmBSp3ZHtf
+TjjTuxxEtX/1H7YyYl3J6YRbTzBPEVoA/VhYDKX1DyxNB0cTddqXl5dvMVztK517
+IDvYuVTZXpmkOlEKMaNCMEAwHQYDVR0OBBYEFLuw3qFYM4iapIqZ3r6966/ayySr
+MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMDA2gA
+MGUCMQCD6cHEFl4aXTQY2e3v9GwOAEZLuN+yRhHFD/3meoyhpmvOwgPUnPWTxnS4
+at+qIxUCMG1mihDK1A3UT82NQz60imOlM27jbdoXt2QfyFMm+YhidDkLF1vLUagM
+6BgD56KyKA==
+-----END CERTIFICATE-----
+"""
+# Marker extensions Apple puts on the certificates that sign App Store data.
+APPLE_LEAF_OID = x509.ObjectIdentifier("1.2.840.113635.100.6.11.1")
+APPLE_INTERMEDIATE_OID = x509.ObjectIdentifier("1.2.840.113635.100.6.2.1")
+APPSTORE_PRODUCTS = ("org.clavix.approve.personal.monthly", "org.clavix.approve.personal.yearly")
+CLOCK_SKEW = 300            # seconds a signedDate may be ahead of our clock
+MAX_JWS = 64 * 1024         # one JWS, x5c included
+MAX_X5C = 8 * 1024          # one certificate of it, base64
+NOTIFICATION_BODY = 128 * 1024   # an App Store notification nests three JWS
+OTID_RE = re.compile(r"^[0-9A-Za-z._-]{1,64}$")
+BUNDLE_RE = re.compile(r"^[A-Za-z0-9.-]{1,155}$")
+ENDED_KEEP_DAYS = 30        # an entitlement no channel uses is forgotten that long after it ended
+
+
+class JwsError(ValueError):
+    """A JWS that is not one Apple signed for this app; the message is a
+    short reason, safe to return to the client."""
+
+
+def _utc(cert, field):
+    value = getattr(cert, field + "_utc", None)   # cryptography >= 42
+    if value is None:
+        value = getattr(cert, field).replace(tzinfo=datetime.timezone.utc)
+    return value
+
+
+def _has_extension(cert, oid):
+    try:
+        cert.extensions.get_extension_for_oid(oid)
+    except x509.ExtensionNotFound:
+        return False
+    return True
+
+
+def _is_ca(cert):
+    try:
+        return cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    except x509.ExtensionNotFound:
+        return False
+
+
+def load_apple_root():
+    return x509.load_pem_x509_certificate(APPLE_ROOT_CA_G3_PEM)
+
+
+def verify_apple_jws(token, root, now):
+    """The payload of a JWS signed by Apple, or JwsError.
+
+    ES256 only; the header's x5c is [leaf, intermediate(, root)]. The leaf
+    must be issued by the intermediate and the intermediate by `root` (our
+    pinned copy: an x5c root, if present, must be that same certificate),
+    each signature checked, each certificate valid at the payload's
+    signedDate, which may not be in the future. That is the date Apple's
+    own library checks against when it verifies offline: a transaction
+    signed while the chain was valid stays verifiable after its leaf
+    expires. The leaf and intermediate carry Apple's marker extensions,
+    the intermediate is a CA, the leaf key is P-256.
+    """
+    if not isinstance(token, str) or len(token) > MAX_JWS:
+        raise JwsError("format")
+    parts = token.split(".")
+    if len(parts) != 3 or not all(p and B64U_RE.match(p) for p in parts):
+        raise JwsError("format")
+    try:
+        header = json.loads(unb64u(parts[0]))
+        payload = json.loads(unb64u(parts[1]))
+        signature = unb64u(parts[2])
+    except (ValueError, binascii.Error):
+        raise JwsError("format") from None
+    if not (isinstance(header, dict) and isinstance(payload, dict)):
+        raise JwsError("format")
+    if header.get("alg") != "ES256":
+        raise JwsError("algorithm")
+    x5c = header.get("x5c")
+    if not (isinstance(x5c, list) and len(x5c) in (2, 3)
+            and all(isinstance(c, str) and len(c) <= MAX_X5C for c in x5c)):
+        raise JwsError("chain")
+    try:
+        certs = [x509.load_der_x509_certificate(base64.b64decode(c, validate=True)) for c in x5c]
+    except (ValueError, binascii.Error):
+        raise JwsError("chain") from None
+    leaf, intermediate = certs[0], certs[1]
+    if len(certs) == 3 and certs[2] != root:
+        raise JwsError("chain")
+    for cert, issuer in ((leaf, intermediate), (intermediate, root)):
+        try:
+            cert.verify_directly_issued_by(issuer)
+        except (ValueError, TypeError, InvalidSignature):
+            raise JwsError("chain") from None
+    if not (_is_ca(intermediate) and _has_extension(intermediate, APPLE_INTERMEDIATE_OID)
+            and _has_extension(leaf, APPLE_LEAF_OID) and not _is_ca(leaf)):
+        raise JwsError("chain")
+    key = leaf.public_key()
+    if not (isinstance(key, ec.EllipticCurvePublicKey) and isinstance(key.curve, ec.SECP256R1)):
+        raise JwsError("chain")
+    if len(signature) != 64:
+        raise JwsError("signature")
+    try:
+        key.verify(encode_dss_signature(int.from_bytes(signature[:32], "big"),
+                                        int.from_bytes(signature[32:], "big")),
+                   f"{parts[0]}.{parts[1]}".encode(), ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise JwsError("signature") from None
+    signed = payload.get("signedDate")
+    if not (isinstance(signed, int) and not isinstance(signed, bool) and signed > 0):
+        raise JwsError("format")
+    if signed / 1000 > now + CLOCK_SKEW:
+        raise JwsError("date")
+    at = datetime.datetime.fromtimestamp(signed / 1000, datetime.timezone.utc)
+    for cert in (leaf, intermediate, root):
+        if not _utc(cert, "not_valid_before") <= at <= _utc(cert, "not_valid_after"):
+            raise JwsError("validity")
+    return payload
+
+
+@dataclasses.dataclass
+class Transaction:
+    """What the relay keeps of one App Store transaction."""
+    otid: str           # originalTransactionId: the same across renewals
+    product: str
+    expires: int        # seconds since the epoch
+    environment: str    # Production or Sandbox
+    revoked: bool       # refunded, or revoked by Apple
+    signed_at: int      # the JWS's signedDate, milliseconds
+
+    @property
+    def eid(self):
+        return "appstore:" + self.otid
+
+
+def _ms(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+@dataclasses.dataclass
+class Entitlements:
+    """Subscription settings. Off: no check at all, as before."""
+    enabled: bool = False
+    bundle_id: str = "org.clavix.approve"
+    products: tuple = APPSTORE_PRODUCTS
+    sandbox: bool = False
+    machines: int = 10
+    grace_hours: int = 48
+    root: object = None   # Apple Root CA - G3; tests inject their own
+
+    def __post_init__(self):
+        if self.root is None:
+            self.root = load_apple_root()
+
+    @property
+    def grace(self):
+        return self.grace_hours * 3600
+
+    def environment_allowed(self, environment):
+        return environment == "Production" or (self.sandbox and environment == "Sandbox")
+
+    def transaction(self, payload, signed_at=None):
+        """The Transaction a verified JWS payload describes, for this app,
+        or JwsError. Its expiry and revocation are not judged here."""
+        if payload.get("bundleId") != self.bundle_id:
+            raise JwsError("bundle")
+        product = payload.get("productId")
+        if product not in self.products:
+            raise JwsError("product")
+        if not self.environment_allowed(payload.get("environment")):
+            raise JwsError("environment")
+        otid = payload.get("originalTransactionId")
+        expires = _ms(payload.get("expiresDate"))
+        if not (isinstance(otid, str) and OTID_RE.match(otid)) or expires is None:
+            raise JwsError("format")
+        return Transaction(otid, product, expires // 1000, payload["environment"],
+                           payload.get("revocationDate") is not None,
+                           payload["signedDate"] if signed_at is None else signed_at)
+
+    @classmethod
+    def from_env(cls, env, root=None):
+        def switch(name):
+            raw = env.get(name, "").strip().lower()
+            if raw in ("", "off", "0", "false", "no"):
+                return False
+            if raw in ("on", "1", "true", "yes"):
+                return True
+            raise ValueError(f"{name} must be on or off")
+
+        def number(name, default, minimum):
+            raw = env.get(name, "")
+            if raw == "":
+                return default
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer") from None
+            if value < minimum:
+                raise ValueError(f"{name} is out of range")
+            return value
+
+        bundle = env.get("RELAY_APPSTORE_BUNDLE_ID", "") or cls.bundle_id
+        if not BUNDLE_RE.match(bundle):
+            raise ValueError("RELAY_APPSTORE_BUNDLE_ID is not a bundle id")
+        raw = env.get("RELAY_APPSTORE_PRODUCTS", "")
+        products = tuple(p.strip() for p in raw.split(",") if p.strip()) if raw else APPSTORE_PRODUCTS
+        if not products or not all(BUNDLE_RE.match(p) for p in products):
+            raise ValueError("RELAY_APPSTORE_PRODUCTS must list product ids")
+        return cls(enabled=switch("RELAY_ENTITLEMENT"), bundle_id=bundle, products=products,
+                   sandbox=switch("RELAY_APPSTORE_SANDBOX"),
+                   machines=number("RELAY_MACHINES_PER_SUBSCRIPTION", cls.machines, 1),
+                   grace_hours=number("RELAY_ENTITLEMENT_GRACE_HOURS", cls.grace_hours, 0),
+                   root=root)
+
+
 # ---- Storage ----------------------------------------------------------------
 
 class Store:
@@ -559,6 +821,14 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS channels (ch TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        # Subscriptions, keyed "<kind>:<id>" (see Entitlements), and which
+        # channel uses which one.
+        self.db.execute("CREATE TABLE IF NOT EXISTS entitlements (eid TEXT PRIMARY KEY, "
+                        "product TEXT NOT NULL, expires INTEGER NOT NULL, "
+                        "environment TEXT NOT NULL, status TEXT NOT NULL, "
+                        "signed_at INTEGER NOT NULL, updated INTEGER NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS channel_entitlements "
+                        "(ch TEXT PRIMARY KEY, eid TEXT NOT NULL)")
         self._migrate(os.path.join(state_dir, "state.json"))
 
     def _migrate(self, legacy):
@@ -584,6 +854,26 @@ class Store:
 
     def delete(self, ch):
         self.db.execute("DELETE FROM channels WHERE ch = ?", (ch,))
+        self.db.execute("DELETE FROM channel_entitlements WHERE ch = ?", (ch,))
+
+    ENTITLEMENT_FIELDS = ("product", "expires", "environment", "status", "signed_at", "updated")
+
+    def load_entitlements(self):
+        """({eid: row}, {ch: eid})"""
+        rows = {eid: dict(zip(self.ENTITLEMENT_FIELDS, rest)) for eid, *rest in self.db.execute(
+            "SELECT eid, " + ", ".join(self.ENTITLEMENT_FIELDS) + " FROM entitlements")}
+        links = dict(self.db.execute("SELECT ch, eid FROM channel_entitlements"))
+        return rows, links
+
+    def put_entitlement(self, eid, row):
+        self.db.execute("INSERT OR REPLACE INTO entitlements VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (eid, *(row[f] for f in self.ENTITLEMENT_FIELDS)))
+
+    def delete_entitlement(self, eid):
+        self.db.execute("DELETE FROM entitlements WHERE eid = ?", (eid,))
+
+    def link(self, ch, eid):
+        self.db.execute("INSERT OR REPLACE INTO channel_entitlements VALUES (?, ?)", (ch, eid))
 
     def close(self):
         self.db.close()
@@ -606,9 +896,11 @@ class Relay:
     lock, so an event wakes the long-polls of its channel only.
     """
 
-    def __init__(self, state_dir, enroll_secret=None, push=None, now=time.time, limits=None):
+    def __init__(self, state_dir, enroll_secret=None, push=None, now=time.time, limits=None,
+                 entitlements=None):
         self.enroll_auth = digest(enroll_secret) if enroll_secret else None
         self.limits = limits = limits or Limits()
+        self.entitlements = entitlements or Entitlements()
         self.push = push
         self.now = now
         self.lock = threading.Lock()
@@ -623,6 +915,9 @@ class Relay:
             for sid, s in c["signers"].items():
                 if s.get("sub"):
                     self.subs[sub_key(s["sub"])] = (ch, sid)
+        # Subscriptions: eid -> row, channel -> eid, and channels per eid.
+        self.ents, self.links = self.store.load_entitlements()
+        self.linked = collections.Counter(self.links.values())
         self.swept = 0
         self.created_hour = RateLimit(limits.channels_per_ip_hour, 3600, now)
         self.created_day = RateLimit(limits.channels_per_ip_day, 86400, now)
@@ -711,6 +1006,11 @@ class Relay:
             self._set_sub(ch, sid, None)
         del self.channels[ch]
         self._forget_entries(ch)
+        eid = self.links.pop(ch, None)   # frees a machine of its subscription
+        if eid is not None:
+            self.linked[eid] -= 1
+            if self.linked[eid] <= 0:
+                del self.linked[eid]
         self._save(ch)
         self._notify(ch)
         self.conds.pop(ch, None)
@@ -739,6 +1039,13 @@ class Relay:
             elif c.get("pair_until", 0) < now and (c["hello"] or c["answer"] or c["pair_auth"]):
                 c.update(hello=None, answer=None, pair_auth=None)   # pairing over
                 self._save(ch)
+        # A subscription no channel uses, ended long enough ago that any
+        # JWS of it would be refused as expired anyway (a revoked one is
+        # kept until then, so that an older JWS cannot bring it back).
+        for eid, row in list(self.ents.items()):
+            if eid not in self.linked and row["expires"] + ENDED_KEEP_DAYS * 86400 < now:
+                del self.ents[eid]
+                self.store.delete_entitlement(eid)
 
     def _channel(self, ch, token, role):
         """The channel if `token` holds `role` on it, plus the signer id."""
@@ -782,6 +1089,7 @@ class Relay:
     DENIED = (401, {"error": "unauthorized"})
     GONE = object()
     BAD = (400, {"error": "bad request"})
+    SUBSCRIPTION_REQUIRED = (402, {"error": "subscription_required"})
 
     # -- long-poll slots (used by the HTTP layer around a call with wait > 0) --
 
@@ -1073,6 +1381,8 @@ class Relay:
             wait = self.request_rate.take(ch)
             if wait:
                 return limited(wait)
+            if self.entitlements.enabled and not self._entitled(ch):
+                return self.SUBSCRIPTION_REQUIRED
             self._sweep()
             self._purge_pending(ch)
             now = self.now()
@@ -1169,6 +1479,125 @@ class Relay:
                 return 200, {"state": "pending", "seen": bool(e and e.get("seen"))}
             return 204, None
 
+    # -- subscriptions --
+
+    def _active(self, row, grace=0):
+        """Whether an entitlement row entitles, `grace` seconds past its
+        expiry. A subscription Apple said has ended gets no grace."""
+        if row is None or row["status"] == "revoked":
+            return False
+        if row["status"] == "ended":
+            grace = 0
+        return row["expires"] + grace > self.now()
+
+    def _entitled(self, ch):
+        row = self.ents.get(self.links.get(ch))
+        return self._active(row, self.entitlements.grace)
+
+    def _record(self, tx, status, now):
+        """Store what a verified transaction says, unless what is stored was
+        signed later (an older JWS must not undo a renewal or a refund).
+        Returns the row now stored."""
+        row = self.ents.get(tx.eid)
+        if row is not None and tx.signed_at < row["signed_at"]:
+            return row
+        row = {"product": tx.product, "expires": tx.expires, "environment": tx.environment,
+               "status": status, "signed_at": tx.signed_at, "updated": int(now)}
+        self.ents[tx.eid] = row
+        self.store.put_entitlement(tx.eid, row)
+        return row
+
+    def post_entitlement(self, ch, dev, token, body):
+        """The device `dev` hands over the JWS of its App Store subscription
+        (StoreKit 2 Transaction.jwsRepresentation). Verified offline; when
+        it is current, its channel is linked to it, within the machines one
+        subscription covers. A relay that does not check subscriptions
+        answers `required: false` without looking at it."""
+        jws = body.get("jws")
+        if not (isinstance(dev, str) and SIGNER_RE.match(dev)
+                and isinstance(jws, str) and len(jws) <= MAX_JWS):
+            return self.BAD
+        with self.lock:
+            c, sid = self._channel(ch, token, "signer")
+            if c is None or sid != dev:
+                return self.DENIED
+        cfg = self.entitlements
+        if not cfg.enabled:
+            return 200, {"ok": True, "expires": None, "required": False}
+        now = self.now()
+        try:   # outside the lock: a few signature checks
+            tx = cfg.transaction(verify_apple_jws(jws, cfg.root, now))
+        except JwsError as e:
+            log(f"channel {ch[:8]}: subscription refused ({e})")
+            return 403, {"error": "invalid_transaction", "reason": str(e)}
+        with self.lock:
+            if self.channels.get(ch) is not c or dev not in c["signers"]:
+                return self.DENIED
+            row = self._record(tx, "revoked" if tx.revoked else "active", now)
+            if not self._active(row):
+                state = "revoked" if row["status"] == "revoked" else "expired"
+                return 402, {"error": "subscription_required", "state": state,
+                             "expires": row["expires"]}
+            if self.links.get(ch) != tx.eid:
+                if self.linked[tx.eid] >= cfg.machines:
+                    log(f"channel {ch[:8]}: subscription at its machine limit")
+                    return 403, {"error": "machine_limit", "limit": cfg.machines}
+                old = self.links.get(ch)
+                if old is not None:
+                    self.linked[old] -= 1
+                    if self.linked[old] <= 0:
+                        del self.linked[old]
+                self.links[ch] = tx.eid
+                self.linked[tx.eid] += 1
+                self.store.link(ch, tx.eid)
+                log(f"channel {ch[:8]}: subscription linked ({tx.environment})")
+        return 200, {"ok": True, "expires": row["expires"], "required": True}
+
+    # App Store Server Notifications v2 that change an entitlement.
+    NOTIFICATION_STATUS = {"DID_RENEW": "active", "EXPIRED": "ended",
+                           "GRACE_PERIOD_EXPIRED": "ended", "REFUND": "revoked",
+                           "REVOKE": "revoked"}
+
+    def appstore_notification(self, body):
+        """An App Store Server Notification v2 (`{signedPayload}`), sent by
+        Apple. Verified like the phone's JWS, the transaction inside too.
+        Only updates a subscription some phone already sent; everything
+        else verified is acknowledged (200) so that Apple does not retry."""
+        cfg = self.entitlements
+        if not cfg.enabled:
+            return 404, {"error": "not found"}
+        now = self.now()
+        try:
+            payload = verify_apple_jws(body.get("signedPayload"), cfg.root, now)
+            data = payload.get("data")
+            if not isinstance(data, dict) or data.get("bundleId") != cfg.bundle_id:
+                raise JwsError("bundle")
+        except JwsError as e:
+            log(f"App Store notification refused ({e})")
+            return 400, {"error": "bad request"}
+        kind = payload.get("notificationType")
+        status = self.NOTIFICATION_STATUS.get(kind)
+        if status is None or not cfg.environment_allowed(data.get("environment")) \
+                or "signedTransactionInfo" not in data:
+            return 200, {"ok": True, "state": "ignored"}
+        try:
+            tx = cfg.transaction(verify_apple_jws(data["signedTransactionInfo"], cfg.root, now),
+                                 signed_at=payload["signedDate"])
+        except JwsError as e:
+            log(f"App Store notification {kind}: transaction refused ({e})")
+            return 400, {"error": "bad request"}
+        with self.lock:
+            row = self.ents.get(tx.eid)
+            if row is None:
+                return 200, {"ok": True, "state": "unknown"}
+            if tx.signed_at < row["signed_at"]:
+                return 200, {"ok": True, "state": "stale"}
+            if status == "ended":   # keep the expiry; only the grace goes
+                tx.expires = min(tx.expires, row["expires"])
+            self._record(tx, status, now)
+        log(f"App Store notification {kind}: subscription {status}")
+        return 200, {"ok": True, "state": status}
+
 
 # ---- HTTP ------------------------------------------------------------------
 
@@ -1205,7 +1634,9 @@ MAIN_ICON = "/clavix-icon-180.png"
 
 
 ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|pair/open|pair/reveal|subscription|requests|revoke|"
-                   r"responses/([0-9a-f]{32})|requests/([0-9a-f]{32})/cancel)$")
+                   r"responses/([0-9a-f]{32})|requests/([0-9a-f]{32})/cancel|"
+                   r"dev/([0-9a-f]{16})/entitlement)$")
+APPSTORE_NOTIFICATIONS = "/api/appstore/notifications"
 
 
 UNKNOWN_CLIENT = "unknown"
@@ -1291,12 +1722,12 @@ def make_handler(relay, static, vapid_public, ip_header=None):
             return client_address(self.client_address[0], self.headers.get("X-Forwarded-For"),
                                   limits.trusted_proxies)
 
-        def json_body(self):
+        def json_body(self, cap=None):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 n = -1
-            if not 0 < n <= limits.max_body:
+            if not 0 < n <= (cap or limits.max_body):
                 self.close_connection = True   # the body, if any, stays unread
                 return None
             try:
@@ -1379,13 +1810,17 @@ def make_handler(relay, static, vapid_public, ip_header=None):
 
         def do_POST(self):
             path = urllib.parse.urlsplit(self.path).path
-            body = self.json_body()
+            # Apple's notifications nest three JWS, each with its chain.
+            body = self.json_body(max(limits.max_body, NOTIFICATION_BODY)
+                                  if path == APPSTORE_NOTIFICATIONS else None)
             if body is False:
                 return None   # dropped without an answer
             if body is None:
                 return self.reply(400, {"error": "bad request"})
             if path == "/api/channels":
                 return self.reply(*relay.create_channel(self.token(), body, self.ip()))
+            if path == APPSTORE_NOTIFICATIONS:
+                return self.reply(*relay.appstore_notification(body))
             m = ROUTE.match(path)
             if not m:
                 return self.reply(404, {"error": "not found"})
@@ -1402,6 +1837,8 @@ def make_handler(relay, static, vapid_public, ip_header=None):
                 return self.reply(*relay.post_reveal(ch, self.token(), body))
             if m.group(4):
                 return self.reply(*relay.cancel(ch, self.token(), m.group(4)))
+            if m.group(5):
+                return self.reply(*relay.post_entitlement(ch, m.group(5), self.token(), body))
             if what == "requests":
                 return self.reply(*relay.post_request(ch, self.token(), body))
             if rid and what.startswith("responses/"):
@@ -1461,10 +1898,10 @@ def load_apns(env, enabled):
 
 
 def serve(bind, port, state_dir, enroll_secret, web_dir, contact, push_enabled, apns=None,
-          serve_web=True, limits=None, ip_header=None):
+          serve_web=True, limits=None, ip_header=None, entitlements=None):
     os.makedirs(state_dir, exist_ok=True)
     push = Pushers(WebPush(state_dir, contact, push_enabled), apns)
-    relay = Relay(state_dir, enroll_secret, push, limits=limits)
+    relay = Relay(state_dir, enroll_secret, push, limits=limits, entitlements=entitlements)
     static = load_static(web_dir) if serve_web else {}
     server = Server((bind, port), make_handler(relay, static, push.public_key(), ip_header),
                     relay.limits.max_connections)
@@ -1520,6 +1957,7 @@ def main():
     try:
         secret = enrolment_secret(os.environ)
         limits = Limits.from_env(os.environ)
+        entitlements = Entitlements.from_env(os.environ)
     except ValueError as e:
         sys.exit(str(e))
     push_enabled = on_off(os.environ, "RELAY_PUSH")
@@ -1530,9 +1968,11 @@ def main():
                    os.environ.get("RELAY_WEB_DIR", os.path.join(HERE, "..", "web")),
                    os.environ.get("RELAY_VAPID_SUB", "mailto:webpush@example.com"),
                    push_enabled, apns, serve_web, limits,
-                   os.environ.get("RELAY_CLIENT_IP_HEADER") or None)
+                   os.environ.get("RELAY_CLIENT_IP_HEADER") or None, entitlements)
     log(f"listening on {bind}:{port}, enrolment {'closed' if secret else 'open'}, "
-        f"page {'served' if serve_web else 'not served'}, APNs {'on' if apns else 'off'}")
+        f"page {'served' if serve_web else 'not served'}, APNs {'on' if apns else 'off'}, "
+        f"subscriptions {'required' if entitlements.enabled else 'not checked'}"
+        f"{' (Sandbox accepted)' if entitlements.enabled and entitlements.sandbox else ''}")
     server.serve_forever()
 
 

@@ -96,6 +96,25 @@ origin of its own.
 | `RELAY_APNS_KEY_ID`, `RELAY_APNS_TEAM_ID` | | that key's id and the developer team id |
 | `RELAY_APNS_TOPIC` | `org.clavix.approve` | the app's bundle id |
 
+Subscriptions, for a hosted relay that serves paying or trialling users
+only. Everything is off by default: a development or self-hosted relay
+checks nothing and stays free.
+
+| Variable | Default | |
+|---|---|---|
+| `RELAY_ENTITLEMENT` | `off` | `on`: a request posted on a channel needs a current subscription linked to it, otherwise `402 {"error":"subscription_required"}`. Creating a channel and pairing stay free |
+| `RELAY_APPSTORE_BUNDLE_ID` | `org.clavix.approve` | the app whose App Store transactions are accepted |
+| `RELAY_APPSTORE_PRODUCTS` | `org.clavix.approve.personal.monthly,org.clavix.approve.personal.yearly` | comma-separated product ids accepted |
+| `RELAY_APPSTORE_SANDBOX` | `off` | `on` also accepts Sandbox transactions (TestFlight builds buy in the Sandbox) |
+| `RELAY_MACHINES_PER_SUBSCRIPTION` | `10` | channels (machines) one subscription covers; past it, `403 {"error":"machine_limit"}` |
+| `RELAY_ENTITLEMENT_GRACE_HOURS` | `48` | hours requests are still served after the subscription's expiry, for a renewal the phone has not re-sent yet; `0` for none |
+
+The phone sends its StoreKit 2 transaction (`PROTOCOL.md`, "Subscriptions");
+the relay verifies it offline against Apple Root CA - G3, which is built
+in. With `RELAY_ENTITLEMENT=on` it also takes App Store Server
+Notifications v2 at `POST /api/appstore/notifications` (renewal, expiry,
+refund, revocation): set that URL in App Store Connect.
+
 Client address, which the per-address limits count against:
 
 | Variable | Default | |
@@ -130,8 +149,9 @@ channel that was revoked or expired answers `401` to every call; clients
 stop polling it (and on `404`). The `429` and `413` a proxy sends may have
 an HTML body: clients must not expect JSON on those statuses.
 
-Channels are kept in SQLite (`state.db`, WAL), one row each; pending
-requests live in memory. A `state.json` from an older version is imported
+Channels are kept in SQLite (`state.db`, WAL), one row each, with the
+subscriptions and which channel uses which; pending requests live in
+memory. A `state.json` from an older version is imported
 on first start and renamed `state.json.migrated`.
 
 The `Dockerfile` builds an image that runs as an unprivileged user on a
