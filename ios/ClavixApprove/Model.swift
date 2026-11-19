@@ -205,7 +205,7 @@ final class Model: ObservableObject {
         if RelaySubscription.needed(by: p) {
             // A place freed under the machine limit: those refused for it
             // are tried again.
-            deliveries = deliveries.filter { $0.value.outcome != .machineLimit }
+            deliveries = deliveries.filter { if case .machineLimit = $0.value.outcome { return false } else { return true } }
             await sendEntitlement()
         }
     }
@@ -246,16 +246,39 @@ final class Model: ObservableObject {
         Task { await sendEntitlement() }
     }
 
-    /// Why this pairing is not covered by the subscription, if the relay said so.
+    /// Pairings whose relay answered that it checks no subscription: never
+    /// counted, never prompted for.
+    var notRequired: Set<String> { remembered.notRequired ?? [] }
+
+    /// The machine limit the relay last stated, else the usual one.
+    var machineLimit: Int {
+        for d in deliveries.values { if case .machineLimit(let limit?) = d.outcome { return limit } }
+        return RelaySubscription.machineLimit
+    }
+
+    /// Why this pairing is not served under the subscription, if its relay
+    /// said so for the current one.
     func entitlementIssue(of p: PairingRecord) -> String? {
-        guard let d = deliveries[EntitlementSync.key(p)], d.transactionID == subscriptions?.current?.transactionID,
-              d.outcome == .machineLimit else { return nil }
-        return "Non couverte : l’abonnement couvre déjà \(RelaySubscription.machineLimit) machines. Oubliez-en une dans Réglages pour couvrir celle-ci."
+        guard let current = subscriptions?.current, let d = deliveries[EntitlementSync.key(p)],
+              d.transactionID == current.transactionID else { return nil }
+        switch d.outcome {
+        case .machineLimit(let limit):
+            return "Non couverte : l’abonnement couvre déjà \(limit ?? RelaySubscription.machineLimit) machines. Oubliez-en une dans Réglages pour couvrir celle-ci."
+        case .ended(let revoked):
+            return revoked
+                ? "Abonnement révoqué : le relais Clavix ne transmet plus les demandes de cette machine."
+                : "Abonnement expiré : le relais Clavix ne transmet plus les demandes de cette machine."
+        default:
+            return nil
+        }
     }
 
     /// Posts the current subscription's proof to every confirmed pairing on
-    /// the hosted relay that does not hold it yet. Quiet and best effort:
-    /// approvals never wait for it, network failures are retried later.
+    /// the hosted relay that does not hold it yet; without a subscription,
+    /// asks once whether its relay checks one at all (an empty proof, see
+    /// `EntitlementSync.pending`). Quiet and best effort: approvals never
+    /// wait for it, network failures are retried later, every other answer
+    /// is final until the subscription changes.
     func sendEntitlement() async {
         guard !sendingEntitlement else { entitlementAgain = true; return }
         sendingEntitlement = true
@@ -264,29 +287,32 @@ final class Model: ObservableObject {
         repeat {
             entitlementAgain = false
             failed = false
-            guard let current = subscriptions?.current else { break }
+            // Not before StoreKit has answered: the probe is for when there
+            // is truly no subscription.
+            guard let subscriptions, subscriptions.status != nil else { break }
+            let current = subscriptions.current
             for p in EntitlementSync.pending(pairings, current: current, delivered: deliveries) {
-                let result: Result<Date?, Error>
+                let result: Result<EntitlementGrant, Error>
                 do {
-                    let expires = try await RelayClient(base: p.relay, ch: p.ch, token: p.token)
-                        .postEntitlement(signer: p.signer, jws: current.jws)
-                    result = .success(expires)
+                    result = .success(try await RelayClient(base: p.relay, ch: p.ch, token: p.token)
+                        .postEntitlement(signer: p.signer, jws: current?.jws ?? EntitlementSync.probe))
                 } catch {
                     result = .failure(error)
                 }
-                let outcome = EntitlementOutcome(result)
-                let key = EntitlementSync.key(p)
-                if outcome == .machineLimit && deliveries[key]?.outcome != .machineLimit {
-                    journal("Abonnement : \(Self.machineName(p)) n’est pas couverte, limite de \(RelaySubscription.machineLimit) machines atteinte")
-                }
-                // A proof the relay could not check. A 401 means the pairing
-                // is gone, which its card already says.
-                if outcome == .refused(status: 400) {
-                    journal("Abonnement non transmis pour \(Self.machineName(p)) : le relais a refusé la preuve d’achat")
-                }
                 // Forgotten meanwhile: nothing to remember.
                 guard pairings.contains(where: { $0.id == p.id }) else { continue }
-                deliveries[key] = EntitlementDelivery(transactionID: current.transactionID, outcome: outcome)
+                let outcome = EntitlementOutcome(result)
+                let key = EntitlementSync.key(p)
+                if current != nil && outcome != deliveries[key]?.outcome {
+                    note(outcome, for: p)
+                }
+                deliveries[key] = EntitlementDelivery(transactionID: current?.transactionID, outcome: outcome)
+                if let required = outcome.requiresSubscription, required == notRequired.contains(key) {
+                    var keys = notRequired
+                    if required { keys.remove(key) } else { keys.insert(key) }
+                    remembered.notRequired = keys
+                    Store.save(remembered)
+                }
                 if outcome == .failed { failed = true }
             }
         } while entitlementAgain
@@ -294,6 +320,26 @@ final class Model: ObservableObject {
             scheduleEntitlementRetry()
         } else {
             entitlementBackoff = 0
+        }
+    }
+
+    /// One journal line per new refusal of a real proof.
+    private func note(_ outcome: EntitlementOutcome, for p: PairingRecord) {
+        let name = Self.machineName(p)
+        switch outcome {
+        case .machineLimit(let limit):
+            journal("Abonnement : \(name) n’est pas couverte, limite de \(limit ?? RelaySubscription.machineLimit) machines atteinte")
+        case .ended(let revoked):
+            journal("Abonnement \(revoked ? "révoqué" : "expiré") selon le relais de \(name)")
+        case .invalidTransaction(let reason):
+            // Expected for a purchase made with Xcode's StoreKit testing.
+            journal("Preuve d’achat refusée par le relais de \(name)" + (reason.map { " (\($0))" } ?? ""))
+        case .refused(status: 400):
+            journal("Abonnement non transmis pour \(name) : le relais a refusé la requête")
+        default:
+            // Accepted, not required, a failure retried later, or a 401
+            // (the pairing is gone, which its card already says).
+            break
         }
     }
 

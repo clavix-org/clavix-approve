@@ -10,8 +10,14 @@ public struct RelayError: Error, CustomStringConvertible {
     /// The call outlived its bound: a connection that died, not a refusal.
     public var timedOut = false
     /// The `error` field of the relay's JSON answer, when it gave one
-    /// (`machine_limit`, …).
+    /// (`machine_limit`, `subscription_required`, …).
     public var code: String? = nil
+    /// Its `state` field (`expired`, `revoked` with `subscription_required`).
+    public var state: String? = nil
+    /// Its `limit` field (machines per subscription, with `machine_limit`).
+    public var limit: Int? = nil
+    /// Its `reason` field (why, with `invalid_transaction`).
+    public var reason: String? = nil
 
     public var description: String { message }
 
@@ -80,9 +86,11 @@ public struct RelayClient: Sendable {
         if status == 204 { return nil }
         // A proxy in front may answer with its own HTML error page.
         guard (200..<300).contains(status) else {
-            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let code = obj?["error"] as? String
             throw RelayError(status: status, message: "relay answered HTTP \(status)" + (code.map { " (\($0))" } ?? ""),
-                             code: code)
+                             code: code, state: obj?["state"] as? String, limit: Self.integer(obj?["limit"]),
+                             reason: obj?["reason"] as? String)
         }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw RelayError(status: status, message: "relay answer is not JSON")
@@ -91,6 +99,12 @@ public struct RelayClient: Sendable {
     }
 
     private func state(_ obj: [String: Any]?) -> String { obj?["state"] as? String ?? "" }
+
+    /// A JSON number, not a boolean (both are NSNumber).
+    static func integer(_ value: Any?) -> Int? {
+        guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        return n.intValue
+    }
 
     // ---- pairing (the token is the one derived from the pairing secret) ----
 
@@ -141,14 +155,19 @@ public struct RelayClient: Sendable {
     }
 
     /// Hand the hosted relay the App Store's signed transaction of this
-    /// device's subscription (`Transaction.jwsRepresentation`). Returns the
-    /// time up to which the relay serves this device, when it says.
-    /// `403` with code `machine_limit`: the subscription already covers
-    /// `RelaySubscription.machineLimit` machines.
-    public func postEntitlement(signer: String, jws: String) async throws -> Date? {
+    /// device's subscription (`Transaction.jwsRepresentation`). A relay
+    /// that does not check subscriptions answers `required: false` without
+    /// reading it. Refusals are `RelayError`s: `402` code
+    /// `subscription_required` (state `expired` or `revoked`), `403` code
+    /// `machine_limit` (with `limit`) or `invalid_transaction` (with
+    /// `reason`), `401`, `400`.
+    public func postEntitlement(signer: String, jws: String) async throws -> EntitlementGrant {
         let obj = try await call("POST", "dev/\(signer)/entitlement", body: ["jws": jws])
-        guard let n = obj?["expires"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
-        return Date(timeIntervalSince1970: n.doubleValue)
+        // Unix seconds, or null when the relay does not check.
+        let expires = Self.integer(obj?["expires"]).map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        var required = true
+        if let b = obj?["required"] as? NSNumber, CFGetTypeID(b) == CFBooleanGetTypeID() { required = b.boolValue }
+        return EntitlementGrant(expires: expires, required: required)
     }
 
     /// Delete this device's pairing on the relay. True when this call did

@@ -15,8 +15,9 @@ public enum RelaySubscription {
     public static let yearly = "org.clavix.approve.personal.yearly"
     /// Both plans, in one subscription group.
     public static let productIDs = [monthly, yearly]
-    /// Machines one subscription covers on the hosted relay; the relay
-    /// enforces it and answers `403 {"error":"machine_limit"}` past it.
+    /// Machines one subscription covers on the hosted relay, until the
+    /// relay says otherwise: it enforces it and answers
+    /// `403 {"error":"machine_limit","limit":10}` past it.
     public static let machineLimit = 10
 
     /// Whether this pairing goes through the hosted relay, hence needs the
@@ -26,17 +27,20 @@ public enum RelaySubscription {
     }
 
     /// The pairings that count against the machine limit: confirmed, on
-    /// the hosted relay.
-    public static func covered(_ pairings: [PairingRecord]) -> [PairingRecord] {
-        pairings.filter { $0.isActive && needed(by: $0) }
+    /// the hosted relay, and not known to be on a relay that answered
+    /// `required: false` (`notRequired` holds `EntitlementSync.key`s).
+    public static func covered(_ pairings: [PairingRecord], notRequired: Set<String> = []) -> [PairingRecord] {
+        pairings.filter { $0.isActive && needed(by: $0) && !notRequired.contains(EntitlementSync.key($0)) }
     }
 
     /// Whether the main screen should say a subscription is required: the
     /// status is known, nothing is in force, and a machine is paired on the
-    /// hosted relay. `status` is nil until StoreKit has answered.
-    public static func shouldPrompt(status: SubscriptionStatus?, pairings: [PairingRecord]) -> Bool {
+    /// hosted relay whose relay did not say it checks no subscription.
+    /// `status` is nil until StoreKit has answered.
+    public static func shouldPrompt(status: SubscriptionStatus?, pairings: [PairingRecord],
+                                    notRequired: Set<String> = []) -> Bool {
         guard let status, !status.isActive else { return false }
-        return pairings.contains { needed(by: $0) }
+        return pairings.contains { needed(by: $0) && !notRequired.contains(EntitlementSync.key($0)) }
     }
 
     /// The purchase whose proof the relay must hold: the subscription in
@@ -109,38 +113,77 @@ public enum SubscriptionStatus: Equatable, Sendable {
     }
 }
 
+/// The relay's `200` to `POST …/dev/{dev}/entitlement`.
+public struct EntitlementGrant: Equatable, Sendable {
+    /// Up to when the relay serves this device (from Unix seconds); nil
+    /// when it does not check subscriptions.
+    public let expires: Date?
+    /// False: this relay checks no subscription, the machine never needs one.
+    public let required: Bool
+
+    public init(expires: Date?, required: Bool) {
+        (self.expires, self.required) = (expires, required)
+    }
+}
+
 /// The relay's answer to `POST …/dev/{dev}/entitlement`.
 public enum EntitlementOutcome: Equatable, Sendable {
     /// Recorded; the relay serves this device up to `expires`.
     case accepted(expires: Date?)
-    /// This subscription already covers `RelaySubscription.machineLimit` machines.
-    case machineLimit
+    /// `required: false`: this relay checks no subscription.
+    case notRequired
+    /// `402 subscription_required`: a genuine transaction, expired or revoked.
+    case ended(revoked: Bool)
+    /// `403 machine_limit`: this subscription already covers `limit`
+    /// machines (nil: the relay did not say).
+    case machineLimit(limit: Int?)
+    /// `403 invalid_transaction`: the relay could not verify the proof. A
+    /// transaction signed by Xcode's StoreKit testing gets this, as does
+    /// the empty probe (`EntitlementSync.pending`).
+    case invalidTransaction(reason: String?)
     /// Refused for good with this proof (400, 401, or a relay that does
     /// not know the call): not sent again before the proof changes.
     case refused(status: Int)
     /// Not reached, throttled, or a server error: sent again later.
     case failed
 
-    public init(_ result: Result<Date?, Error>) {
+    public init(_ result: Result<EntitlementGrant, Error>) {
         switch result {
-        case .success(let expires):
-            self = .accepted(expires: expires)
+        case .success(let grant):
+            self = grant.required ? .accepted(expires: grant.expires) : .notRequired
         case .failure(let error):
             guard let e = error as? RelayError, e.isFatal else { self = .failed; return }
-            self = e.status == 403 && e.code == "machine_limit" ? .machineLimit : .refused(status: e.status)
+            switch (e.status, e.code) {
+            case (402, "subscription_required"): self = .ended(revoked: e.state == "revoked")
+            case (403, "machine_limit"): self = .machineLimit(limit: e.limit)
+            case (403, "invalid_transaction"): self = .invalidTransaction(reason: e.reason)
+            default: self = .refused(status: e.status)
+            }
         }
     }
 
-    /// Whether the relay has decided, for this proof.
+    /// Whether the relay has decided, for this proof: everything but a
+    /// failure is final until the proof changes, so nothing loops.
     public var isSettled: Bool { self != .failed }
+
+    /// Whether the answer says the relay checks subscriptions (nil: it
+    /// says nothing about it).
+    public var requiresSubscription: Bool? {
+        switch self {
+        case .accepted, .ended, .machineLimit, .invalidTransaction: return true
+        case .notRequired: return false
+        case .refused, .failed: return nil
+        }
+    }
 }
 
-/// The last answer one pairing got, and for which transaction.
+/// The last answer one pairing got, and for which transaction (nil: the
+/// probe sent without a subscription, see `EntitlementSync.pending`).
 public struct EntitlementDelivery: Equatable, Sendable {
-    public let transactionID: UInt64
+    public let transactionID: UInt64?
     public let outcome: EntitlementOutcome
 
-    public init(transactionID: UInt64, outcome: EntitlementOutcome) {
+    public init(transactionID: UInt64?, outcome: EntitlementOutcome) {
         (self.transactionID, self.outcome) = (transactionID, outcome)
     }
 }
@@ -149,15 +192,24 @@ public enum EntitlementSync {
     /// The key of a pairing in `delivered`.
     public static func key(_ record: PairingRecord) -> String { record.ch + record.signer }
 
-    /// The pairings `current`'s proof must be posted to: confirmed, on the
-    /// hosted relay, and without a settled answer for this transaction. A
-    /// failed attempt is due again; a new transaction (a renewal, another
-    /// plan) is due everywhere.
+    /// The proof sent without a subscription.
+    public static let probe = ""
+
+    /// The pairings to post to: confirmed, on the hosted relay, and without
+    /// a settled answer for `current`. A failed attempt is due again; a new
+    /// transaction (a renewal, another plan) is due everywhere.
+    ///
+    /// Without a subscription, a pairing never asked is due once, with the
+    /// empty `probe`: a relay that checks no subscription answers
+    /// `required: false` without reading the proof, and the app then never
+    /// asks for one for that machine; a relay that checks answers
+    /// `invalid_transaction`. A pairing that answered for an earlier
+    /// subscription is not asked again before a new one.
     public static func pending(_ pairings: [PairingRecord], current: SubscriptionPurchase?,
                                delivered: [String: EntitlementDelivery]) -> [PairingRecord] {
-        guard let current else { return [] }
-        return RelaySubscription.covered(pairings).filter { p in
-            guard let last = delivered[key(p)], last.transactionID == current.transactionID else { return true }
+        RelaySubscription.covered(pairings).filter { p in
+            guard let last = delivered[key(p)] else { return true }
+            if last.transactionID != current?.transactionID { return current != nil }
             return !last.outcome.isSettled
         }
     }

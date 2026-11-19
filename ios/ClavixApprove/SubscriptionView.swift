@@ -19,8 +19,11 @@ struct SubscriptionSection: View {
 
     private static let restoring = "restore"
 
-    private var covered: [PairingRecord] { RelaySubscription.covered(model.pairings) }
-    private var hostedCount: Int { model.pairings.filter(RelaySubscription.needed(by:)).count }
+    private var covered: [PairingRecord] { RelaySubscription.covered(model.pairings, notRequired: model.notRequired) }
+    /// Machines on the hosted relay, but for those whose relay checks no subscription.
+    private var hostedCount: Int {
+        model.pairings.filter { RelaySubscription.needed(by: $0) && !model.notRequired.contains(EntitlementSync.key($0)) }.count
+    }
     private var isActive: Bool { subscriptions.status?.isActive == true }
     /// « 14 jours d’essai gratuit », as App Store Connect sets it, when this Apple ID may still take it.
     private var trial: String? {
@@ -35,7 +38,7 @@ struct SubscriptionSection: View {
             }
             if hostedCount > 0 {
                 LabeledContent("Machines sur le relais Clavix") {
-                    Text("\(covered.count) / \(RelaySubscription.machineLimit)").monospacedDigit()
+                    Text("\(covered.count) / \(model.machineLimit)").monospacedDigit()
                 }
             }
             ForEach(model.pairings) { p in
@@ -57,8 +60,8 @@ struct SubscriptionSection: View {
             Text("Abonnement")
         } footer: {
             Text(hostedCount == 0 && !isActive
-                 ? "Inutile pour les machines appairées avec votre propre relais : seul le relais Clavix (approve.clavix.org) demande un abonnement. 10 machines max par abonnement."
-                 : "Requis pour les machines appairées via le relais Clavix (approve.clavix.org), pas pour celles de votre propre relais. 10 machines max par abonnement.")
+                 ? "Inutile pour les machines appairées avec votre propre relais : seul le relais Clavix (approve.clavix.org) demande un abonnement. \(model.machineLimit) machines max par abonnement."
+                 : "Requis pour les machines appairées via le relais Clavix (approve.clavix.org), pas pour celles de votre propre relais. \(model.machineLimit) machines max par abonnement.")
         }
 
         Section {

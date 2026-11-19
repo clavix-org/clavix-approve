@@ -487,7 +487,8 @@ struct RequestsView: View {
 
     var body: some View {
         List {
-            if RelaySubscription.shouldPrompt(status: subscriptions.status, pairings: model.pairings) {
+            if RelaySubscription.shouldPrompt(status: subscriptions.status, pairings: model.pairings,
+                                              notRequired: model.notRequired) {
                 Section { SubscriptionBanner() }
                     .listRowBackground(Color.accentColor.opacity(0.12))
             }

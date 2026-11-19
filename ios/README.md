@@ -124,13 +124,27 @@ shown, the purchase in force, and which pairings need its proof.
 The app hands the hosted relay the proof, for every confirmed pairing on
 it: `POST /api/ch/{ch}/dev/{signer}/entitlement` with the pairing's own
 bearer token, body `{"jws": "<Transaction.jwsRepresentation>"}`. The relay
-answers `200 {"ok":true,"expires":<unix>}`, or `403
-{"error":"machine_limit"}` past 10 machines (shown on the machine's card
-and in Réglages → Abonnement), or `400`/`401`. It is sent at launch, after
-a purchase or a restore, on each transaction update, when a pairing is
-confirmed, and again when the app comes to the front if it did not get
-through; network failures are retried with a growing pause. Approvals
-never wait for it.
+answers:
+
+| Answer | The app |
+|---|---|
+| `200 {"ok":true,"expires":<unix s>,"required":true}` | covered |
+| `200 {"ok":true,"expires":null,"required":false}` | this relay checks no subscription: the machine is never counted nor prompted for (remembered) |
+| `402 {"error":"subscription_required","state":"expired"\|"revoked"}` | « Abonnement expiré » / « révoqué » on the machine's card |
+| `403 {"error":"machine_limit","limit":10}` | « Non couverte » on the card and in Réglages, with the relay's `limit` |
+| `403 {"error":"invalid_transaction","reason":…}` | a journal line (expected for a purchase made with Xcode's StoreKit testing) |
+| `401`, `400` | nothing more |
+
+It is sent at launch, after a purchase or a restore, on each transaction
+update, when a pairing is confirmed, and again when the app comes to the
+front if it did not get through. Only network failures, `429` and `5xx`
+are retried, with a growing pause; any other answer stands until the
+transaction changes. Approvals never wait for it.
+
+Without a subscription, each hosted pairing is asked once per launch
+with an empty proof: a relay that checks no subscription answers
+`required: false` without reading it, so the banner does not show for
+it; a relay that checks answers `invalid_transaction`.
 
 To try it in Xcode without App Store Connect: the shared scheme
 `ClavixApprove` runs with `ClavixApprove.storekit` (Product → Scheme →

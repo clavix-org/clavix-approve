@@ -68,6 +68,12 @@ final class SubscriptionTests: XCTestCase {
         XCTAssertFalse(RelaySubscription.shouldPrompt(status: .expired(since: nil), pairings: []))
         XCTAssertTrue(RelaySubscription.shouldPrompt(status: .never, pairings: [own, hosted]))
         XCTAssertTrue(RelaySubscription.shouldPrompt(status: .expired(since: nil), pairings: [hosted]))
+
+        // A relay that answered `required: false` is not counted.
+        let off: Set = [EntitlementSync.key(hosted)]
+        XCTAssertFalse(RelaySubscription.shouldPrompt(status: .never, pairings: [own, hosted], notRequired: off))
+        XCTAssertEqual(RelaySubscription.covered([own, hosted]), [hosted])
+        XCTAssertEqual(RelaySubscription.covered([own, hosted], notRequired: off), [])
     }
 
     // ---- which pairings get the proof ----
@@ -81,35 +87,70 @@ final class SubscriptionTests: XCTestCase {
         let sub = purchase(7, expires: 20 * day)
         let key = EntitlementSync.key
 
-        XCTAssertEqual(EntitlementSync.pending(all, current: nil, delivered: [:]), [])
         XCTAssertEqual(EntitlementSync.pending(all, current: sub, delivered: [:]), [a, b])
 
         // Settled answers for this transaction are not sent again; a failure is.
         var delivered = [key(a): EntitlementDelivery(transactionID: 7, outcome: .accepted(expires: nil)),
                          key(b): EntitlementDelivery(transactionID: 7, outcome: .failed)]
         XCTAssertEqual(EntitlementSync.pending(all, current: sub, delivered: delivered), [b])
-        delivered[key(b)] = EntitlementDelivery(transactionID: 7, outcome: .machineLimit)
-        XCTAssertEqual(EntitlementSync.pending(all, current: sub, delivered: delivered), [])
+        for settled: EntitlementOutcome in [.machineLimit(limit: 10), .ended(revoked: false), .ended(revoked: true),
+                                            .invalidTransaction(reason: "x"), .notRequired, .refused(status: 400)] {
+            delivered[key(b)] = EntitlementDelivery(transactionID: 7, outcome: settled)
+            XCTAssertEqual(EntitlementSync.pending(all, current: sub, delivered: delivered), [], "\(settled)")
+        }
 
         // A renewal is a new transaction: due everywhere again.
         XCTAssertEqual(EntitlementSync.pending(all, current: purchase(8, expires: 50 * day), delivered: delivered), [a, b])
+
+        // Without a subscription: the probe, once per pairing never asked,
+        // again only after a failure.
+        XCTAssertEqual(EntitlementSync.pending(all, current: nil, delivered: [:]), [a, b])
+        var probed = [key(a): EntitlementDelivery(transactionID: nil, outcome: .notRequired),
+                      key(b): EntitlementDelivery(transactionID: nil, outcome: .failed)]
+        XCTAssertEqual(EntitlementSync.pending(all, current: nil, delivered: probed), [b])
+        probed[key(b)] = EntitlementDelivery(transactionID: nil, outcome: .invalidTransaction(reason: nil))
+        XCTAssertEqual(EntitlementSync.pending(all, current: nil, delivered: probed), [])
+        // A subscription bought after the probe: due everywhere.
+        XCTAssertEqual(EntitlementSync.pending(all, current: sub, delivered: probed), [a, b])
+        // A subscription that lapsed: not probed again.
+        XCTAssertEqual(EntitlementSync.pending(all, current: nil, delivered: delivered), [])
     }
 
     // ---- the relay's answers ----
 
     func testOutcomes() {
         let expires = Date(timeIntervalSince1970: 1_900_000_000)
-        XCTAssertEqual(EntitlementOutcome(.success(expires)), .accepted(expires: expires))
-        XCTAssertEqual(EntitlementOutcome(.failure(RelayError(status: 403, message: "", code: "machine_limit"))), .machineLimit)
-        XCTAssertEqual(EntitlementOutcome(.failure(RelayError(status: 403, message: ""))), .refused(status: 403))
-        XCTAssertEqual(EntitlementOutcome(.failure(RelayError(status: 401, message: ""))), .refused(status: 401))
-        XCTAssertEqual(EntitlementOutcome(.failure(RelayError(status: 400, message: "", code: "bad_jws"))), .refused(status: 400))
-        XCTAssertEqual(EntitlementOutcome(.failure(RelayError(status: 429, message: ""))), .failed)
-        XCTAssertEqual(EntitlementOutcome(.failure(RelayError(status: 502, message: ""))), .failed)
-        XCTAssertEqual(EntitlementOutcome(.failure(RelayError(status: 0, message: "unreachable"))), .failed)
+        func outcome(_ status: Int, _ code: String? = nil, state: String? = nil, limit: Int? = nil,
+                     reason: String? = nil) -> EntitlementOutcome {
+            EntitlementOutcome(.failure(RelayError(status: status, message: "", code: code, state: state,
+                                                   limit: limit, reason: reason)))
+        }
+        XCTAssertEqual(EntitlementOutcome(.success(EntitlementGrant(expires: expires, required: true))),
+                       .accepted(expires: expires))
+        XCTAssertEqual(EntitlementOutcome(.success(EntitlementGrant(expires: nil, required: false))), .notRequired)
+        XCTAssertEqual(outcome(402, "subscription_required", state: "expired"), .ended(revoked: false))
+        XCTAssertEqual(outcome(402, "subscription_required", state: "revoked"), .ended(revoked: true))
+        XCTAssertEqual(outcome(403, "machine_limit", limit: 10), .machineLimit(limit: 10))
+        XCTAssertEqual(outcome(403, "machine_limit"), .machineLimit(limit: nil))
+        XCTAssertEqual(outcome(403, "invalid_transaction", reason: "bad signature"),
+                       .invalidTransaction(reason: "bad signature"))
+        XCTAssertEqual(outcome(403), .refused(status: 403))
+        XCTAssertEqual(outcome(402), .refused(status: 402))
+        XCTAssertEqual(outcome(401), .refused(status: 401))
+        XCTAssertEqual(outcome(400, "bad_request"), .refused(status: 400))
+        XCTAssertEqual(outcome(429), .failed)
+        XCTAssertEqual(outcome(502), .failed)
+        XCTAssertEqual(outcome(0), .failed)
         XCTAssertEqual(EntitlementOutcome(.failure(CoreError.malformed("x"))), .failed)
-        XCTAssertTrue(EntitlementOutcome.machineLimit.isSettled)
+
         XCTAssertFalse(EntitlementOutcome.failed.isSettled)
+        XCTAssertTrue(EntitlementOutcome.ended(revoked: false).isSettled)
+        XCTAssertTrue(EntitlementOutcome.invalidTransaction(reason: nil).isSettled)
+        XCTAssertEqual(EntitlementOutcome.notRequired.requiresSubscription, false)
+        XCTAssertEqual(EntitlementOutcome.accepted(expires: nil).requiresSubscription, true)
+        XCTAssertEqual(EntitlementOutcome.invalidTransaction(reason: nil).requiresSubscription, true)
+        XCTAssertNil(EntitlementOutcome.failed.requiresSubscription)
+        XCTAssertNil(EntitlementOutcome.refused(status: 401).requiresSubscription)
     }
 
     func testPostEntitlementCall() async throws {
@@ -117,35 +158,52 @@ final class SubscriptionTests: XCTestCase {
         config.protocolClasses = [StubRelay.self]
         let client = RelayClient(base: URL(string: "https://approve.clavix.org/")!, ch: "ab12", token: "tok",
                                  session: URLSession(configuration: config))
+        let signer = "0011223344556677"
 
-        StubRelay.answer = (200, #"{"ok":true,"expires":1900000000}"#)
-        let expires = try await client.postEntitlement(signer: "0011223344556677", jws: "a.b.c")
-        XCTAssertEqual(expires, Date(timeIntervalSince1970: 1_900_000_000))
+        // `expires` is in seconds: 1_900_000_000 is in 2030.
+        StubRelay.answer = (200, #"{"ok":true,"expires":1900000000,"required":true}"#)
+        let grant = try await client.postEntitlement(signer: signer, jws: "a.b.c")
+        XCTAssertEqual(grant, EntitlementGrant(expires: Date(timeIntervalSince1970: 1_900_000_000), required: true))
         let seen = try XCTUnwrap(StubRelay.seen)
         XCTAssertEqual(seen.method, "POST")
         XCTAssertEqual(seen.url, "https://approve.clavix.org/api/ch/ab12/dev/0011223344556677/entitlement")
         XCTAssertEqual(seen.authorization, "Bearer tok")
         XCTAssertEqual(try JSONSerialization.jsonObject(with: seen.body) as? [String: String], ["jws": "a.b.c"])
 
-        StubRelay.answer = (403, #"{"error":"machine_limit"}"#)
-        do {
-            _ = try await client.postEntitlement(signer: "0011223344556677", jws: "a.b.c")
-            XCTFail("a refusal passed")
-        } catch let e as RelayError {
-            XCTAssertEqual(e.status, 403)
-            XCTAssertEqual(e.code, "machine_limit")
-            XCTAssertEqual(EntitlementOutcome(.failure(e)), .machineLimit)
+        // A relay that checks no subscription.
+        StubRelay.answer = (200, #"{"ok":true,"expires":null,"required":false}"#)
+        let off = try await client.postEntitlement(signer: signer, jws: EntitlementSync.probe)
+        XCTAssertEqual(off, EntitlementGrant(expires: nil, required: false))
+        XCTAssertEqual(EntitlementOutcome(.success(off)), .notRequired)
+
+        func refusal(_ status: Int, _ body: String) async -> RelayError? {
+            StubRelay.answer = (status, body)
+            do {
+                _ = try await client.postEntitlement(signer: signer, jws: "a.b.c")
+                XCTFail("a refusal passed: \(body)")
+                return nil
+            } catch {
+                return error as? RelayError
+            }
         }
 
+        var e = await refusal(402, #"{"error":"subscription_required","state":"revoked","expires":1800000000}"#)
+        XCTAssertEqual(e?.status, 402)
+        XCTAssertEqual(e?.state, "revoked")
+        XCTAssertEqual(e.map { EntitlementOutcome(.failure($0)) }, .ended(revoked: true))
+
+        e = await refusal(403, #"{"error":"machine_limit","limit":12}"#)
+        XCTAssertEqual(e?.limit, 12)
+        XCTAssertEqual(e.map { EntitlementOutcome(.failure($0)) }, .machineLimit(limit: 12))
+
+        e = await refusal(403, #"{"error":"invalid_transaction","reason":"untrusted certificate chain"}"#)
+        XCTAssertEqual(e.map { EntitlementOutcome(.failure($0)) },
+                       .invalidTransaction(reason: "untrusted certificate chain"))
+
         // A proxy's HTML page: no code.
-        StubRelay.answer = (502, "<html>bad gateway</html>")
-        do {
-            _ = try await client.postEntitlement(signer: "0011223344556677", jws: "a.b.c")
-            XCTFail("a proxy error passed")
-        } catch let e as RelayError {
-            XCTAssertEqual(e.status, 502)
-            XCTAssertNil(e.code)
-        }
+        e = await refusal(502, "<html>bad gateway</html>")
+        XCTAssertEqual(e?.status, 502)
+        XCTAssertNil(e?.code)
     }
 }
 
