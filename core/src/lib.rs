@@ -23,3 +23,5 @@ pub mod relay;
 pub mod requester;
 pub mod sign_requester;
 pub mod state;
+#[cfg(test)]
+mod test_relay;

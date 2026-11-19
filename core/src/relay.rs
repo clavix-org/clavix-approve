@@ -85,16 +85,25 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
-    /// `base` must be HTTPS, except for a loopback address (tests): the
-    /// bearer tokens travel in a header.
+    /// `base` must be HTTPS, except for a literal loopback IP address
+    /// (`127.0.0.1`, `[::1]`; tests and local relays): the bearer tokens
+    /// travel in a header. The name `localhost` is not accepted over plain
+    /// HTTP, since a resolver could send it elsewhere. Redirects are never
+    /// followed: one could carry a request, and its token, to another host.
     pub fn new(base: &str) -> Result<Self, String> {
         let base = base.trim_end_matches('/').to_string();
         let url = reqwest::Url::parse(&base).map_err(|e| format!("invalid relay URL: {e}"))?;
-        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        let loopback = url
+            .host_str()
+            .map(|h| h.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|h| h.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
         if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
             return Err("the relay URL must use https".into());
         }
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(!loopback)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(POLL_SECONDS + 15))
             .build()
@@ -241,10 +250,55 @@ mod tests {
     fn relay_url_must_be_https_unless_loopback() {
         assert!(RelayClient::new("https://relay.example").is_ok());
         assert!(RelayClient::new("http://127.0.0.1:8765/").is_ok());
-        assert!(RelayClient::new("http://localhost:8765").is_ok());
+        assert!(RelayClient::new("http://[::1]:8765").is_ok());
+        assert!(RelayClient::new("https://localhost:8765").is_ok());
+        // Plain HTTP only to a literal loopback IP, never to a name.
+        assert!(RelayClient::new("http://localhost:8765").is_err());
+        assert!(RelayClient::new("http://LOCALHOST:8765").is_err());
+        assert!(RelayClient::new("http://127.0.0.1.relay.example").is_err());
+        assert!(RelayClient::new("http://[::2]").is_err());
+        assert!(RelayClient::new("http://10.0.0.1").is_err());
         assert!(RelayClient::new("http://relay.example").is_err());
         assert!(RelayClient::new("ftp://relay.example").is_err());
         assert!(RelayClient::new("not a url").is_err());
+    }
+
+    /// An HTTP server on loopback that answers every request with
+    /// `response`, and returns how many it served once idle for 500 ms.
+    async fn canned_server(response: &'static str) -> (String, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut served = 0;
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+                served += 1;
+            }
+            served
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        // The redirect points back at the same server: following it would
+        // make a second request.
+        let (base, server) = canned_server(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /elsewhere\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let client = RelayClient::new(&base).unwrap();
+        let result = client.post("/api/channels", "token", &json!({})).await;
+        assert_eq!(result, Err(RelayError::Status(307)));
+        assert!(!RelayError::Status(307).is_transient());
+        assert_eq!(server.await.unwrap(), 1, "the redirect was followed");
     }
 
     #[test]

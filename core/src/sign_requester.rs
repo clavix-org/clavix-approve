@@ -361,24 +361,46 @@ impl SignRequester {
                 return Err(SignError::Busy);
             };
 
+            // From here on, giving up for any reason but an answer (local
+            // deadline, future dropped because ssh went away or the agent
+            // stopped) takes the request off the relay, so that the device
+            // stops offering it. Armed before the POST: dropped while it
+            // is in flight, the request may have been queued.
+            let mut withdraw = WithdrawOnDrop {
+                client: client.clone(),
+                ch: ch.clone(),
+                token: token.clone(),
+                id: id.clone(),
+                armed: true,
+            };
             let queued = match client
                 .post(&format!("{base}/requests"), &token, &envelope)
                 .await
             {
                 Ok(queued) => queued,
+                // Not queued (or the relay is unreachable, and so would
+                // the cancellation be).
                 Err(RelayError::SubscriptionRequired) => {
+                    withdraw.disarm();
                     *unpaid_until.lock().unwrap() = Some(Instant::now() + BACKOFF_AFTER_UNPAID);
                     return Err(SignError::Relay(RelayError::SubscriptionRequired));
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    withdraw.disarm();
+                    return Err(e.into());
+                }
             };
             match state_of(&queued) {
                 "queued" => {}
-                "unknown-signer" => return Err(SignError::UnknownDevice(to)),
+                "unknown-signer" => {
+                    withdraw.disarm();
+                    return Err(SignError::UnknownDevice(to));
+                }
                 other => {
+                    withdraw.disarm();
                     return Err(SignError::Invalid(format!(
                         "relay did not queue the request ({other})"
-                    )))
+                    )));
                 }
             }
 
@@ -387,6 +409,7 @@ impl SignRequester {
             let answer = loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
+                    // Still on the relay: `withdraw` takes it off.
                     return Err(SignError::Expired);
                 }
                 // Never ask the relay to hold the connection past the expiry.
@@ -396,6 +419,7 @@ impl SignRequester {
                     if until.is_zero() {
                         // The device never fetched it: give up, so that
                         // ssh tries the next key, and take it off the relay.
+                        withdraw.disarm();
                         let _ = relay::cancel(&client, &ch, &token, &id).await;
                         return Err(SignError::NotPickedUp {
                             device: to,
@@ -406,7 +430,7 @@ impl SignRequester {
                 }
                 let report = if pickup_at.is_some() { "&seen=1" } else { "" };
                 let poll = format!("{base}/responses/{id}?wait={wait}{report}");
-                match client.get(&poll, &token).await {
+                let ended = match client.get(&poll, &token).await {
                     Ok(None) => continue,
                     Ok(Some(value)) => match state_of(&value) {
                         "pending" => {
@@ -414,24 +438,32 @@ impl SignRequester {
                             continue;
                         }
                         "answered" => match value.get("msg").and_then(Value::as_str) {
-                            Some(msg) => break msg.to_string(),
-                            None => {
-                                return Err(SignError::Invalid("answer without content".into()))
-                            }
+                            Some(msg) => Ok(msg.to_string()),
+                            None => Err(SignError::Invalid("answer without content".into())),
                         },
-                        "expired" => return Err(SignError::Expired),
-                        other => {
-                            return Err(SignError::Invalid(format!(
-                                "relay lost the request ({other})"
-                            )))
-                        }
+                        "expired" => Err(SignError::Expired),
+                        other => Err(SignError::Invalid(format!(
+                            "relay lost the request ({other})"
+                        ))),
                     },
                     // Throttled: back off for real, each 429 counts
                     // against us at a proxy that bans.
-                    Err(RelayError::Status(429)) => tokio::time::sleep(THROTTLED_PAUSE).await,
-                    Err(e) if e.is_transient() => tokio::time::sleep(RETRY_PAUSE).await,
-                    Err(e) => return Err(e.into()),
-                }
+                    Err(RelayError::Status(429)) => {
+                        tokio::time::sleep(THROTTLED_PAUSE).await;
+                        continue;
+                    }
+                    Err(e) if e.is_transient() => {
+                        tokio::time::sleep(RETRY_PAUSE).await;
+                        continue;
+                    }
+                    // A refusal (revoked pairing...): cancelling would
+                    // only get the same refusal.
+                    Err(e) => Err(e.into()),
+                };
+                // The relay answered, expired or lost the request: nothing
+                // left to withdraw.
+                withdraw.disarm();
+                break ended?;
             };
 
             // Only the paired device can have produced this.
@@ -444,6 +476,43 @@ impl SignRequester {
             }
             result
         })
+    }
+}
+
+/// Takes a queued request off the relay when dropped armed: in a
+/// background task, best effort, never blocking the drop. Without a Tokio
+/// runtime at drop time nothing is sent, and the request expires on its
+/// own.
+struct WithdrawOnDrop {
+    client: RelayClient,
+    ch: String,
+    token: String,
+    id: String,
+    armed: bool,
+}
+
+impl WithdrawOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WithdrawOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            let (ch, token, id) = (
+                std::mem::take(&mut self.ch),
+                std::mem::take(&mut self.token),
+                std::mem::take(&mut self.id),
+            );
+            runtime.spawn(async move {
+                let _ = relay::cancel(&client, &ch, &token, &id).await;
+            });
+        }
     }
 }
 
@@ -478,6 +547,7 @@ fn read_response(inner: &Value, id: &str, sent: &str) -> Result<Vec<u8>, SignErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_relay;
 
     fn answer(sent: &str, fields: Value) -> Value {
         let mut inner = json!({ "id": "id-1", "req": b64u(&Sha256::digest(sent.as_bytes())) });
@@ -699,6 +769,95 @@ mod tests {
         assert_eq!(
             r.sign(&SignRequest::new(key, vec![])).await,
             Err(SignError::Busy)
+        );
+    }
+
+    fn requester_on(base: &str, timeout: Duration) -> SignRequester {
+        SignRequester::new(
+            RelayClient::new(base).unwrap(),
+            &"ab".repeat(16),
+            "token",
+            "desk",
+            Identity::generate(),
+            vec![device("01", KEY_A)],
+            timeout,
+        )
+        .unwrap()
+    }
+
+    /// A stand-in relay that queues every request and keeps it pending
+    /// (or, with `expire`, says it expired).
+    async fn fake_relay(expire: bool) -> (String, test_relay::Calls) {
+        test_relay::serve(move |call| {
+            let state = if call.ends_with("/cancel") {
+                "cancelled"
+            } else if call.starts_with("POST ") {
+                "queued"
+            } else if expire {
+                "expired"
+            } else {
+                "pending"
+            };
+            (200, json!({ "state": state }).to_string())
+        })
+        .await
+    }
+
+    /// The relay id of the request, from its first poll.
+    fn polled_id(calls: &test_relay::Calls) -> String {
+        let calls = calls.lock().unwrap();
+        let poll = calls.iter().find(|c| c.starts_with("GET ")).unwrap();
+        poll.rsplit('/').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_request_given_up_on_is_withdrawn_from_the_relay() {
+        let (base, calls) = fake_relay(false).await;
+        let r = requester_on(&base, DEFAULT_TIMEOUT);
+        let key = r.keys()[0].key_blob.clone();
+        let future = r.sign(&SignRequest::new(key, b"data".to_vec()));
+        // ssh went away (or the agent stopped) while the phone was asked:
+        // the future is dropped.
+        let gave_up = tokio::time::timeout(Duration::from_millis(400), future).await;
+        assert!(gave_up.is_err());
+        let cancel = test_relay::until_cancelled(&calls).await;
+        let id = polled_id(&calls);
+        assert_eq!(
+            cancel,
+            vec![format!(
+                "POST /api/ch/{}/requests/{id}/cancel",
+                "ab".repeat(16)
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_past_its_deadline_is_withdrawn_from_the_relay() {
+        let (base, calls) = fake_relay(false).await;
+        let r = requester_on(&base, Duration::from_secs(1));
+        let key = r.keys()[0].key_blob.clone();
+        let result = r.sign(&SignRequest::new(key, b"data".to_vec())).await;
+        assert_eq!(result, Err(SignError::Expired));
+        let cancel = test_relay::until_cancelled(&calls).await;
+        assert!(
+            cancel.len() == 1 && cancel[0].contains(&polled_id(&calls)),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_the_relay_expired_is_not_cancelled_again() {
+        let (base, calls) = fake_relay(true).await;
+        let r = requester_on(&base, DEFAULT_TIMEOUT);
+        let key = r.keys()[0].key_blob.clone();
+        let result = r.sign(&SignRequest::new(key, b"data".to_vec())).await;
+        assert_eq!(result, Err(SignError::Expired));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            test_relay::cancels(&calls).is_empty(),
+            "{:?}",
+            calls.lock().unwrap()
         );
     }
 }
