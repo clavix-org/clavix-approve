@@ -37,6 +37,12 @@ pub const MAX_SESSION_BINDS: usize = 16;
 /// session identifier in the data a client asks us to sign for
 /// public-key authentication.
 const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
+/// The only user-auth method this agent signs for (OpenSSH >= 8.9). Plain
+/// `publickey` does not name the server in the signed bytes: anyone
+/// holding a host key the user trusts could bind a session it opened with
+/// another server and pass a login there off as a login to itself.
+pub const METHOD_HOSTBOUND: &[u8] = b"publickey-hostbound-v00@openssh.com";
+const METHOD_PLAIN: &[u8] = b"publickey";
 
 // Cap any single agent request to 256 KB — real traffic is orders smaller.
 pub const MAX_MESSAGE: usize = 256 * 1024;
@@ -154,9 +160,9 @@ pub trait Signer: Send + Sync {
     fn sign(&self, job: SignJob) -> SignFuture;
 }
 
-/// A parsed public-key user-auth request (RFC 4252 §7, plus OpenSSH's
-/// `publickey-hostbound-v00@openssh.com`) — the only thing this agent
-/// will ask a signer to sign.
+/// A parsed host-bound public-key user-auth request (RFC 4252 §7 with
+/// OpenSSH's `publickey-hostbound-v00@openssh.com`) — the only thing this
+/// agent will ask a signer to sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserAuthRequest<'a> {
     pub session_id: &'a [u8],
@@ -165,8 +171,8 @@ pub struct UserAuthRequest<'a> {
     pub algorithm: &'a [u8],
     /// The client key the request authenticates with.
     pub key_blob: &'a [u8],
-    /// Server host key named by the host-bound variant.
-    pub host_key: Option<&'a [u8]>,
+    /// Server host key the client authenticates to.
+    pub host_key: &'a [u8],
 }
 
 /// Reduce an OS-supplied process label (Linux `/proc/<pid>/comm`) to a
@@ -274,8 +280,22 @@ fn session_bind(reader: &mut SshReader<'_>, conn: &mut ConnState) -> Option<()> 
     Some(())
 }
 
-/// Parse `data` as a public-key user-auth request. `None` for anything
-/// else (git's `SSHSIG`, arbitrary data) and for trailing bytes.
+/// The user-auth method named by `data`, if it starts like a user-auth
+/// request. Only used to explain a refusal.
+fn userauth_method(data: &[u8]) -> Option<&[u8]> {
+    let mut r = SshReader::new(data);
+    r.read_string().ok()?;
+    if r.read_u8().ok()? != SSH_MSG_USERAUTH_REQUEST {
+        return None;
+    }
+    r.read_string().ok()?;
+    r.read_string().ok()?;
+    r.read_string().ok()
+}
+
+/// Parse `data` as a host-bound public-key user-auth request. `None` for
+/// anything else (plain `publickey`, git's `SSHSIG`, arbitrary data) and
+/// for trailing bytes.
 pub fn parse_userauth_request(data: &[u8]) -> Option<UserAuthRequest<'_>> {
     let mut r = SshReader::new(data);
     let session_id = r.read_string().ok()?;
@@ -284,21 +304,15 @@ pub fn parse_userauth_request(data: &[u8]) -> Option<UserAuthRequest<'_>> {
     }
     let user = r.read_string().ok()?;
     let service = r.read_string().ok()?;
-    let hostbound = match r.read_string().ok()? {
-        b"publickey" => false,
-        b"publickey-hostbound-v00@openssh.com" => true,
-        _ => return None,
-    };
+    if r.read_string().ok()? != METHOD_HOSTBOUND {
+        return None;
+    }
     if r.read_u8().ok()? != 1 {
         return None;
     }
     let algorithm = r.read_string().ok()?;
     let key_blob = r.read_string().ok()?;
-    let host_key = if hostbound {
-        Some(r.read_string().ok()?)
-    } else {
-        None
-    };
+    let host_key = r.read_string().ok()?;
     r.is_empty().then_some(UserAuthRequest {
         session_id,
         user,
@@ -385,27 +399,34 @@ async fn handle_sign(
     }
 
     // Refuse early what the signer would refuse anyway, without waking
-    // anyone up: the request must be a user-auth request for the session
-    // this connection is bound to (and, host-bound, for that host), made
-    // with the key we are asked to sign with. A hostile server holding a
-    // forwarded agent cannot then relay another session's challenge
-    // through a connection whose binding the user is looking at. The
-    // signer repeats every one of these checks: this machine may lie.
+    // anyone up: the request must be a host-bound user-auth request for
+    // the session this connection is bound to and for that session's host
+    // key, made with the key we are asked to sign with. A hostile server
+    // holding a forwarded agent cannot then relay another session's
+    // challenge through a connection whose binding the user is looking
+    // at: even if it binds that session with its own key, the request
+    // names the other server's key. The signer repeats every one of these
+    // checks: this machine may lie.
     let Some(bound) = conn.bound_for_auth() else {
         log("sign request refused: connection has no session binding for authentication");
         return failure;
     };
     let Some(request) = parse_userauth_request(data) else {
-        log("sign request refused: not a public-key user-auth request");
+        if userauth_method(data) == Some(METHOD_PLAIN) {
+            log(
+                "sign request refused: plain \"publickey\" login, which does not name the server; \
+                 client and server must be OpenSSH 8.9 or later (publickey-hostbound-v00@openssh.com)",
+            );
+        } else {
+            log("sign request refused: not a host-bound public-key user-auth request");
+        }
         return failure;
     };
     if request.session_id != bound.session_id.as_slice()
         || request.key_blob != key_blob
-        || request
-            .host_key
-            .is_some_and(|hk| hk != bound.key_blob.as_slice())
+        || request.host_key != bound.key_blob.as_slice()
     {
-        log("sign request refused: it does not match the bound session");
+        log("sign request refused: it does not match the bound session and host key");
         return failure;
     }
 
@@ -801,23 +822,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_userauth_request_accepts_only_publickey_requests() {
-        let plain = userauth(b"s", b"k", None);
-        let parsed = parse_userauth_request(&plain).unwrap();
+    fn parse_userauth_request_accepts_only_host_bound_requests() {
+        let hb = userauth(b"s", b"k", Some(b"hk"));
+        let parsed = parse_userauth_request(&hb).unwrap();
         assert_eq!(parsed.session_id, b"s");
         assert_eq!(parsed.user, b"git");
         assert_eq!(parsed.service, b"ssh-connection");
         assert_eq!(parsed.algorithm, b"ssh-ed25519");
         assert_eq!(parsed.key_blob, b"k");
-        assert_eq!(parsed.host_key, None);
+        assert_eq!(parsed.host_key, b"hk");
 
-        let hb = userauth(b"s", b"k", Some(b"hk"));
-        assert_eq!(
-            parse_userauth_request(&hb).unwrap().host_key,
-            Some(&b"hk"[..])
-        );
+        // Plain `publickey` does not name the server: refused.
+        let plain = userauth(b"s", b"k", None);
+        assert_eq!(parse_userauth_request(&plain), None);
+        assert_eq!(userauth_method(&plain), Some(METHOD_PLAIN));
 
-        let mut trailing = userauth(b"s", b"k", None);
+        let mut trailing = userauth(b"s", b"k", Some(b"hk"));
         trailing.push(0);
         assert_eq!(parse_userauth_request(&trailing), None);
         assert_eq!(parse_userauth_request(b"SSHSIG"), None);
@@ -858,7 +878,7 @@ mod tests {
         bind(&mut conn, &jump, b"sid-j", true);
         bind(&mut conn, &dest, b"sid-d", false);
 
-        let data = userauth(b"sid-d", &key, None);
+        let data = userauth(b"sid-d", &key, Some(&dest.blob()));
         let out = run(&sign_msg(&key, &data), &signer, &mut conn);
         assert_eq!(out[0], SSH_AGENT_SIGN_RESPONSE);
         let jobs = signer.jobs.lock().unwrap();
@@ -875,25 +895,29 @@ mod tests {
 
         // No binding at all (old client).
         let mut unbound = ConnState::default();
-        let data = userauth(b"sid-ok", &key, None);
+        let data = userauth(b"sid-ok", &key, Some(&host.blob()));
         assert_eq!(run(&sign_msg(&key, &data), &signer, &mut unbound), fail);
 
         // Only a forwarding binding: the session to sign for is unknown.
         let mut forwarded = ConnState::default();
         bind(&mut forwarded, &host, b"sid-fwd", true);
-        let data = userauth(b"sid-fwd", &key, None);
+        let data = userauth(b"sid-fwd", &key, Some(&host.blob()));
         assert_eq!(run(&sign_msg(&key, &data), &signer, &mut forwarded), fail);
 
         let mut conn = ConnState::default();
         bind(&mut conn, &host, b"sid-ok", false);
         // Another session's challenge relayed through this connection.
-        let data = userauth(b"sid-other", &key, None);
+        let data = userauth(b"sid-other", &key, Some(&host.blob()));
+        assert_eq!(run(&sign_msg(&key, &data), &signer, &mut conn), fail);
+        // A plain `publickey` login for the bound session: its bytes do
+        // not name the server, so the binding proves nothing about it.
+        let data = userauth(b"sid-ok", &key, None);
         assert_eq!(run(&sign_msg(&key, &data), &signer, &mut conn), fail);
         // Host-bound request naming another host key.
         let data = userauth(b"sid-ok", &key, Some(&TestKey::new(5).blob()));
         assert_eq!(run(&sign_msg(&key, &data), &signer, &mut conn), fail);
         // A request made with another client key than the one asked for.
-        let data = userauth(b"sid-ok", &TestKey::new(6).blob(), None);
+        let data = userauth(b"sid-ok", &TestKey::new(6).blob(), Some(&host.blob()));
         assert_eq!(run(&sign_msg(&key, &data), &signer, &mut conn), fail);
         // Not a user-auth request (git commit signing).
         assert_eq!(
@@ -902,7 +926,7 @@ mod tests {
         );
         // A key the signer does not offer.
         let other = TestKey::new(6).blob();
-        let data = userauth(b"sid-ok", &other, None);
+        let data = userauth(b"sid-ok", &other, Some(&host.blob()));
         assert_eq!(run(&sign_msg(&other, &data), &signer, &mut conn), fail);
 
         assert_eq!(signer.asked(), 0);
@@ -915,7 +939,7 @@ mod tests {
         let key = signer.key.blob();
         let mut conn = ConnState::default();
         bind(&mut conn, &host, b"sid-ok", false);
-        let data = userauth(b"sid-ok", &key, None);
+        let data = userauth(b"sid-ok", &key, Some(&host.blob()));
         assert_eq!(
             run(&sign_msg(&key, &data), &signer, &mut conn),
             vec![SSH_AGENT_FAILURE]
@@ -930,12 +954,83 @@ mod tests {
         let key = signer.key.blob();
         let mut conn = ConnState::default();
         bind(&mut conn, &host, b"sid-ok", false);
-        let data = userauth(b"sid-ok", &key, None);
+        let data = userauth(b"sid-ok", &key, Some(&host.blob()));
         assert_eq!(
             run(&sign_msg(&key, &data), &signer, &mut conn),
             vec![SSH_AGENT_FAILURE]
         );
         assert_eq!(signer.asked(), 1);
+    }
+
+    /// testdata/hostbound.json, shared with web/test and the iOS tests:
+    /// the agent passes on exactly the requests the signers accept, and
+    /// refuses the others before anyone is asked.
+    #[test]
+    fn hostbound_vectors() {
+        use base64::Engine as _;
+        let unb64u = |v: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(v.as_str().unwrap())
+                .unwrap()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/hostbound.json")).unwrap();
+        let key = unb64u(&v["key"]);
+
+        struct VectorSigner {
+            key: Vec<u8>,
+            asked: Mutex<usize>,
+        }
+        impl Signer for VectorSigner {
+            fn identities(&self) -> Vec<Identity> {
+                vec![Identity {
+                    key_blob: self.key.clone(),
+                    comment: "phone".into(),
+                }]
+            }
+            fn sign(&self, _job: SignJob) -> SignFuture {
+                *self.asked.lock().unwrap() += 1;
+                Box::pin(async { Err(SignError::Denied) })
+            }
+        }
+
+        for case in v["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let signer = VectorSigner {
+                key: key.clone(),
+                asked: Mutex::new(0),
+            };
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let mut conn = ConnState::default();
+            for b in case["binds"].as_array().unwrap() {
+                let msg = bind_msg(
+                    &unb64u(&b["hostkey"]),
+                    &unb64u(&b["sid"]),
+                    &unb64u(&b["sig"]),
+                    b["fwd"].as_bool().unwrap(),
+                );
+                let out = rt.block_on(process_message(&msg, &signer, None, &mut conn));
+                assert_eq!(out, vec![SSH_AGENT_SUCCESS], "{name}: bind");
+            }
+            let data = unb64u(&case["data"]);
+            let out = rt.block_on(process_message(
+                &sign_msg(&key, &data),
+                &signer,
+                None,
+                &mut conn,
+            ));
+            assert_eq!(out, vec![SSH_AGENT_FAILURE], "{name}");
+            let ok = case["ok"].as_bool().unwrap();
+            assert_eq!(*signer.asked.lock().unwrap(), usize::from(ok), "{name}");
+            if ok {
+                let dest = conn.bound_for_auth().unwrap();
+                assert_eq!(
+                    dest.fingerprint,
+                    case["destination"].as_str().unwrap(),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]

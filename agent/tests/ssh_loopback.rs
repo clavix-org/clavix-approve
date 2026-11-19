@@ -102,7 +102,7 @@ async fn stock_ssh_logs_in_with_a_signature_from_the_signer() {
     let request = parse_userauth_request(&job.data).unwrap();
     assert_eq!(request.session_id, job.hops[0].session_id.as_slice());
     assert_eq!(request.user, current_user().as_bytes());
-    assert_eq!(request.host_key, Some(sshd.host_key_blob.as_slice()));
+    assert_eq!(request.host_key, sshd.host_key_blob.as_slice());
     let caller = job.caller.as_ref().expect("caller identified on Linux");
     assert_eq!(caller.name.as_deref(), Some("ssh"));
 

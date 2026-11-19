@@ -170,10 +170,13 @@ returns a signature instead of a boolean.
 The headless machine may be compromised, so the phone trusts nothing it
 says about the destination. From the request alone it checks that:
 
-- the data to sign is an SSH `publickey` user-auth request;
+- the data to sign is an SSH `publickey-hostbound-v00@openssh.com`
+  user-auth request (plain `publickey` does not name the server and is
+  refused, see PROTOCOL.md, "Why host-bound only");
 - the session identifier inside it matches a `session-bind` whose
   signature verifies under the claimed host key (the same check
-  `session_bind()` performs today);
+  `session_bind()` performs today), and the host key it names is that
+  same key;
 - that host key is in the phone's **own pinned host list** (imported at
   pairing, extended by explicit trust-on-first-use on the phone).
 

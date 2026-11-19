@@ -111,19 +111,34 @@ signer id, `exp` an integer Unix time. `msg` is sealed and contains:
   hints:  { "SHA256:…": name from known_hosts }   unverified }
 ```
 
-The agent only sends a request whose `data` is a public-key user-auth
-request for the session its connection is bound to. The signer trusts
-none of that and checks again, from the message alone:
+The agent only sends a request whose `data` is a host-bound public-key
+user-auth request for the session its connection is bound to and for that
+session's host key. The signer trusts none of that and checks again, from
+the message alone:
 
-1. `data` parses as `SSH_MSG_USERAUTH_REQUEST`, method `publickey` or
-   `publickey-hostbound-v00@openssh.com`, service `ssh-connection`,
-   algorithm `ecdsa-sha2-nistp256`, made with its own key;
+1. `data` parses as `SSH_MSG_USERAUTH_REQUEST`, method
+   `publickey-hostbound-v00@openssh.com` (never plain `publickey`),
+   service `ssh-connection`, algorithm `ecdsa-sha2-nistp256`, made with
+   its own key;
 2. there are 1 to 16 binds; each `sig` verifies as the signature of
    `sid` under `hostkey` (Ed25519, ECDSA P-256/384/521, RSA with SHA-2);
    all but the last are forwarding binds, the last is not;
-3. the session id in `data` is the last bind's, and the host key named by
-   a host-bound request is the last bind's;
+3. the session id in `data` is the last bind's, and the host key named in
+   `data` is the last bind's;
 4. `id` is the relay's, `exp` is in the future.
+
+**Why host-bound only.** A bind proves that host key K signed session id
+S. With plain `publickey` the bytes to sign name S but not the server, and
+whoever holds the private key of K can sign any S, including the id of a
+session it opened with another server. A hostile host the user pinned and
+forwards the agent to, or a compromised agent machine holding a pinned
+host key, could then bind a session with a third server under K and get a
+login there displayed as a login to K. The host-bound method puts the
+server's host key in the signed bytes, the server checks it against its
+own, and step 3 checks it against the bind: what is shown is what the
+signature is good for. It needs OpenSSH 8.9 or later on both ends (client
+and server); there is no fallback for older ones. Agent and signer refuse
+the same requests (`testdata/hostbound.json`).
 
 It then shows the user name taken from `data`, and the last host key
 under the name **the signer itself** pinned for it — or as an unknown host
@@ -413,6 +428,8 @@ relay's and the app's business, not part of this format.
 
 ## Agent behaviour worth knowing
 
+- It refuses a plain `publickey` login (OpenSSH before 8.9 on either end)
+  before contacting anyone, and logs why.
 - Default expiry 90 s (`--timeout`), under sshd's `LoginGraceTime`.
 - At most 4 requests wait at once; after a denial, requests fail
   immediately for 5 s.

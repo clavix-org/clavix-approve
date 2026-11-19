@@ -77,7 +77,10 @@ export async function fingerprint(keyBlob) {
 }
 
 // Parse the data an SSH client asks an agent to sign for public-key
-// authentication (RFC 4252 §7, plus OpenSSH's host-bound variant).
+// authentication, host-bound variant only (RFC 4252 §7 with OpenSSH's
+// publickey-hostbound-v00@openssh.com, OpenSSH 8.9+). Plain "publickey"
+// does not name the server in the signed bytes, so a holder of a pinned
+// host key could pass a login to another server off as one to itself.
 // Returns null for anything else, including trailing bytes.
 export function parseUserAuthRequest(data) {
   try {
@@ -87,11 +90,11 @@ export function parseUserAuthRequest(data) {
     const user = r.string();
     const service = r.text();
     const method = r.text();
-    if (method !== 'publickey' && method !== 'publickey-hostbound-v00@openssh.com') return null;
+    if (method !== 'publickey-hostbound-v00@openssh.com') return null;
     if (r.u8() !== 1) return null;
     const algorithm = r.text();
     const keyBlob = r.string();
-    const hostKey = method === 'publickey' ? null : r.string();
+    const hostKey = r.string();
     if (!r.done) return null;
     return { sessionId, user, service, algorithm, keyBlob, hostKey };
   } catch (_) {
