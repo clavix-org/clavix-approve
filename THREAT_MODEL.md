@@ -20,7 +20,7 @@ key as the passkey, read "user verification" for "biometric".)
 | Agent channel keys, agent token | agent state file, mode 0600 | sending requests that look like this agent's |
 | Pinned host list | page storage | a destination shown under a wrong name |
 | Pairing code | on screen for a few minutes | pairing another device in the user's place |
-| Relay enrolment secret | relay and agent environments | creating channels on the relay (spam, storage) |
+| Relay enrolment secret (closed enrolment only) | relay and agent environments | creating channels on the relay, within the per-address limits |
 | APNs auth key (`.p8`) | relay environment | sending notifications to the app on any device that registered it (spam, false alerts; no request content, no signature) |
 
 ## Who is trusted for what
@@ -28,7 +28,9 @@ key as the passkey, read "user verification" for "biometric".)
 - **The phone and its browser** are trusted completely.
 - **The origin that serves the page** is trusted completely, because it
   delivers the code that handles the key. In this prototype that origin
-  is the relay's host. See "Known weaknesses".
+  is the relay's host by default; a public relay runs with
+  `RELAY_SERVE_WEB=off` so that the page lives on another origin. See
+  "Known weaknesses".
 - **The relay as a message carrier** is not trusted: it sees sizes,
   timing, channel and request ids, expiry times and the push
   subscription. It cannot read, forge, alter or redirect a message.
@@ -74,8 +76,31 @@ user to name the host before approving. **A user who approves unknown
 hosts without checking the fingerprint defeats this protection.**
 
 It can bury the user under requests. Mitigations: at most 4 waiting, a
-5-second silence after each denial, at most 8 queued at the relay, no
-"approve all".
+5-second silence after each denial, no "approve all" (all three in the
+agent, which this attacker controls), and on the relay, which it does
+not: at most 8 live and 32 stored requests per channel (cancelled and
+answered ones count, so a cancel loop does not get around it), 60
+requests per channel per minute, and at most one push per 10 seconds and
+100 a day, per channel and per device. A flood can still keep the user's
+request list busy within those bounds; it cannot make the phone buzz
+more than that.
+
+### Anyone on the internet (public relay, open enrolment)
+
+Can create channels, pair its own devices and post requests to them: it
+needs no secret. It cannot touch a channel it does not hold a token of.
+What bounds it: channels per client address per hour and per day, a
+global safety cap, idle channels deleted after 90 days, devices and
+requests per channel, a size cap on every message, a global byte budget
+for pending data, push rate limits per channel and per device token,
+concurrent long-polls per token and per address, a connection cap and
+socket timeouts. A device token registered on a second channel leaves the
+first (the latest registration wins), so one token cannot be woken from
+many channels at once. What remains: someone controlling many addresses
+can fill the global cap until idle expiry catches up, and can register a
+victim's APNs token on its own channel (no proof of possession yet) to
+send it at most the push budget of notifications per day. Per-account
+quotas and App Attest are the next steps.
 
 ### Another user of the machine running the agent
 
@@ -135,6 +160,8 @@ and a short `ControlPersist` on the server side are outside this project.
   while the relay is unreachable keeps its pairing until the agent end
   revokes it. With a stolen phone, the passkey's user verification still
   stands between the thief and any signature.
-- **The enrolment secret is shared** by every agent allowed on a relay.
+- **Enrolment is open, or one secret is shared** by every agent allowed on
+  a relay. Abuse is bounded by per-address and per-channel limits, not by
+  identity: there are no accounts to cut off one by one yet.
 - Not yet verified on a real device: everything listed under "Needs the
   iPhone" in the README.
