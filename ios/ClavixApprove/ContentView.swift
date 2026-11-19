@@ -287,19 +287,28 @@ struct PairedView: View {
 
 struct PublicKeyView: View {
     let line: String
+    @State private var copied = false
 
     var body: some View {
+        // The whole line, never truncated: it is what goes in authorized_keys.
         Text(line)
-            .font(.system(.footnote, design: .monospaced))
+            .font(.system(.caption, design: .monospaced))
             .textSelection(.enabled)
-            .lineLimit(4)
+            .fixedSize(horizontal: false, vertical: true)
         HStack {
             Button {
                 UIPasteboard.general.string = line
+                withAnimation { copied = true }
+                Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    withAnimation { copied = false }
+                }
             } label: {
-                Label("Copier", systemImage: "doc.on.doc")
+                Label(copied ? "Copiée" : "Copier", systemImage: copied ? "checkmark" : "doc.on.doc")
             }
             .buttonStyle(.bordered)
+            .sensoryFeedback(.success, trigger: copied) { _, new in new }
+            .accessibilityHint(copied ? "Clé copiée dans le presse-papiers" : "")
             Spacer()
             ShareLink(item: line) { Label("Partager", systemImage: "square.and.arrow.up") }
                 .buttonStyle(.bordered)
@@ -447,14 +456,22 @@ struct RequestCard: View {
                 Button(role: .destructive) {
                     run { try await model.deny(request) }
                 } label: {
-                    Text("Refuser").frame(maxWidth: .infinity)
+                    // Unknown host: the approve title is long, so "Refuser"
+                    // keeps its natural width and leaves it the room.
+                    Text("Refuser").lineLimit(1).frame(maxWidth: known == nil ? nil : .infinity)
                 }
                 .buttonStyle(.bordered)
                 Button {
                     run { try await model.approve(request, newName: newName) }
                 } label: {
-                    Label(approveTitle, systemImage: "lock.open.fill")
-                        .frame(maxWidth: .infinity)
+                    // Explicit icon and colour: left to the button style, the
+                    // symbol took the tint and vanished into the background.
+                    HStack(spacing: 6) {
+                        Image(systemName: "lock.open.fill")
+                        Text(approveTitle).lineLimit(1).minimumScaleFactor(0.8)
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
             }
