@@ -158,19 +158,34 @@ signer id, `exp` an integer Unix time. `msg` is sealed and contains:
   hints:  { "SHA256:…": name from known_hosts }   unverified }
 ```
 
-The agent only sends a request whose `data` is a public-key user-auth
-request for the session its connection is bound to. The signer trusts
-none of that and checks again, from the message alone:
+The agent only sends a request whose `data` is a host-bound public-key
+user-auth request for the session its connection is bound to and for that
+session's host key. The signer trusts none of that and checks again, from
+the message alone:
 
-1. `data` parses as `SSH_MSG_USERAUTH_REQUEST`, method `publickey` or
-   `publickey-hostbound-v00@openssh.com`, service `ssh-connection`,
-   algorithm `ecdsa-sha2-nistp256`, made with its own key;
+1. `data` parses as `SSH_MSG_USERAUTH_REQUEST`, method
+   `publickey-hostbound-v00@openssh.com` (never plain `publickey`),
+   service `ssh-connection`, algorithm `ecdsa-sha2-nistp256`, made with
+   its own key;
 2. there are 1 to 16 binds; each `sig` verifies as the signature of
    `sid` under `hostkey` (Ed25519, ECDSA P-256/384/521, RSA with SHA-2);
    all but the last are forwarding binds, the last is not;
-3. the session id in `data` is the last bind's, and the host key named by
-   a host-bound request is the last bind's;
+3. the session id in `data` is the last bind's, and the host key named in
+   `data` is the last bind's;
 4. `id` is the relay's, `exp` is in the future.
+
+**Why host-bound only.** A bind proves that host key K signed session id
+S. With plain `publickey` the bytes to sign name S but not the server, and
+whoever holds the private key of K can sign any S, including the id of a
+session it opened with another server. A hostile host the user pinned and
+forwards the agent to, or a compromised agent machine holding a pinned
+host key, could then bind a session with a third server under K and get a
+login there displayed as a login to K. The host-bound method puts the
+server's host key in the signed bytes, the server checks it against its
+own, and step 3 checks it against the bind: what is shown is what the
+signature is good for. It needs OpenSSH 8.9 or later on both ends (client
+and server); there is no fallback for older ones. Agent and signer refuse
+the same requests (`testdata/hostbound.json`).
 
 It then shows the user name taken from `data`, and the last host key
 under the name **the signer itself** pinned for it — or as an unknown host
@@ -194,11 +209,11 @@ request that fails to open gets no response at all.
 
 ## Relay API
 
-Same origin as the page. JSON bodies, bearer tokens in `Authorization`.
+Same origin as the page, unless the relay does not serve it (`RELAY_SERVE_WEB=off`). JSON bodies, bearer tokens in `Authorization`. Only `GET`, `HEAD` and `POST` are used.
 
 | Method and path | Token | Purpose |
 |---|---|---|
-| `POST /api/channels` | enrolment secret | create a channel |
+| `POST /api/channels` | enrolment secret (closed enrolment) | create a channel |
 | `GET /api/ch/{ch}/pair` | pairing | fetch the hello |
 | `POST /api/ch/{ch}/pair` | pairing | enrol the signer (once) |
 | `GET /api/ch/{ch}/pair/answer?wait=` | agent | fetch the signer's answer |
@@ -221,10 +236,20 @@ pending set differs from it, so a request that stays on screen does not
 make the long-poll return in a loop. "Nothing yet" is `204`. Normal outcomes are `200` with a `state`
 (`queued`, `busy`, `duplicate`, `expired`, `unknown`, `accepted`, …);
 `401` and `400` mean a wrong token or a malformed call and are never
-retried by a client. `429` and `5xx` (from the relay or a proxy in front,
-whose body may be HTML) are retried with a growing pause. The page starts
-at most one call every 350 ms, whatever triggers it. Limits: 64 KiB per body, 8 pending requests per
-channel, 300 s maximum lifetime, 15 minutes to complete a pairing.
+retried by a client; a channel that was revoked or has expired answers
+`401` to everything, and its clients stop polling it. `429` and `5xx`
+(from the relay or a proxy in front, whose body may be HTML, as may a
+proxy's `413`) are retried with a growing pause, never shorter than
+`Retry-After` when present: the relay sends it with every `429` and with
+its own `503`. The page starts at most one call every 350 ms, whatever
+triggers it. Limits (defaults, each configurable on the relay): 32 KiB per
+body, 16 KiB per `msg`, 8 live and 32 stored requests per channel, 60
+requests per channel per minute, 4 devices per channel, 300 s maximum
+lifetime, 15 minutes to complete a pairing, 8 concurrent long-polls per
+token, 10 channels per client address per hour and 30 per day.
+
+`POST /api/channels` takes the relay's enrolment secret when the relay
+has closed enrolment; with open enrolment any token, or none, is accepted.
 
 The push is VAPID-signed, `aes128gcm`-encrypted, and its payload is the
 constant `{"t":"sign"}`: the notification says only that a request waits.
@@ -241,6 +266,13 @@ shown instead of adding one, so a device shows at most one per channel,
 and Apple never sees the channel id. A withdrawn request sends no push:
 the app clears its delivered notifications when opened. A token APNs reports dead (`410`, `BadDeviceToken`)
 is forgotten, like a Web Push subscription answering `404` or `410`.
+The relay sends at most one push per 10 seconds and 100 a day to one
+channel or one device; a request queued without a push says
+`"push": false`, and the device finds it at its next poll. A device
+(APNs token or Web Push endpoint) wakes for one channel only: registering
+it on another channel removes it from the first. A Web Push subscription
+whose `p256dh` is not a P-256 point or whose `auth` is not 16 bytes is
+refused with `400`.
 
 ## Several devices
 
@@ -441,6 +473,8 @@ relay's and the app's business, not part of this format.
 
 ## Agent behaviour worth knowing
 
+- It refuses a plain `publickey` login (OpenSSH before 8.9 on either end)
+  before contacting anyone, and logs why.
 - Default expiry 90 s (`--timeout`), under sshd's `LoginGraceTime`.
 - At most 4 requests wait at once; after a denial, requests fail
   immediately for 5 s.

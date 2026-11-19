@@ -3,8 +3,11 @@
 
 Run: python3 -m unittest discover -s relay
 """
+import collections
 import json
 import os
+import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -31,6 +34,9 @@ SIGNER = "c" * 16
 ENROLL, AGENT, PAIR, PHONE = "enroll-secret", "agent-token", "pair-token", "phone-token"
 APPLE = "https://web.push.apple.com/abc"
 TOKEN = "0123456789abcdef" * 4
+# A valid Web Push key pair, as a browser hands it over.
+KEYS = {"p256dh": R.b64u(R.raw_pub(ec.generate_private_key(ec.SECP256R1()))),
+        "auth": R.b64u(os.urandom(16))}
 
 
 class Clock:
@@ -56,6 +62,15 @@ class FakePush:
         return "fake push", self.gone
 
 
+def saved_state(state_dir):
+    """Everything the relay wrote to its database, as text."""
+    db = sqlite3.connect(os.path.join(state_dir, "state.db"))
+    try:
+        return "\n".join(f"{ch} {data}" for ch, data in db.execute("SELECT ch, data FROM channels"))
+    finally:
+        db.close()
+
+
 class RelayTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -63,6 +78,7 @@ class RelayTest(unittest.TestCase):
         self.clock = Clock()
         self.push = FakePush()
         self.relay = R.Relay(self.dir.name, ENROLL, self.push, self.clock)
+        self.addCleanup(self.relay.close)
 
     def create(self):
         return self.relay.create_channel(ENROLL, {
@@ -78,8 +94,7 @@ class RelayTest(unittest.TestCase):
             "id": rid, "to": SIGNER, "exp": self.clock.t + ttl, "msg": "sealed"})
 
     def saved_state(self):
-        with open(os.path.join(self.dir.name, "state.json"), encoding="utf-8") as f:
-            return f.read()
+        return saved_state(self.dir.name)
 
     # -- pairing --
 
@@ -136,6 +151,24 @@ class RelayTest(unittest.TestCase):
         self.relay.revoke(CH, PHONE)
         self.assertEqual(self.relay.get_reveal(CH, PHONE, wait=1)[0], 401)
 
+    def test_a_reveal_is_stored_and_wakes_only_its_own_channel(self):
+        self.pair()
+        other = "e" * 32
+        self.relay.create_channel(ENROLL, {
+            "ch": other, "agent_auth": R.digest("agent2"), "pair_auth": R.digest("pair2"), "hello": "hi"})
+        self.relay.post_pair(other, "pair2", {"signer": SIGNER, "signer_auth": R.digest("phone2"), "msg": "a"})
+        got = []
+        t = threading.Thread(target=lambda: got.append(self.relay.get_reveal(other, "phone2", wait=1)))
+        t.start()
+        time.sleep(0.1)
+        self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "N" * 43})
+        t.join(5)
+        # The other channel's device gets nothing: a reveal is per channel and device.
+        self.assertEqual(got, [(204, None)])
+        again = R.Relay(self.dir.name, ENROLL, self.push, self.clock)
+        self.assertEqual(again.get_reveal(CH, PHONE), (200, {"nonce": "N" * 43}))
+        self.assertEqual(again.get_reveal(other, "phone2"), (204, None))
+
     def test_an_unpaired_channel_expires(self):
         self.create()
         self.clock.t += R.PAIR_WINDOW + 1
@@ -158,7 +191,7 @@ class RelayTest(unittest.TestCase):
             with self.subTest(by=token):
                 self.pair()
                 self.relay.put_subscription(CH, PHONE, {
-                    "endpoint": "https://web.push.apple.com/x", "keys": {"p256dh": "k", "auth": "a"}})
+                    "endpoint": "https://web.push.apple.com/x", "keys": KEYS})
                 self.request()
                 self.assertEqual(self.relay.revoke(CH, token), (200, {"state": "revoked"}))
                 self.assertNotIn(CH, self.saved_state())
@@ -399,7 +432,7 @@ class RelayTest(unittest.TestCase):
 
     def test_subscription_must_point_to_a_known_push_service(self):
         self.pair()
-        keys = {"p256dh": "x", "auth": "y"}
+        keys = KEYS
         for endpoint in ("https://evil.example/x", "http://web.push.apple.com/x",
                          "https://push.apple.com.evil.example/x", None):
             self.assertEqual(self.relay.put_subscription(
@@ -411,7 +444,7 @@ class RelayTest(unittest.TestCase):
 
     def test_a_request_sends_a_content_free_push(self):
         self.pair()
-        self.relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": {"p256dh": "x", "auth": "y"}})
+        self.relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": KEYS})
         self.assertEqual(self.request(), (200, {"state": "queued", "push": True}))
         self.assertTrue(self.push.done.wait(5))
         self.assertEqual(self.push.sent, [(APPLE, {"t": "sign"})])
@@ -419,7 +452,7 @@ class RelayTest(unittest.TestCase):
     def test_a_gone_subscription_is_forgotten(self):
         self.pair()
         self.push.gone = True
-        self.relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": {"p256dh": "x", "auth": "y"}})
+        self.relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": KEYS})
         self.request()
         self.assertTrue(self.push.done.wait(5))
         # The push thread drops the subscription and saves; wait for the save.
@@ -453,7 +486,7 @@ class RelayTest(unittest.TestCase):
     def test_a_relay_without_apns_keeps_the_web_push_subscription(self):
         self.push.supports_apns = False
         self.pair()
-        self.relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": {"p256dh": "x", "auth": "y"}})
+        self.relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": KEYS})
         self.assertEqual(self.relay.put_subscription(CH, PHONE, {"apns": TOKEN, "sandbox": False}),
                          (200, {"state": "unsupported"}))
         self.assertIn(APPLE, self.saved_state())
@@ -709,6 +742,553 @@ class HttpTest(unittest.TestCase):
         expected = b"<p>Version " + R.VERSION.encode() + b"</p>"
         self.assertEqual(static["/"][1], expected)
         self.assertEqual(static["/index.html"][1], expected)
+
+
+class LimitsTest(unittest.TestCase):
+    """Enrolment modes, every limit, the lifecycle, and the audit's
+    proofs of concept turned into regression tests."""
+
+    def make(self, enroll=None, **limits):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.clock = Clock()
+        self.push = FakePush()
+        relay = R.Relay(self.dir.name, enroll, self.push, self.clock, R.Limits(**limits))
+        self.addCleanup(relay.close)
+        return relay
+
+    @staticmethod
+    def channel(relay, ch=CH, ip=None, token=None, agent=AGENT, pair=PAIR):
+        return relay.create_channel(token, {
+            "ch": ch, "agent_auth": R.digest(agent), "pair_auth": R.digest(pair), "hello": "hi"}, ip)
+
+    @classmethod
+    def paired(cls, relay, ch=CH, agent=AGENT, phone=PHONE):
+        cls.channel(relay, ch, agent=agent, pair="pair-" + ch)
+        relay.post_pair(ch, "pair-" + ch, {"signer": SIGNER, "signer_auth": R.digest(phone), "msg": "a"})
+
+    def request(self, relay, rid, ch=CH, msg="sealed", ttl=90):
+        return relay.post_request(ch, AGENT, {"id": rid, "to": SIGNER, "exp": self.clock.t + ttl,
+                                              "msg": msg})
+
+    # -- enrolment --
+
+    def test_open_enrolment_takes_any_token_or_none(self):
+        relay = self.make()
+        self.assertTrue(relay.open_enrolment)
+        self.assertEqual(self.channel(relay, "1" * 32, token=None), (200, {"state": "created"}))
+        self.assertEqual(self.channel(relay, "2" * 32, token=""), (200, {"state": "created"}))
+        self.assertEqual(self.channel(relay, "3" * 32, token="any old secret"), (200, {"state": "created"}))
+
+    def test_closed_enrolment_needs_the_secret(self):
+        relay = self.make(ENROLL)
+        self.assertFalse(relay.open_enrolment)
+        self.assertEqual(self.channel(relay, token=None)[0], 401)
+        self.assertEqual(self.channel(relay, token="wrong")[0], 401)
+        self.assertEqual(self.channel(relay, token=ENROLL), (200, {"state": "created"}))
+
+    def test_the_enrolment_mode_comes_from_the_environment(self):
+        self.assertIsNone(R.enrolment_secret({}))
+        self.assertIsNone(R.enrolment_secret({"RELAY_ENROLL_SECRET": ""}))
+        self.assertEqual(R.enrolment_secret({"RELAY_ENROLL_SECRET": "s"}), "s")
+        self.assertEqual(R.enrolment_secret({"RELAY_ENROLL_SECRET": "s", "RELAY_ENROLL": "closed"}), "s")
+        self.assertIsNone(R.enrolment_secret({"RELAY_ENROLL_SECRET": "s", "RELAY_ENROLL": "open"}))
+        for env in ({"RELAY_ENROLL": "closed"}, {"RELAY_ENROLL": "maybe", "RELAY_ENROLL_SECRET": "s"}):
+            with self.assertRaises(ValueError):
+                R.enrolment_secret(env)
+
+    def test_limits_come_from_the_environment(self):
+        self.assertEqual(R.Limits.from_env({}), R.Limits())
+        limits = R.Limits.from_env({"RELAY_MAX_DEVICES": "2", "RELAY_TRUSTED_PROXIES": "0",
+                                    "RELAY_PUSH_INTERVAL": "", "RELAY_OTHER": "x"})
+        self.assertEqual((limits.max_devices, limits.trusted_proxies, limits.push_interval), (2, 0, 10))
+        for env in ({"RELAY_MAX_DEVICES": "two"}, {"RELAY_MAX_DEVICES": "0"},
+                    {"RELAY_TRUSTED_PROXIES": "-1"}):
+            with self.assertRaises(ValueError):
+                R.Limits.from_env(env)
+        self.assertTrue(R.on_off({}, "RELAY_SERVE_WEB"))
+        self.assertFalse(R.on_off({"RELAY_SERVE_WEB": "off"}, "RELAY_SERVE_WEB"))
+        self.assertFalse(R.on_off({"RELAY_SERVE_WEB": "Off "}, "RELAY_SERVE_WEB"))
+
+    # -- channels --
+
+    def test_channels_per_address_per_hour_and_per_day(self):
+        relay = self.make(channels_per_ip_hour=2, channels_per_ip_day=3)
+        ip = "192.0.2.1"
+        self.assertEqual(self.channel(relay, "1" * 32, ip)[1]["state"], "created")
+        self.assertEqual(self.channel(relay, "1" * 32, ip)[1]["state"], "exists")   # not counted
+        self.assertEqual(self.channel(relay, "2" * 32, ip)[1]["state"], "created")
+        status, body = self.channel(relay, "3" * 32, ip)
+        self.assertEqual(status, 429)
+        self.assertTrue(3500 < body["retry_after"] <= 3600)
+        self.assertEqual(self.channel(relay, "3" * 32, "192.0.2.2")[1]["state"], "created")
+        self.clock.t += 3601
+        self.assertEqual(self.channel(relay, "4" * 32, ip)[1]["state"], "created")
+        status, body = self.channel(relay, "5" * 32, ip)
+        self.assertEqual(status, 429)
+        self.assertTrue(body["retry_after"] > 3600)   # the daily cap
+        self.clock.t += 86400
+        self.assertEqual(self.channel(relay, "5" * 32, ip)[1]["state"], "created")
+
+    def test_the_global_safety_cap(self):
+        relay = self.make(max_channels=2)
+        for ch in ("1" * 32, "2" * 32):
+            self.assertEqual(self.channel(relay, ch)[1]["state"], "created")
+        self.assertEqual(self.channel(relay, "3" * 32), (200, {"state": "full"}))
+
+    def test_devices_per_channel(self):
+        relay = self.make(max_devices=1)
+        self.paired(relay)
+        self.assertEqual(relay.open_pairing(CH, AGENT, {"pair_auth": R.digest("p2"), "hello": "h"}),
+                         (200, {"state": "full"}))
+
+    def test_an_idle_channel_expires_paired_or_not(self):
+        relay = self.make(channel_idle_days=90)
+        self.paired(relay, "1" * 32)
+        self.paired(relay, "2" * 32, agent="agent2", phone="phone2")
+        self.clock.t += 60 * 86400
+        self.assertEqual(relay.get_requests("2" * 32, "phone2")[0], 200)   # in use
+        self.clock.t += 31 * 86400
+        self.channel(relay, "3" * 32)   # any creation sweeps
+        self.assertEqual(relay.get_requests("1" * 32, PHONE)[0], 401)
+        self.assertNotIn("1" * 32, saved_state(self.dir.name))
+        self.assertEqual(relay.get_requests("2" * 32, "phone2")[0], 200)
+        # Activity is on disk too, so it survives a restart.
+        self.clock.t += ACTIVITY_GRAIN_PLUS
+        relay.get_requests("2" * 32, "phone2")
+        again = R.Relay(self.dir.name, None, self.push, self.clock)
+        self.addCleanup(again.close)
+        self.assertEqual(again.channels["2" * 32]["last_active"], int(self.clock.t))
+
+    def test_the_hello_is_not_kept_after_the_pairing_window(self):
+        relay = self.make()
+        self.paired(relay)
+        self.clock.t += R.PAIR_WINDOW + R.SWEEP_EVERY + 1
+        self.channel(relay, "3" * 32)
+        self.assertIsNone(relay.channels[CH]["hello"])
+        self.assertIsNone(relay.channels[CH]["answer"])
+        self.assertNotIn('"hi"', saved_state(self.dir.name).split("\n")[0])
+
+    def test_poc_filling_the_relay_with_channels(self):
+        """Audit H3: 1000 paired channels used to lock out every new pairing
+        for good. Now one address is stopped early, the cap is a high
+        safety net, and idle channels go."""
+        relay = self.make(max_channels=50)
+        created = 0
+        for i in range(1, 100):
+            status, body = self.channel(relay, f"{i:032x}", ip="198.51.100.7", pair="p")
+            if status == 429:
+                break
+            relay.post_pair(f"{i:032x}", "p", {"signer": SIGNER, "signer_auth": R.digest("s"), "msg": "m"})
+            created += 1
+        self.assertEqual(created, R.Limits().channels_per_ip_hour)
+        # Many addresses reach the safety cap...
+        for i in range(100, 200):
+            if self.channel(relay, f"{i:032x}", ip=f"203.0.113.{i - 99}", pair="p")[1]["state"] == "full":
+                break
+            relay.post_pair(f"{i:032x}", "p", {"signer": SIGNER, "signer_auth": R.digest("s"), "msg": "m"})
+        self.assertEqual(len(relay.channels), 50)
+        self.assertEqual(self.channel(relay, "f" * 32, ip="192.0.2.9"), (200, {"state": "full"}))
+        # ...and idle expiry frees it without the operator.
+        self.clock.t += 91 * 86400
+        self.assertEqual(self.channel(relay, "f" * 32, ip="192.0.2.9"), (200, {"state": "created"}))
+
+    # -- requests --
+
+    def test_requests_per_channel_per_minute(self):
+        relay = self.make(requests_per_minute=3)
+        self.paired(relay)
+        for i in range(3):
+            self.assertEqual(self.request(relay, f"{i:032x}")[1]["state"], "queued")
+        status, body = self.request(relay, "f" * 32)
+        self.assertEqual((status, body["retry_after"]), (429, 60))
+        self.clock.t += 61
+        self.assertEqual(self.request(relay, "f" * 32)[1]["state"], "queued")
+
+    def test_messages_are_capped(self):
+        relay = self.make(max_msg=100)
+        self.paired(relay)
+        self.assertEqual(self.request(relay, RID, msg="x" * 101)[0], 400)
+        self.assertEqual(self.request(relay, RID, msg="x" * 100)[1]["state"], "queued")
+        self.assertEqual(relay.post_response(CH, PHONE, RID, {"msg": "y" * 101})[0], 400)
+        self.assertEqual(relay.post_response(CH, PHONE, RID, {"msg": "y" * 100})[1]["state"], "accepted")
+        self.assertEqual(R.Limits().max_msg, 16 * 1024)
+
+    def test_the_global_budget_for_pending_data(self):
+        relay = self.make(pending_budget=250)
+        self.paired(relay)
+        self.assertEqual(self.request(relay, "1" * 32, msg="x" * 200)[1]["state"], "queued")
+        status, body = self.request(relay, "2" * 32, msg="x" * 100)
+        self.assertEqual((status, body["retry_after"]), (503, 5))
+        relay.cancel(CH, AGENT, "1" * 32)   # frees its bytes at once
+        self.assertEqual(relay.pending_bytes, 0)
+        self.assertEqual(self.request(relay, "2" * 32, msg="x" * 100)[1]["state"], "queued")
+
+    def test_every_stored_entry_counts_and_data_is_dropped(self):
+        relay = self.make(max_entries=4, max_pending=8, requests_per_minute=1000)
+        self.paired(relay)
+        self.request(relay, "1" * 32)
+        relay.cancel(CH, AGENT, "1" * 32)
+        self.assertIsNone(relay.pending[CH]["1" * 32]["msg"])   # cancelled: msg dropped
+        self.request(relay, "2" * 32)
+        relay.post_response(CH, PHONE, "2" * 32, {"msg": "signed"})
+        self.assertIsNone(relay.pending[CH]["2" * 32]["msg"])   # answered: msg dropped
+        self.assertEqual(relay.get_response(CH, AGENT, "2" * 32)[1]["msg"], "signed")
+        self.request(relay, "3" * 32)
+        self.request(relay, "4" * 32)
+        self.assertEqual(self.request(relay, "5" * 32), (200, {"state": "busy"}))
+        # Kept KEEP_AFTER_EXPIRY past their expiry, then gone.
+        self.clock.t += 90 + R.KEEP_AFTER_EXPIRY + 1
+        self.assertEqual(self.request(relay, "5" * 32)[1]["state"], "queued")
+        self.assertEqual(list(relay.pending[CH]), ["5" * 32])
+        self.assertEqual(relay.pending_bytes, len("sealed"))
+
+    def test_poc_cancel_loop_no_longer_grows_memory(self):
+        """Audit H4: post then cancel, 2000 times with 60 KB each, used to
+        hold 2000 entries and 120 MB."""
+        relay = self.make(max_msg=60000, requests_per_minute=10 ** 6)
+        self.paired(relay)
+        big = "A" * 60000
+        states = collections.Counter()
+        for i in range(2000):
+            rid = f"{i:032x}"
+            states[self.request(relay, rid, msg=big)[1]["state"]] += 1
+            relay.cancel(CH, AGENT, rid)
+        self.assertEqual(states["queued"], R.Limits().max_entries)
+        self.assertEqual(states["busy"], 2000 - R.Limits().max_entries)
+        self.assertLessEqual(len(relay.pending[CH]), R.Limits().max_entries)
+        self.assertEqual(relay.pending_bytes, 0)
+        # Answering instead of cancelling holds no request bytes either.
+        relay2 = self.make(requests_per_minute=10 ** 6)
+        self.paired(relay2)
+        for i in range(100):
+            rid = f"{i:032x}"
+            if self.request(relay2, rid, msg="x" * 16000)[1]["state"] == "queued":
+                relay2.post_response(CH, PHONE, rid, {"msg": "y" * 100})
+        self.assertLessEqual(len(relay2.pending[CH]), R.Limits().max_entries)
+        self.assertEqual(relay2.pending_bytes, 100 * len(relay2.pending[CH]))
+        # And with the default rate limit, the loop is stopped at once anyway.
+        relay3 = self.make()
+        self.paired(relay3)
+        codes = [self.request(relay3, f"{i:032x}")[0] for i in range(100)]
+        self.assertEqual(codes.count(429), 100 - R.Limits().requests_per_minute)
+
+    # -- push --
+
+    def subscribe(self, relay, ch=CH, phone=PHONE, token=TOKEN):
+        return relay.put_subscription(ch, phone, {"apns": token, "sandbox": False})
+
+    def wait_pushes(self, n):
+        for _ in range(250):
+            if len(self.push.sent) >= n:
+                break
+            threading.Event().wait(0.02)
+        threading.Event().wait(0.05)
+        return len(self.push.sent)
+
+    def test_pushes_per_interval_and_per_day(self):
+        relay = self.make(push_interval=10, push_per_day=3, requests_per_minute=1000)
+        self.paired(relay)
+        self.subscribe(relay)
+        pushed = []
+        for i in range(6):
+            rid = f"{i:032x}"
+            pushed.append(self.request(relay, rid)[1]["push"])
+            relay.cancel(CH, AGENT, rid)
+            pushed.append(self.request(relay, "f" * 31 + str(i))[1]["push"])   # within 10 s
+            relay.cancel(CH, AGENT, "f" * 31 + str(i))
+            self.clock.t += 11
+        self.assertEqual(pushed, [True, False] * 3 + [False, False] * 3)
+        self.assertEqual(self.wait_pushes(3), 3)
+
+    def test_pushes_are_limited_per_device_across_channels(self):
+        relay = self.make(push_interval=10, requests_per_minute=1000)
+        self.paired(relay, "1" * 32)
+        self.paired(relay, "2" * 32, phone="phone2")
+        self.subscribe(relay, "1" * 32)
+        self.assertTrue(self.request(relay, "1" * 32, ch="1" * 32)[1]["push"])
+        # The same device token registered on another channel moves there...
+        self.subscribe(relay, "2" * 32, "phone2")
+        self.assertIsNone(relay.channels["1" * 32]["signers"][SIGNER]["sub"])
+        self.assertEqual(relay.channels["2" * 32]["signers"][SIGNER]["sub"]["apns"], TOKEN)
+        self.assertNotIn(TOKEN, saved_state(self.dir.name).split("\n")[0])
+        self.assertFalse(self.request(relay, "2" * 32, ch="1" * 32)[1]["push"])
+        # ...and keeps its own push budget: no second push within 10 s.
+        self.assertFalse(self.request(relay, "3" * 32, ch="2" * 32)[1]["push"])
+        self.clock.t += 11
+        self.assertTrue(self.request(relay, "4" * 32, ch="2" * 32)[1]["push"])
+
+    def test_poc_junk_token_cannot_make_the_relay_hammer_apns(self):
+        """Audit M3: a junk (or someone else's) token and a request loop
+        used to send one push, on its own thread, per request."""
+        relay = self.make(requests_per_minute=10 ** 6)
+        self.paired(relay)
+        self.assertEqual(self.subscribe(relay, token="ee" * 32), (200, {"state": "stored"}))
+        threads = threading.active_count()
+        for i in range(200):
+            rid = f"{i:032x}"
+            self.request(relay, rid)
+            relay.cancel(CH, AGENT, rid)
+        self.assertEqual(self.wait_pushes(1), 1)
+        self.assertLessEqual(threading.active_count(), threads + R.Limits().push_workers)
+
+    def test_the_push_queue_is_bounded(self):
+        q = R.PushQueue(1, 1)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def slow():
+            started.set()
+            gate.wait(5)
+        self.assertTrue(q.submit(slow))
+        started.wait(5)
+        self.assertTrue(q.submit(slow))    # waits in the queue
+        self.assertFalse(q.submit(slow))   # dropped
+        gate.set()
+
+    def test_web_push_keys_are_checked_at_subscription(self):
+        relay = self.make()
+        self.paired(relay)
+        point = R.b64u(b"\x04" + b"\x01" * 64)   # 65 bytes, not on the curve
+        for keys in ({"p256dh": "x", "auth": "y"}, {"p256dh": KEYS["p256dh"], "auth": "y"},
+                     {"p256dh": point, "auth": KEYS["auth"]},
+                     {"p256dh": KEYS["p256dh"], "auth": R.b64u(os.urandom(17))},
+                     {"p256dh": KEYS["p256dh"] + "!", "auth": KEYS["auth"]},
+                     {"p256dh": KEYS["p256dh"]}, None, "keys"):
+            self.assertEqual(relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": keys})[0],
+                             400, keys)
+        self.assertEqual(relay.put_subscription(CH, PHONE, {"endpoint": APPLE + "x" * 1024,
+                                                            "keys": KEYS})[0], 400)
+        padded = {"p256dh": KEYS["p256dh"] + "=", "auth": KEYS["auth"] + "=="}
+        self.assertEqual(relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": padded}),
+                         (200, {"state": "stored"}))
+
+    # -- long-polls --
+
+    def test_concurrent_long_polls_per_token_and_per_address(self):
+        relay = self.make(polls_per_token=2, polls_per_ip=3)
+        a = relay.acquire_poll("t1", "192.0.2.1")
+        b = relay.acquire_poll("t1", "192.0.2.1")
+        self.assertIsNone(relay.acquire_poll("t1", "192.0.2.2"))   # token at its limit
+        c = relay.acquire_poll("t2", "192.0.2.1")
+        self.assertIsNone(relay.acquire_poll("t3", "192.0.2.1"))   # address at its limit
+        self.assertIsNotNone(relay.acquire_poll("t3", "192.0.2.2"))
+        a()
+        self.assertIsNotNone(relay.acquire_poll("t1", "192.0.2.3"))
+        b(), c()
+        self.assertIsNotNone(relay.acquire_poll("t4", "192.0.2.1"))
+
+    # -- storage --
+
+    def test_the_old_json_state_is_imported_once(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        old = {"channels": {CH: {"agent_auth": R.digest(AGENT), "pair_auth": None, "hello": "",
+                                 "answer": None, "created": 1, "pair_until": 901,
+                                 "signers": {SIGNER: {"auth": R.digest(PHONE), "sub": None}}}}}
+        with open(os.path.join(self.dir.name, "state.json"), "w", encoding="utf-8") as f:
+            json.dump(old, f)
+        relay = R.Relay(self.dir.name, None, FakePush(), Clock())
+        self.addCleanup(relay.close)
+        self.assertEqual(relay.get_requests(CH, PHONE), (200, {"requests": []}))
+        self.assertFalse(os.path.exists(os.path.join(self.dir.name, "state.json")))
+        self.assertTrue(os.path.exists(os.path.join(self.dir.name, "state.json.migrated")))
+        self.assertIn(CH, saved_state(self.dir.name))
+        self.assertEqual(os.stat(os.path.join(self.dir.name, "state.db")).st_mode & 0o077, 0)
+        db = sqlite3.connect(os.path.join(self.dir.name, "state.db"))
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_an_event_wakes_only_its_own_channel(self):
+        relay = self.make()
+        self.paired(relay, "1" * 32)
+        self.assertIsNot(relay._cond("1" * 32), relay._cond("2" * 32))
+        wakes = []
+        cond = relay._cond("2" * 32)
+        original = cond.wait
+        cond.wait = lambda t=None: (wakes.append(1), original(t))[1]
+        self.paired(relay, "2" * 32, agent="agent2", phone="phone2")
+        waiter = threading.Thread(target=relay.get_requests, args=("2" * 32, "phone2", 0.5, set()))
+        waiter.start()
+        threading.Event().wait(0.1)
+        self.request(relay, "1" * 32, ch="1" * 32)   # another channel: no wake-up
+        waiter.join(5)
+        self.assertEqual(len(wakes), 1)
+
+
+ACTIVITY_GRAIN_PLUS = R.ACTIVITY_GRAIN + 1
+
+
+class ClientAddressTest(unittest.TestCase):
+    def test_the_peer_unless_proxies_are_trusted(self):
+        self.assertEqual(R.client_address("192.0.2.1", "198.51.100.1", 0), "192.0.2.1")
+        self.assertEqual(R.client_address("10.0.0.1", "198.51.100.1", 1), "198.51.100.1")
+        # A client cannot spoof by sending its own header: proxies append.
+        self.assertEqual(R.client_address("10.0.0.1", "6.6.6.6, 198.51.100.1", 1), "198.51.100.1")
+        self.assertEqual(R.client_address("10.0.0.1", "6.6.6.6, 198.51.100.1, 10.0.0.2", 2),
+                         "198.51.100.1")
+        self.assertEqual(R.client_address("10.0.0.1", None, 1), "10.0.0.1")
+        self.assertEqual(R.client_address("10.0.0.1", "junk", 1), "10.0.0.1")
+
+    def test_a_proxy_set_header_fails_closed(self):
+        self.assertEqual(R.header_address("8.8.4.4"), "8.8.4.4")
+        self.assertEqual(R.header_address(" 2606:4700::1 "), "2606:4700::/64")
+        for value in (None, "", "junk", "10.0.0.1", "192.168.1.1", "127.0.0.1", "::1",
+                      "169.254.1.1", "fe80::1", "0.0.0.0", "8.8.4.4, 1.1.1.1"):
+            self.assertEqual(R.header_address(value), R.UNKNOWN_CLIENT, value)
+
+    def test_ipv6_counts_by_64(self):
+        self.assertEqual(R.client_address("2001:db8:1:2:3:4:5:6", None, 0), "2001:db8:1:2::/64")
+        self.assertEqual(R.client_address("2001:db8:1:2::9", None, 0), "2001:db8:1:2::/64")
+        self.assertEqual(R.client_address("::ffff:192.0.2.1", None, 0), "192.0.2.1")
+
+
+class HttpLimitsTest(unittest.TestCase):
+    def start(self, enroll=None, serve_web=True, ip_header=None, **limits):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        web = os.path.join(self.dir.name, "web")
+        os.makedirs(web)
+        with open(os.path.join(web, "index.html"), "w", encoding="utf-8") as f:
+            f.write("<!doctype html>")
+        server = R.serve("127.0.0.1", 0, os.path.join(self.dir.name, "state"), enroll, web,
+                         "mailto:test@example.com", False, serve_web=serve_web,
+                         limits=R.Limits(**limits), ip_header=ip_header)
+        self.port = server.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    call = HttpTest.call
+
+    def create(self, ch=CH, token=None, headers=None):
+        body = json.dumps({"ch": ch, "agent_auth": R.digest(AGENT), "pair_auth": R.digest(PAIR),
+                           "hello": "hi"}).encode()
+        req = urllib.request.Request(self.base + "/api/channels", data=body, method="POST",
+                                     headers={**({"Authorization": f"Bearer {token}"} if token else {}),
+                                              **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.headers, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, json.loads(e.read())
+
+    def test_open_enrolment_over_http_and_429_with_retry_after(self):
+        self.start(channels_per_ip_hour=1)
+        self.assertEqual(self.create()[2], {"state": "created"})   # no Authorization at all
+        status, headers, body = self.create("1" * 32, token="whatever")
+        self.assertEqual(status, 429)
+        self.assertEqual(headers["Retry-After"], str(body["retry_after"]))
+
+    def test_closed_enrolment_over_http(self):
+        self.start(ENROLL)
+        self.assertEqual(self.create()[0], 401)
+        self.assertEqual(self.create(token=ENROLL)[2], {"state": "created"})
+
+    def test_forwarded_for_is_used_only_behind_trusted_proxies(self):
+        self.start(channels_per_ip_hour=1, trusted_proxies=1)
+        self.assertEqual(self.create("1" * 32, headers={"X-Forwarded-For": "192.0.2.1"})[0], 200)
+        self.assertEqual(self.create("2" * 32, headers={"X-Forwarded-For": "192.0.2.1"})[0], 429)
+        self.assertEqual(self.create("3" * 32, headers={"X-Forwarded-For": "192.0.2.2"})[0], 200)
+        self.start(channels_per_ip_hour=1)   # no trusted proxy: the header is ignored
+        self.assertEqual(self.create("1" * 32, headers={"X-Forwarded-For": "192.0.2.1"})[0], 200)
+        self.assertEqual(self.create("2" * 32, headers={"X-Forwarded-For": "192.0.2.2"})[0], 429)
+
+    def test_the_client_address_header_is_the_only_source_when_set(self):
+        self.start(channels_per_ip_hour=1, trusted_proxies=1, ip_header="X-Real-IP")
+        h = {"X-Real-IP": "8.8.4.4", "X-Forwarded-For": "9.9.9.9"}
+        self.assertEqual(self.create("1" * 32, headers=h)[0], 200)
+        self.assertEqual(self.create("2" * 32, headers={**h, "X-Forwarded-For": "1.1.1.1"})[0], 429)
+        self.assertEqual(self.create("3" * 32, headers={"X-Real-IP": "8.8.8.8"})[0], 200)
+        # Missing or private: one shared bucket, never the forwarded header.
+        self.assertEqual(self.create("4" * 32, headers={"X-Forwarded-For": "1.1.1.1"})[0], 200)
+        for headers in ({}, {"X-Real-IP": "10.1.2.3"}, {"X-Real-IP": "127.0.0.1"},
+                        {"X-Real-IP": "fe80::1"}, {"X-Real-IP": "junk"}):
+            self.assertEqual(self.create("5" * 32, headers=headers)[0], 429, headers)
+
+    def test_the_body_is_capped(self):
+        self.start(max_body=1024)
+        status = self.call("POST", "/api/channels", raw=b'{"x":"' + b"a" * 1100 + b'"}')[0]
+        self.assertEqual(status, 400)
+
+    def test_long_polls_over_their_limit_get_429(self):
+        server = self.start(polls_per_token=1)
+        relay = server.relay
+        relay.create_channel(None, {"ch": CH, "agent_auth": R.digest(AGENT),
+                                    "pair_auth": R.digest(PAIR), "hello": "hi"})
+        relay.post_pair(CH, PAIR, {"signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "a"})
+        first = threading.Thread(target=self.call, args=(
+            "GET", f"/api/ch/{CH}/requests?wait=2&known=", None, PHONE))
+        first.start()
+        threading.Event().wait(0.3)
+        status, headers, _ = self.call("GET", f"/api/ch/{CH}/requests?wait=2&known=", token=PHONE)
+        self.assertEqual((status, headers["Retry-After"]), (429, "10"))
+        self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests", token=PHONE)[0], 200)   # no wait
+        first.join(5)
+        self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests?wait=0.1&known=", token=PHONE)[0], 200)
+
+    def test_the_reveal_over_http_and_within_the_limits(self):
+        server = self.start(polls_per_token=1, max_body=1024)
+        relay = server.relay
+        relay.create_channel(None, {"ch": CH, "agent_auth": R.digest(AGENT),
+                                    "pair_auth": R.digest(PAIR), "hello": "hi"})
+        relay.post_pair(CH, PAIR, {"signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "a"})
+        path = f"/api/ch/{CH}/pair/reveal"
+        # Tokens: the agent posts, the device reads; nobody else.
+        self.assertEqual(self.call("GET", path, token=PHONE)[0], 204)
+        self.assertEqual(self.call("GET", path, token=AGENT)[0], 401)
+        self.assertEqual(self.call("GET", path, token=PAIR)[0], 401)
+        self.assertEqual(self.call("POST", path, token=PHONE, body={"signer": SIGNER, "nonce": "N" * 43})[0], 401)
+        self.assertEqual(self.call("POST", path, token=AGENT, body={"signer": SIGNER, "nonce": "x"})[0], 400)
+        # The body cap applies as on every route.
+        self.assertEqual(self.call("POST", path, token=AGENT, raw=b'{"x":"' + b"a" * 1100 + b'"}')[0], 400)
+        # The long-poll counts against the token's slots.
+        first = threading.Thread(target=self.call, args=("GET", f"{path}?wait=2", None, PHONE))
+        first.start()
+        threading.Event().wait(0.3)
+        self.assertEqual(self.call("GET", f"{path}?wait=2", token=PHONE)[0], 429)
+        status, _, body = self.call("POST", path, token=AGENT, body={"signer": SIGNER, "nonce": "N" * 43})
+        self.assertEqual((status, json.loads(body)), (200, {"state": "revealed"}))
+        first.join(5)
+        status, _, body = self.call("GET", f"{path}?wait=1", token=PHONE)
+        self.assertEqual((status, json.loads(body)), (200, {"nonce": "N" * 43}))
+
+    def test_without_the_page_only_the_api_and_health_answer(self):
+        self.start(serve_web=False)
+        self.assertEqual(self.call("GET", "/")[0], 404)
+        self.assertEqual(self.call("GET", "/index.html")[0], 404)
+        self.assertEqual(self.call("GET", "/favicon.ico")[0], 404)
+        self.assertEqual(json.loads(self.call("GET", "/healthz")[2]), {"ok": True})
+        self.assertEqual(self.create()[2], {"state": "created"})
+        self.start(serve_web=True)
+        self.assertEqual(self.call("GET", "/")[0], 200)
+        self.assertEqual(json.loads(self.call("GET", "/healthz")[2]), {"ok": True})
+
+    def test_a_silent_client_is_dropped(self):
+        self.start(socket_timeout=1)
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(b"POST /api/channels HTTP/1.1\r\nContent-Length: 100\r\n\r\n{")
+            started = time.monotonic()
+            self.assertEqual(s.recv(100), b"")   # closed by the server
+            self.assertLess(time.monotonic() - started, 4)
+
+    def test_connections_are_capped(self):
+        self.start(max_connections=1, socket_timeout=5)
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as idle:
+            idle.sendall(b"GET /healthz HTTP/1.1\r\n")   # holds the only slot
+            threading.Event().wait(0.2)
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                self.assertTrue(s.recv(100).startswith(b"HTTP/1.1 503"))
+        for _ in range(50):   # the slot comes back once the first one is gone
+            try:
+                if self.call("GET", "/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            threading.Event().wait(0.1)
+        self.assertEqual(self.call("GET", "/healthz")[0], 200)
 
 
 if __name__ == "__main__":

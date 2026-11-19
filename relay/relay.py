@@ -3,7 +3,7 @@
 
 Carries opaque messages between a key-less SSH agent and the phone that
 signs, wakes the phone with a content-free Web Push (the page) or APNs
-notification (the iOS app), and serves the approval page from the same
+notification (the iOS app), and can serve the approval page from the same
 origin (the passkey is bound to that host).
 
 The relay is untrusted: it never sees a key or a destination, it can only
@@ -16,15 +16,23 @@ follow from that:
 
 - a normal situation never answers 4xx (a proxy may ban a client after a
   burst of them): "nothing yet" is 204, "expired" or "unknown" is 200 with
-  a `state` field; 4xx is kept for real errors (bad token, bad request);
+  a `state` field; 4xx is kept for real errors (bad token, bad request)
+  and for a client over its limits (429, with Retry-After);
 - identifiers in URLs are lowercase hexadecimal, nothing free-form;
 - the service sends its own Content-Security-Policy and Permissions-Policy.
 
 Configuration (environment):
-  RELAY_ENROLL_SECRET  required; allows an agent to create a channel
   RELAY_STATE_DIR      required; the only directory written to
+  RELAY_ENROLL_SECRET  optional; when set, an agent needs it to create a
+                       channel (closed enrolment)
+  RELAY_ENROLL         "open" forces open enrolment (no secret checked),
+                       "closed" requires RELAY_ENROLL_SECRET; default:
+                       closed when a secret is set, open otherwise
   RELAY_BIND           listen address, default 127.0.0.1
   RELAY_PORT           default 8765
+  RELAY_SERVE_WEB      "on" (default) serves the approval page; "off" serves
+                       the API only (a public relay keeps the page that
+                       handles keys on another origin)
   RELAY_WEB_DIR        approval page, default ../web next to this file
   RELAY_VAPID_SUB      VAPID contact, default mailto:webpush@example.com
   RELAY_PUSH           "on" (default) or "off" (log instead of sending)
@@ -34,16 +42,63 @@ Configuration (environment):
   RELAY_APNS_TEAM_ID   the developer team id (10 characters)
   RELAY_APNS_TOPIC     the app's bundle id, default org.clavix.approve
 
+Client address (what the per-address limits count against):
+  RELAY_CLIENT_IP_HEADER      a header set by the reverse proxy to the
+                              client's address, overwriting what the client
+                              sent (e.g. X-Real-IP); when set, it is the only
+                              source. Missing, malformed, private, loopback
+                              or link-local values all count as one shared
+                              address ("unknown"): never a way around limits
+  RELAY_TRUSTED_PROXIES       without that header: reverse proxies in front
+                              that append to X-Forwarded-For, read from the
+                              right; 0 (default) uses the peer address
+
+Limits (environment, positive integers; see Limits below for each default):
+  RELAY_CHANNELS_PER_IP_HOUR  channels one client address may create per
+  RELAY_CHANNELS_PER_IP_DAY   hour (10) and per day (30); IPv6 by /64
+  RELAY_MAX_CHANNELS          global safety cap on channels (100000)
+  RELAY_CHANNEL_IDLE_DAYS     a channel unused that long is deleted (90)
+  RELAY_MAX_DEVICES           devices paired on one channel (4)
+  RELAY_REQUESTS_PER_MINUTE   requests one channel may post per minute (60)
+  RELAY_MAX_PENDING           live requests waiting on one channel (8)
+  RELAY_MAX_ENTRIES           requests stored on one channel, answered,
+                              cancelled and expired ones included (32)
+  RELAY_MAX_MSG               bytes of one request or response msg (16384)
+  RELAY_MAX_BODY              bytes of one HTTP request body (32768)
+  RELAY_PENDING_BUDGET        bytes of request and response data held in
+                              memory across all channels (67108864)
+  RELAY_PUSH_INTERVAL         seconds between two pushes to one channel or
+                              one device (10)
+  RELAY_PUSH_PER_DAY          pushes to one channel or one device per day (100)
+  RELAY_PUSH_WORKERS          threads sending pushes (4)
+  RELAY_PUSH_QUEUE            pushes waiting to be sent; more are dropped (1000)
+  RELAY_POLLS_PER_TOKEN       concurrent long-polls per token (8)
+  RELAY_POLLS_PER_IP          concurrent long-polls per client address (64)
+  RELAY_MAX_CONNECTIONS       concurrent connections; more get 503 (512)
+  RELAY_SOCKET_TIMEOUT        seconds a client may stay silent mid-request (30)
+
+State: RELAY_STATE_DIR/state.db (SQLite, WAL), one row per channel,
+written when that channel changes. A state.json left by an older version
+is imported on first start and renamed state.json.migrated. Pending
+requests live in memory only.
+
 Usage: relay.py              run the service
        relay.py --selftest   check the push encryption offline
        relay.py --healthcheck  exit 0 when the local service answers
 """
 import base64
+import binascii
+import collections
+import dataclasses
 import hashlib
 import hmac
+import ipaddress
 import json
+import math
 import os
+import queue
 import re
+import sqlite3
 import struct
 import sys
 import threading
@@ -70,16 +125,21 @@ KNOWN_RE = re.compile(r"^([0-9a-f]{32}(,[0-9a-f]{32}){0,31})?$")
 # An APNs device token: 32 bytes today, Apple says the length may grow.
 APNS_TOKEN_RE = re.compile(r"^(?:[0-9a-f]{2}){32,100}$")
 APNS_ID_RE = re.compile(r"^[0-9A-Z]{10}$")
+B64U_RE = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
 
-MAX_BODY = 64 * 1024        # one HTTP request body
+# Fixed by the protocol. The tunable limits are in Limits.
+MAX_BODY = 32 * 1024        # one HTTP request body (default of RELAY_MAX_BODY)
+MAX_MSG = 16 * 1024         # one request or response (default of RELAY_MAX_MSG)
 MAX_BLOB = 8 * 1024         # pairing hello / answer
-MAX_PENDING = 8             # sign requests waiting on one channel
+MAX_PENDING = 8             # live sign requests on one channel (default)
+MAX_SIGNERS = 4             # devices paired on one channel (default)
 MAX_TTL = 300               # seconds a sign request may ask to live
 MAX_WAIT = 25               # long-poll cap, under usual proxy read timeouts
-MAX_CHANNELS = 1000
-MAX_SIGNERS = 4             # devices paired on one channel
+MAX_ENDPOINT = 1024         # a Web Push endpoint URL
 PAIR_WINDOW = 900           # seconds to complete a pairing
 KEEP_AFTER_EXPIRY = 60      # an agent can still learn "expired" that long
+ACTIVITY_GRAIN = 3600       # last activity is written to disk at most this often
+SWEEP_EVERY = 60            # seconds between two sweeps of expired state
 
 # Only known push services are contacted: the subscription comes from a client.
 PUSH_HOSTS = (".push.apple.com", "fcm.googleapis.com", ".push.services.mozilla.com",
@@ -126,6 +186,145 @@ def unb64u(s):
 
 def digest(token):
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+# ---- Limits -----------------------------------------------------------------
+
+@dataclasses.dataclass
+class Limits:
+    """Every tunable limit. Field `x` is read from RELAY_X (upper case)."""
+    trusted_proxies: int = 0
+    channels_per_ip_hour: int = 10
+    channels_per_ip_day: int = 30
+    max_channels: int = 100_000
+    channel_idle_days: int = 90
+    max_devices: int = MAX_SIGNERS
+    requests_per_minute: int = 60
+    max_pending: int = MAX_PENDING
+    max_entries: int = 32
+    max_msg: int = MAX_MSG
+    max_body: int = MAX_BODY
+    pending_budget: int = 64 * 1024 * 1024
+    push_interval: int = 10
+    push_per_day: int = 100
+    push_workers: int = 4
+    push_queue: int = 1000
+    polls_per_token: int = 8
+    polls_per_ip: int = 64
+    max_connections: int = 512
+    socket_timeout: int = 30
+
+    @classmethod
+    def from_env(cls, env):
+        values = {}
+        for f in dataclasses.fields(cls):
+            raw = env.get("RELAY_" + f.name.upper())
+            if raw is None or raw == "":
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"RELAY_{f.name.upper()} must be an integer") from None
+            if value < (0 if f.name == "trusted_proxies" else 1):
+                raise ValueError(f"RELAY_{f.name.upper()} is out of range")
+            values[f.name] = value
+        return cls(**values)
+
+
+class RateLimit:
+    """At most `limit` events per `period` seconds and key (sliding log).
+
+    Not thread-safe on its own: the relay calls it with its lock held.
+    """
+
+    def __init__(self, limit, period, now):
+        self.limit, self.period, self.now = limit, period, now
+        self.log = {}
+        self.swept = now()
+
+    def retry_after(self, key):
+        """0 when one more event is allowed, else the seconds to wait."""
+        now = self.now()
+        q = self.log.get(key)
+        if not q:
+            return 0
+        while q and q[0] <= now - self.period:
+            q.popleft()
+        if len(q) < self.limit:
+            return 0
+        return max(1, math.ceil(q[0] + self.period - now))
+
+    def hit(self, key):
+        now = self.now()
+        self.log.setdefault(key, collections.deque()).append(now)
+        if now - self.swept > self.period:   # forget keys with nothing recent
+            self.swept = now
+            for k in [k for k, q in self.log.items() if not q or q[-1] <= now - self.period]:
+                del self.log[k]
+
+    def take(self, key):
+        """Count one event if allowed; returns what retry_after returned."""
+        wait = self.retry_after(key)
+        if not wait:
+            self.hit(key)
+        return wait
+
+
+class Slots:
+    """At most `limit` concurrent holders per key."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.held = {}
+        self.lock = threading.Lock()
+
+    def acquire(self, key):
+        with self.lock:
+            n = self.held.get(key, 0)
+            if n >= self.limit:
+                return False
+            self.held[key] = n + 1
+            return True
+
+    def release(self, key):
+        with self.lock:
+            n = self.held.get(key, 0) - 1
+            if n > 0:
+                self.held[key] = n
+            else:
+                self.held.pop(key, None)
+
+
+class PushQueue:
+    """A bounded queue served by a few threads, instead of one thread per
+    push. A push that does not fit is dropped: the device's long-poll, or
+    the next request, still finds the request."""
+
+    def __init__(self, workers, size):
+        self.workers = workers
+        self.q = queue.Queue(size)
+        self.started = False
+        self.lock = threading.Lock()
+
+    def submit(self, fn, *args):
+        with self.lock:
+            if not self.started:
+                self.started = True
+                for _ in range(self.workers):
+                    threading.Thread(target=self._run, daemon=True).start()
+        try:
+            self.q.put_nowait((fn, args))
+            return True
+        except queue.Full:
+            return False
+
+    def _run(self):
+        while True:
+            fn, args = self.q.get()
+            try:
+                fn(*args)
+            except Exception as e:  # a push must never take a worker down
+                log(f"push worker: {type(e).__name__}: {e}")
 
 
 # ---- Web Push (RFC 8291 / 8292) -------------------------------------------
@@ -322,52 +521,224 @@ class Pushers:
         return self.webpush.send(sub, payload)
 
 
+def valid_webpush_keys(keys):
+    """A subscription's p256dh is a P-256 point, its auth 16 bytes (RFC 8291)."""
+    if not isinstance(keys, dict):
+        return False
+    p256dh, auth = keys.get("p256dh"), keys.get("auth")
+    if not (isinstance(p256dh, str) and isinstance(auth, str) and len(p256dh) <= 100
+            and len(auth) <= 32 and B64U_RE.match(p256dh) and B64U_RE.match(auth)):
+        return False
+    try:
+        raw, secret = unb64u(p256dh.rstrip("=")), unb64u(auth.rstrip("="))
+        if len(raw) != 65 or len(secret) != 16:
+            return False
+        ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+    except (ValueError, binascii.Error):
+        return False
+    return True
+
+
+def sub_key(sub):
+    """What identifies one device to the push service, across channels."""
+    return "apns:" + sub["apns"] if "apns" in sub else "web:" + sub["endpoint"]
+
+
+# ---- Storage ----------------------------------------------------------------
+
+class Store:
+    """Channels in SQLite, one row each, written when that channel changes.
+
+    Used with the relay's lock held, from any thread.
+    """
+
+    def __init__(self, state_dir):
+        path = os.path.join(state_dir, "state.db")
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))   # never world-readable
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS channels (ch TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        self._migrate(os.path.join(state_dir, "state.json"))
+
+    def _migrate(self, legacy):
+        """Import the state.json of an older version, once."""
+        if not os.path.exists(legacy):
+            return
+        with open(legacy, encoding="utf-8") as f:
+            channels = json.load(f).get("channels", {})
+        now = int(time.time())
+        with self.db:
+            self.db.execute("BEGIN")
+            for ch, c in channels.items():
+                c.setdefault("last_active", now)
+                self.db.execute("INSERT OR IGNORE INTO channels VALUES (?, ?)", (ch, json.dumps(c)))
+        os.replace(legacy, legacy + ".migrated")
+        log(f"imported {len(channels)} channels from state.json")
+
+    def load(self):
+        return {ch: json.loads(data) for ch, data in self.db.execute("SELECT ch, data FROM channels")}
+
+    def put(self, ch, c):
+        self.db.execute("INSERT OR REPLACE INTO channels VALUES (?, ?)", (ch, json.dumps(c)))
+
+    def delete(self, ch):
+        self.db.execute("DELETE FROM channels WHERE ch = ?", (ch,))
+
+    def close(self):
+        self.db.close()
+
+
 # ---- Relay logic (HTTP-independent) ---------------------------------------
+
+def limited(wait):
+    """The answer to a client over a limit."""
+    return 429, {"error": "rate limited", "retry_after": int(wait)}
+
 
 class Relay:
     """Channels, pairing slots and pending requests.
 
     Every public method returns (HTTP status, JSON body or None). Message
     bodies (`hello`, `msg`) are opaque here.
+
+    One lock guards the state; each channel has its own condition on that
+    lock, so an event wakes the long-polls of its channel only.
     """
 
-    def __init__(self, state_dir, enroll_secret, push=None, now=time.time):
-        if not enroll_secret:
-            raise ValueError("an enrolment secret is required")
-        self.state_file = os.path.join(state_dir, "state.json")
-        self.enroll_auth = digest(enroll_secret)
+    def __init__(self, state_dir, enroll_secret=None, push=None, now=time.time, limits=None):
+        self.enroll_auth = digest(enroll_secret) if enroll_secret else None
+        self.limits = limits = limits or Limits()
         self.push = push
         self.now = now
-        self.cond = threading.Condition()
-        self.channels = {}
+        self.lock = threading.Lock()
+        self.conds = {}
+        self.store = Store(state_dir)
+        self.channels = self.store.load()
+        self.saved_active = {ch: c.get("last_active", 0) for ch, c in self.channels.items()}
         self.pending = {}   # channel -> {request id -> entry}; memory only
-        if os.path.exists(self.state_file):
-            with open(self.state_file, encoding="utf-8") as f:
-                self.channels = json.load(f)["channels"]
+        self.pending_bytes = 0
+        self.subs = {}      # sub_key -> (channel, signer): one device, one channel
+        for ch, c in self.channels.items():
+            for sid, s in c["signers"].items():
+                if s.get("sub"):
+                    self.subs[sub_key(s["sub"])] = (ch, sid)
+        self.swept = 0
+        self.created_hour = RateLimit(limits.channels_per_ip_hour, 3600, now)
+        self.created_day = RateLimit(limits.channels_per_ip_day, 86400, now)
+        self.request_rate = RateLimit(limits.requests_per_minute, 60, now)
+        self.push_rates = (RateLimit(1, limits.push_interval, now),
+                           RateLimit(limits.push_per_day, 86400, now))
+        self.polls_token = Slots(limits.polls_per_token)
+        self.polls_ip = Slots(limits.polls_per_ip)
+        self.push_queue = PushQueue(limits.push_workers, limits.push_queue)
 
-    # -- helpers (call with self.cond held) --
+    @property
+    def open_enrolment(self):
+        return self.enroll_auth is None
 
-    def _save(self):
-        tmp = self.state_file + ".tmp"
-        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w",
-                  encoding="utf-8") as f:
-            json.dump({"channels": self.channels}, f)
-        os.replace(tmp, self.state_file)
+    def close(self):
+        self.store.close()
 
-    def _purge(self):
+    # -- helpers (call with self.lock held) --
+
+    def _cond(self, ch):
+        cond = self.conds.get(ch)
+        if cond is None:
+            cond = self.conds[ch] = threading.Condition(self.lock)
+        return cond
+
+    def _notify(self, ch):
+        cond = self.conds.get(ch)
+        if cond is not None:
+            cond.notify_all()
+
+    def _save(self, ch):
+        c = self.channels.get(ch)
+        if c is None:
+            self.store.delete(ch)
+            self.saved_active.pop(ch, None)
+        else:
+            self.store.put(ch, c)
+            self.saved_active[ch] = c["last_active"]
+
+    def _touch(self, ch, c):
+        """Note activity; written to disk at most once per ACTIVITY_GRAIN."""
+        now = int(self.now())
+        c["last_active"] = now
+        if now - self.saved_active.get(ch, 0) >= ACTIVITY_GRAIN:
+            self._save(ch)
+
+    def _set(self, e, field, value):
+        """Change an entry's msg or response, keeping the byte count."""
+        self.pending_bytes += len(value or "") - len(e[field] or "")
+        e[field] = value
+
+    def _forget_entries(self, ch, keep=lambda e: False):
+        entries = self.pending.get(ch, {})
+        for rid, e in list(entries.items()):
+            if not keep(e):
+                self._set(e, "msg", None)
+                self._set(e, "response", None)
+                del entries[rid]
+        if not entries:
+            self.pending.pop(ch, None)
+
+    def _set_sub(self, ch, sid, sub):
+        """Give a signer its subscription. A device belongs to one channel:
+        the latest registration takes it from any other."""
+        signer = self.channels[ch]["signers"][sid]
+        old = signer.get("sub")
+        if old and self.subs.get(sub_key(old)) == (ch, sid):
+            del self.subs[sub_key(old)]
+        signer["sub"] = sub
+        if sub:
+            other = self.subs.get(sub_key(sub))
+            if other and other != (ch, sid):
+                och, osid = other
+                prev = self.channels.get(och, {}).get("signers", {}).get(osid)
+                if prev is not None:
+                    prev["sub"] = None
+                    self._save(och)
+                log(f"channel {och[:8]}: push target moved to channel {ch[:8]}")
+            self.subs[sub_key(sub)] = (ch, sid)
+
+    def _drop_channel(self, ch):
+        c = self.channels.get(ch)
+        if c is None:
+            return
+        for sid in list(c["signers"]):
+            self._set_sub(ch, sid, None)
+        del self.channels[ch]
+        self._forget_entries(ch)
+        self._save(ch)
+        self._notify(ch)
+        self.conds.pop(ch, None)
+
+    def _purge_pending(self, ch):
         now = self.now()
-        for ch, entries in list(self.pending.items()):
-            for rid, e in list(entries.items()):
-                if e["exp"] + KEEP_AFTER_EXPIRY < now:
-                    del entries[rid]
-            if not entries:
-                del self.pending[ch]
-        stale = [ch for ch, c in self.channels.items()
-                 if not c["signers"] and c["created"] + PAIR_WINDOW < now]
-        for ch in stale:
-            del self.channels[ch]
-        if stale:
-            self._save()
+        for e in self.pending.get(ch, {}).values():
+            if e["exp"] <= now and e["msg"] is not None:
+                self._set(e, "msg", None)   # no longer offered: no need to hold it
+        self._forget_entries(ch, keep=lambda e: e["exp"] + KEEP_AFTER_EXPIRY >= now)
+
+    def _sweep(self):
+        """Expire what time has made useless; at most once per SWEEP_EVERY."""
+        now = self.now()
+        if now - self.swept < SWEEP_EVERY:
+            return
+        self.swept = now
+        for ch in list(self.pending):
+            self._purge_pending(ch)
+        idle = self.limits.channel_idle_days * 86400
+        for ch, c in list(self.channels.items()):
+            if (not c["signers"] and c["created"] + PAIR_WINDOW < now) \
+                    or c.get("last_active", c["created"]) + idle < now:
+                self._drop_channel(ch)
+                log(f"channel {ch[:8]} expired")
+            elif c.get("pair_until", 0) < now and (c["hello"] or c["answer"] or c["pair_auth"]):
+                c.update(hello=None, answer=None, pair_auth=None)   # pairing over
+                self._save(ch)
 
     def _channel(self, ch, token, role):
         """The channel if `token` holds `role` on it, plus the signer id."""
@@ -378,22 +749,25 @@ class Relay:
         if role == "signer":
             for sid, s in c["signers"].items():
                 if hmac.compare_digest(given, s["auth"]):
+                    self._touch(ch, c)
                     return c, sid
             return None, None
         if role == "pair" and c.get("pair_until", float("inf")) < self.now():
             return None, None
         expected = c.get(role + "_auth")
         if expected and hmac.compare_digest(given, expected):
+            self._touch(ch, c)
             return c, None
         return None, None
 
-    def _wait(self, ready, wait, ch=None, c=None, sid=None):
+    def _wait(self, ready, wait, ch, c=None, sid=None):
         """Block until ready() is truthy or `wait` seconds passed.
 
         Given the channel the caller holds (and, for a signer, its id),
         returns GONE as soon as that channel or signer is revoked, so a
         long-poll does not outlive its pairing.
         """
+        cond = self._cond(ch)
         deadline = time.monotonic() + max(0.0, min(float(wait or 0), MAX_WAIT))
         while True:
             if c is not None and (self.channels.get(ch) is not c
@@ -403,16 +777,38 @@ class Relay:
             remaining = deadline - time.monotonic()
             if result or remaining <= 0:
                 return result
-            self.cond.wait(remaining)
+            cond.wait(remaining)
 
     DENIED = (401, {"error": "unauthorized"})
     GONE = object()
     BAD = (400, {"error": "bad request"})
 
+    # -- long-poll slots (used by the HTTP layer around a call with wait > 0) --
+
+    def acquire_poll(self, token, ip):
+        """Reserve a long-poll slot for this token and client address.
+        Returns a release function, or None when either is at its limit."""
+        tkey = digest(token or "")
+        if not self.polls_token.acquire(tkey):
+            return None
+        if ip is not None and not self.polls_ip.acquire(ip):
+            self.polls_token.release(tkey)
+            return None
+
+        def release():
+            self.polls_token.release(tkey)
+            if ip is not None:
+                self.polls_ip.release(ip)
+        return release
+
     # -- pairing --
 
-    def create_channel(self, token, body):
-        if not token or not hmac.compare_digest(digest(token), self.enroll_auth):
+    def create_channel(self, token, body, ip=None):
+        """Open enrolment takes any token, or none; closed enrolment needs
+        the secret. `ip` is the client address the per-address limits
+        count against (None: not counted, for tests and tools)."""
+        if self.enroll_auth is not None and not (
+                token and hmac.compare_digest(digest(token), self.enroll_auth)):
             return self.DENIED
         ch, hello = body.get("ch"), body.get("hello")
         auths = (body.get("agent_auth"), body.get("pair_auth"))
@@ -420,16 +816,24 @@ class Relay:
                 and all(isinstance(a, str) and HASH_RE.match(a) for a in auths)
                 and isinstance(hello, str) and len(hello) <= MAX_BLOB):
             return self.BAD
-        with self.cond:
-            self._purge()
+        with self.lock:
+            self._sweep()
             if ch in self.channels:
                 return 200, {"state": "exists"}
-            if len(self.channels) >= MAX_CHANNELS:
+            if len(self.channels) >= self.limits.max_channels:
+                log("channel cap reached")
                 return 200, {"state": "full"}
+            if ip is not None:
+                wait = max(self.created_hour.retry_after(ip), self.created_day.retry_after(ip))
+                if wait:
+                    return limited(wait)
+                self.created_hour.hit(ip)
+                self.created_day.hit(ip)
+            now = int(self.now())
             self.channels[ch] = {"agent_auth": auths[0], "pair_auth": auths[1], "hello": hello,
-                                 "answer": None, "created": int(self.now()), "signers": {},
-                                 "pair_until": int(self.now()) + PAIR_WINDOW}
-            self._save()
+                                 "answer": None, "created": now, "signers": {},
+                                 "pair_until": now + PAIR_WINDOW, "last_active": now}
+            self._save(ch)
         log(f"channel {ch[:8]} created")
         return 200, {"state": "created"}
 
@@ -443,20 +847,20 @@ class Relay:
         if not (isinstance(pair_auth, str) and HASH_RE.match(pair_auth)
                 and isinstance(hello, str) and len(hello) <= MAX_BLOB):
             return self.BAD
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
                 return self.DENIED
-            if len(c["signers"]) >= MAX_SIGNERS:
+            if len(c["signers"]) >= self.limits.max_devices:
                 return 200, {"state": "full"}
             c.update(pair_auth=pair_auth, hello=hello, answer=None,
                      pair_until=int(self.now()) + PAIR_WINDOW)
-            self._save()
+            self._save(ch)
         log(f"channel {ch[:8]} open for one more device")
         return 200, {"state": "open"}
 
     def get_hello(self, ch, token):
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "pair")
             if c is None:
                 return self.DENIED
@@ -468,22 +872,22 @@ class Relay:
                 and isinstance(auth, str) and HASH_RE.match(auth)
                 and isinstance(msg, str) and len(msg) <= MAX_BLOB):
             return self.BAD
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "pair")
             if c is None:
                 return self.DENIED
-            if len(c["signers"]) >= MAX_SIGNERS or signer in c["signers"]:
+            if len(c["signers"]) >= self.limits.max_devices or signer in c["signers"]:
                 return 200, {"state": "full"}
             c["signers"][signer] = {"auth": auth, "sub": None}
             c["answer"] = {"signer": signer, "msg": msg}
             c["pair_auth"] = None   # the pairing secret works once
-            self._save()
-            self.cond.notify_all()
+            self._save(ch)
+            self._notify(ch)
         log(f"channel {ch[:8]} paired with signer {signer[:4]}")
         return 200, {"state": "paired"}
 
     def get_pair_answer(self, ch, token, wait=0):
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
                 return self.DENIED
@@ -504,7 +908,7 @@ class Relay:
         if not (isinstance(signer, str) and SIGNER_RE.match(signer)
                 and isinstance(nonce, str) and NONCE_RE.match(nonce)):
             return self.BAD
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
                 return self.DENIED
@@ -514,12 +918,14 @@ class Relay:
             if s.get("reveal") is not None:
                 return 200, {"state": "exists"}
             s["reveal"] = nonce
-            self._save()
-            self.cond.notify_all()
+            self._save(ch)
+            self._notify(ch)
         return 200, {"state": "revealed"}
 
     def get_reveal(self, ch, token, wait=0):
-        with self.cond:
+        """The agent's nonce, for the device that holds `token`. With
+        `wait`, a long-poll on this channel's condition."""
+        with self.lock:
             c, sid = self._channel(ch, token, "signer")
             if c is None:
                 return self.DENIED
@@ -545,7 +951,7 @@ class Relay:
         target = (body or {}).get("signer")
         if target is not None and not (isinstance(target, str) and SIGNER_RE.match(target)):
             return self.BAD
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "agent")
             by = "agent"
             if c is None:
@@ -558,18 +964,16 @@ class Relay:
             if target is not None:
                 if target not in c["signers"]:
                     return 200, {"state": "unknown-signer"}
+                self._set_sub(ch, target, None)
                 del c["signers"][target]
-                for rid, e in list(self.pending.get(ch, {}).items()):
-                    if e["to"] == target:
-                        del self.pending[ch][rid]
+                self._forget_entries(ch, keep=lambda e: e["to"] != target)
             if target is None or not c["signers"]:
-                del self.channels[ch]
-                self.pending.pop(ch, None)
+                self._drop_channel(ch)
                 what = "channel"
             else:
                 what = f"signer {target[:4]}"
-            self._save()
-            self.cond.notify_all()
+                self._save(ch)
+                self._notify(ch)
         log(f"channel {ch[:8]}: {what} revoked by the {by}")
         return 200, {"state": "revoked"}
 
@@ -579,27 +983,27 @@ class Relay:
         """Store how to wake this signer: a Web Push subscription
         `{endpoint, keys: {p256dh, auth}}` or an APNs device token
         `{apns: hex, sandbox: bool}`. A relay without APNs answers
-        `unsupported` to the latter and keeps what it had."""
+        `unsupported` to the latter and keeps what it had. One device
+        (endpoint or token) wakes for one channel only: the latest one."""
         if "apns" in body:
             if not (isinstance(body["apns"], str) and APNS_TOKEN_RE.match(body["apns"])
                     and isinstance(body.get("sandbox"), bool)):
                 return self.BAD
             sub = {"apns": body["apns"], "sandbox": body["sandbox"]}
         else:
-            keys = body.get("keys")
-            if not (push_host_allowed(body.get("endpoint")) and isinstance(keys, dict)
-                    and isinstance(keys.get("p256dh"), str) and isinstance(keys.get("auth"), str)):
+            endpoint, keys = body.get("endpoint"), body.get("keys")
+            if not (push_host_allowed(endpoint) and len(endpoint) <= MAX_ENDPOINT
+                    and valid_webpush_keys(keys)):
                 return self.BAD
-            sub = {"endpoint": body["endpoint"],
-                   "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
-        with self.cond:
+            sub = {"endpoint": endpoint, "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
+        with self.lock:
             c, sid = self._channel(ch, token, "signer")
             if c is None:
                 return self.DENIED
             if "apns" in sub and not getattr(self.push, "supports_apns", False):
                 return 200, {"state": "unsupported"}
-            c["signers"][sid]["sub"] = sub
-            self._save()
+            self._set_sub(ch, sid, sub)
+            self._save(ch)
         return 200, {"state": "stored"}
 
     def get_requests(self, ch, token, wait=0, known=None):
@@ -610,7 +1014,7 @@ class Relay:
         call returns as soon as the pending set differs from it. Without
         `known`, any pending request counts as news.
         """
-        with self.cond:
+        with self.lock:
             c, sid = self._channel(ch, token, "signer")
             if c is None:
                 return self.DENIED
@@ -619,7 +1023,8 @@ class Relay:
                 now = self.now()
                 return [{"id": rid, "exp": e["exp"], "msg": e["msg"]}
                         for rid, e in self.pending.get(ch, {}).items()
-                        if e["to"] == sid and e["response"] is None and e["exp"] > now]
+                        if e["to"] == sid and e["response"] is None and e["exp"] > now
+                        and e["msg"] is not None]
 
             def news():
                 current = waiting()
@@ -635,9 +1040,9 @@ class Relay:
 
     def post_response(self, ch, token, rid, body):
         msg = body.get("msg")
-        if not (isinstance(msg, str) and len(msg) <= MAX_BODY):
+        if not (isinstance(msg, str) and len(msg) <= self.limits.max_msg):
             return self.BAD
-        with self.cond:
+        with self.lock:
             c, sid = self._channel(ch, token, "signer")
             if c is None:
                 return self.DENIED
@@ -648,8 +1053,9 @@ class Relay:
                 return 200, {"state": "duplicate"}
             if e["exp"] <= self.now():
                 return 200, {"state": "expired"}
-            e["response"] = msg
-            self.cond.notify_all()
+            self._set(e, "msg", None)   # answered: the request is no longer offered
+            self._set(e, "response", msg)
+            self._notify(ch)
         return 200, {"state": "accepted"}
 
     # -- agent side --
@@ -658,13 +1064,17 @@ class Relay:
         rid, to, exp, msg = body.get("id"), body.get("to"), body.get("exp"), body.get("msg")
         if not (isinstance(rid, str) and REQUEST_RE.match(rid) and isinstance(to, str)
                 and isinstance(exp, (int, float)) and not isinstance(exp, bool)
-                and isinstance(msg, str)):
+                and isinstance(msg, str) and len(msg) <= self.limits.max_msg):
             return self.BAD
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
                 return self.DENIED
-            self._purge()
+            wait = self.request_rate.take(ch)
+            if wait:
+                return limited(wait)
+            self._sweep()
+            self._purge_pending(ch)
             now = self.now()
             signer = c["signers"].get(to)
             if signer is None:
@@ -674,19 +1084,37 @@ class Relay:
             entries = self.pending.setdefault(ch, {})
             if rid in entries:
                 return 200, {"state": "duplicate"}
+            # Every stored entry counts, cancelled and answered ones too:
+            # a cancel or answer loop cannot grow the queue.
             live = sum(1 for e in entries.values() if e["response"] is None and e["exp"] > now)
-            if live >= MAX_PENDING:
+            if len(entries) >= self.limits.max_entries or live >= self.limits.max_pending:
                 return 200, {"state": "busy"}
-            entries[rid] = {"to": to, "exp": exp, "msg": msg, "response": None, "seen": False}
+            if self.pending_bytes + len(msg) > self.limits.pending_budget:
+                log("pending budget exhausted")
+                return 503, {"error": "relay busy", "retry_after": 5}
+            e = entries[rid] = {"to": to, "exp": exp, "msg": None, "response": None, "seen": False}
+            self._set(e, "msg", msg)
             sub = signer["sub"]
-            self.cond.notify_all()
-        if sub and self.push:
-            threading.Thread(target=self._wake, args=(ch, to, sub), daemon=True).start()
-        return 200, {"state": "queued", "push": bool(sub and self.push)}
+            pushed = bool(sub and self.push) and self._push_allowed(ch, sub) \
+                and self.push_queue.submit(self._wake, ch, to, sub)
+            self._notify(ch)
+        return 200, {"state": "queued", "push": pushed}
+
+    def _push_allowed(self, ch, sub):
+        """At most one push per interval and so many a day, both per
+        channel and per device: a channel cannot buzz a device at will,
+        nor make the relay hammer the push service with a junk token."""
+        keys = ("ch:" + ch, sub_key(sub))
+        if any(rate.retry_after(k) for rate in self.push_rates for k in keys):
+            return False
+        for rate in self.push_rates:
+            for k in keys:
+                rate.hit(k)
+        return True
 
     def cancel(self, ch, token, rid):
         """The agent gave up on a request: the device no longer offers it."""
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
                 return self.DENIED
@@ -694,25 +1122,26 @@ class Relay:
             if e is None or e["response"] is not None:
                 return 200, {"state": "unknown"}
             e["exp"] = min(e["exp"], self.now())
-            self.cond.notify_all()
+            self._set(e, "msg", None)
+            self._notify(ch)
         return 200, {"state": "cancelled"}
 
     def _wake(self, ch, sid, sub):
         outcome, gone = self.push.send(sub, {"t": "sign"}, group=ch)   # content-free
         log(f"channel {ch[:8]}: {outcome}")
         if gone:
-            with self.cond:
+            with self.lock:
                 signer = self.channels.get(ch, {}).get("signers", {}).get(sid)
                 if signer and signer["sub"] == sub:
-                    signer["sub"] = None
-                    self._save()
+                    self._set_sub(ch, sid, None)
+                    self._save(ch)
 
     def get_response(self, ch, token, rid, wait=0, report_seen=False):
         """The answer to a request. "Nothing yet" is 204, or with
         `report_seen` 200 `pending` saying whether the device has fetched
         the request: an agent with another device to fall back on gives up
         on one that never picked it up."""
-        with self.cond:
+        with self.lock:
             c, _ = self._channel(ch, token, "agent")
             if c is None:
                 return self.DENIED
@@ -779,10 +1208,54 @@ ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|pair/open|pair/re
                    r"responses/([0-9a-f]{32})|requests/([0-9a-f]{32})/cancel)$")
 
 
-def make_handler(relay, static, vapid_public):
+UNKNOWN_CLIENT = "unknown"
+POLL_RETRY_AFTER = 10   # seconds, for a long-poll over its limits
+
+
+def header_address(value):
+    """The client address from a header the proxy sets, failing closed:
+    anything that is not a public address is the one shared bucket."""
+    try:
+        ip = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return UNKNOWN_CLIENT
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+        return UNKNOWN_CLIENT
+    return client_address(str(ip), None, 0)
+
+
+def client_address(peer, forwarded, trusted_proxies):
+    """The address limits count against, as a string; an IPv6 client by
+    its /64. With N trusted proxies, the client is the Nth address from
+    the right of X-Forwarded-For (each proxy appends what it saw)."""
+    addr = peer
+    if trusted_proxies and forwarded:
+        hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+        if hops:
+            addr = hops[max(0, len(hops) - trusted_proxies)]
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        try:
+            ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.version == 6:
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
+
+
+def make_handler(relay, static, vapid_public, ip_header=None):
+    limits = relay.limits
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "clavix-relay"
         sys_version = ""
+        timeout = limits.socket_timeout   # a silent client mid-request is dropped
 
         def reply(self, code, body=None, ctype="application/json", cache="no-store"):
             try:
@@ -792,12 +1265,15 @@ def make_handler(relay, static, vapid_public):
                 self.close_connection = True
 
         def send_reply(self, code, body, ctype, cache):
+            retry = body.get("retry_after") if isinstance(body, dict) else None
             if body is not None and not isinstance(body, bytes):
                 body = json.dumps(body, separators=(",", ":")).encode()
             self.send_response(code)
             for k, v in SECURITY_HEADERS.items():
                 self.send_header(k, v)
             self.send_header("Cache-Control", cache)
+            if retry is not None:
+                self.send_header("Retry-After", str(retry))
             if body is not None:
                 self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body or b"")))
@@ -809,24 +1285,37 @@ def make_handler(relay, static, vapid_public):
             auth = self.headers.get("Authorization") or ""
             return auth[7:] if auth.startswith("Bearer ") else None
 
+        def ip(self):
+            if ip_header:
+                return header_address(self.headers.get(ip_header))
+            return client_address(self.client_address[0], self.headers.get("X-Forwarded-For"),
+                                  limits.trusted_proxies)
+
         def json_body(self):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
-                return None
-            if not 0 < n <= MAX_BODY:
+                n = -1
+            if not 0 < n <= limits.max_body:
+                self.close_connection = True   # the body, if any, stays unread
                 return None
             try:
-                data = json.loads(self.rfile.read(n))
+                raw = self.rfile.read(n)
+            except OSError:   # timeout: the client went silent mid-body
+                self.close_connection = True
+                return False
+            try:
+                data = json.loads(raw)
             except ValueError:
                 return None
             return data if isinstance(data, dict) else None
 
         def wait(self, query):
             try:
-                return float(urllib.parse.parse_qs(query).get("wait", ["0"])[0])
+                value = float(urllib.parse.parse_qs(query).get("wait", ["0"])[0])
             except ValueError:
                 return 0.0
+            return value if math.isfinite(value) else 0.0
 
         def known(self, query):
             """The `known` parameter: None when absent, else a set of ids."""
@@ -836,6 +1325,21 @@ def make_handler(relay, static, vapid_public):
             if not KNOWN_RE.match(values[0]):
                 raise ValueError("known")
             return set(filter(None, values[0].split(",")))
+
+        def long_poll(self, wait, call):
+            """Run a call that may block, within the long-poll limits."""
+            if wait <= 0:
+                return self.reply(*call(0))
+            release = relay.acquire_poll(self.token(), self.ip())
+            if release is None:
+                # A pause long enough that a client honouring Retry-After
+                # stays far from a proxy's ban threshold on 4xx bursts.
+                return self.reply(*limited(POLL_RETRY_AFTER))
+            try:
+                result = call(wait)
+            finally:
+                release()
+            return self.reply(*result)
 
         def do_GET(self):
             url = urllib.parse.urlsplit(self.path)
@@ -853,21 +1357,22 @@ def make_handler(relay, static, vapid_public):
             if not m:
                 return self.reply(404, {"error": "not found"})
             ch, what, rid = m.group(1), m.group(2), m.group(3)
+            token, wait = self.token(), self.wait(url.query)
             if what == "pair":
-                return self.reply(*relay.get_hello(ch, self.token()))
+                return self.reply(*relay.get_hello(ch, token))
             if what == "pair/answer":
-                return self.reply(*relay.get_pair_answer(ch, self.token(), self.wait(url.query)))
+                return self.long_poll(wait, lambda w: relay.get_pair_answer(ch, token, w))
             if what == "pair/reveal":
-                return self.reply(*relay.get_reveal(ch, self.token(), self.wait(url.query)))
+                return self.long_poll(wait, lambda w: relay.get_reveal(ch, token, w))
             if what == "requests":
                 try:
                     known = self.known(url.query)
                 except ValueError:
                     return self.reply(400, {"error": "bad request"})
-                return self.reply(*relay.get_requests(ch, self.token(), self.wait(url.query), known))
+                return self.long_poll(wait, lambda w: relay.get_requests(ch, token, w, known))
             if rid and what.startswith("responses/"):
                 seen = urllib.parse.parse_qs(url.query).get("seen") == ["1"]
-                return self.reply(*relay.get_response(ch, self.token(), rid, self.wait(url.query), seen))
+                return self.long_poll(wait, lambda w: relay.get_response(ch, token, rid, w, seen))
             return self.reply(404, {"error": "not found"})
 
         do_HEAD = do_GET
@@ -875,10 +1380,12 @@ def make_handler(relay, static, vapid_public):
         def do_POST(self):
             path = urllib.parse.urlsplit(self.path).path
             body = self.json_body()
+            if body is False:
+                return None   # dropped without an answer
             if body is None:
                 return self.reply(400, {"error": "bad request"})
             if path == "/api/channels":
-                return self.reply(*relay.create_channel(self.token(), body))
+                return self.reply(*relay.create_channel(self.token(), body, self.ip()))
             m = ROUTE.match(path)
             if not m:
                 return self.reply(404, {"error": "not found"})
@@ -907,6 +1414,41 @@ def make_handler(relay, static, vapid_public):
     return Handler
 
 
+BUSY = (b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\n"
+        b"Connection: close\r\n\r\n")
+
+
+class Server(ThreadingHTTPServer):
+    """One thread per connection, but at most `max_connections` of them:
+    past that a connection gets an immediate 503 and is closed."""
+    daemon_threads = True
+
+    def __init__(self, address, handler, max_connections):
+        self.slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(BUSY)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def load_apns(env, enabled):
     """An ApnsPush from the environment, or None when no key is given."""
     path = env.get("RELAY_APNS_KEY_FILE")
@@ -918,14 +1460,34 @@ def load_apns(env, enabled):
                     env.get("RELAY_APNS_TOPIC", "org.clavix.approve"), enabled)
 
 
-def serve(bind, port, state_dir, enroll_secret, web_dir, contact, push_enabled, apns=None):
+def serve(bind, port, state_dir, enroll_secret, web_dir, contact, push_enabled, apns=None,
+          serve_web=True, limits=None, ip_header=None):
     os.makedirs(state_dir, exist_ok=True)
     push = Pushers(WebPush(state_dir, contact, push_enabled), apns)
-    relay = Relay(state_dir, enroll_secret, push)
-    static = load_static(web_dir)
-    server = ThreadingHTTPServer((bind, port), make_handler(relay, static, push.public_key()))
-    server.daemon_threads = True
+    relay = Relay(state_dir, enroll_secret, push, limits=limits)
+    static = load_static(web_dir) if serve_web else {}
+    server = Server((bind, port), make_handler(relay, static, push.public_key(), ip_header),
+                    relay.limits.max_connections)
+    server.relay = relay
     return server
+
+
+def enrolment_secret(env):
+    """The enrolment secret, or None for open enrolment."""
+    mode = env.get("RELAY_ENROLL", "")
+    secret = env.get("RELAY_ENROLL_SECRET") or None
+    if mode == "open":
+        return None
+    if mode == "closed" and not secret:
+        raise ValueError("RELAY_ENROLL=closed needs RELAY_ENROLL_SECRET")
+    if mode not in ("", "closed"):
+        raise ValueError("RELAY_ENROLL must be open or closed")
+    return secret
+
+
+def on_off(env, name):
+    """A switch that is on unless set to "off" (or 0, false, no)."""
+    return env.get(name, "on").strip().lower() not in ("off", "0", "false", "no")
 
 
 def selftest():
@@ -952,18 +1514,25 @@ def main():
     if "--healthcheck" in sys.argv:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as r:
             return None if r.status == 200 else sys.exit(1)
-    secret = os.environ.get("RELAY_ENROLL_SECRET")
     state_dir = os.environ.get("RELAY_STATE_DIR")
-    if not secret or not state_dir:
-        sys.exit("RELAY_ENROLL_SECRET and RELAY_STATE_DIR must be set")
+    if not state_dir:
+        sys.exit("RELAY_STATE_DIR must be set")
+    try:
+        secret = enrolment_secret(os.environ)
+        limits = Limits.from_env(os.environ)
+    except ValueError as e:
+        sys.exit(str(e))
+    push_enabled = on_off(os.environ, "RELAY_PUSH")
+    serve_web = on_off(os.environ, "RELAY_SERVE_WEB")
     bind = os.environ.get("RELAY_BIND", "127.0.0.1")
-    push_enabled = os.environ.get("RELAY_PUSH", "on") != "off"
     apns = load_apns(os.environ, push_enabled)
     server = serve(bind, port, state_dir, secret,
                    os.environ.get("RELAY_WEB_DIR", os.path.join(HERE, "..", "web")),
                    os.environ.get("RELAY_VAPID_SUB", "mailto:webpush@example.com"),
-                   push_enabled, apns)
-    log(f"listening on {bind}:{port}, APNs {'on' if apns else 'off'}")
+                   push_enabled, apns, serve_web, limits,
+                   os.environ.get("RELAY_CLIENT_IP_HEADER") or None)
+    log(f"listening on {bind}:{port}, enrolment {'closed' if secret else 'open'}, "
+        f"page {'served' if serve_web else 'not served'}, APNs {'on' if apns else 'off'}")
     server.serve_forever()
 
 

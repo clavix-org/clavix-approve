@@ -130,7 +130,8 @@ private func checkRequest(_ inner: [String: Any], id: String, now: Double, t: St
     }
     guard let allowed = algorithms(key) else { return .failure(.unknownKey) }
 
-    // 1. The bytes to sign are a public-key login made with that key.
+    // 1. The bytes to sign are a host-bound public-key login made with that
+    //    key (plain "publickey" is refused by the parser).
     guard let request = SSH.parseUserAuthRequest(data), request.service == "ssh-connection",
           allowed.contains(request.algorithm), equal(request.keyBlob, key) else {
         return .failure(.unverified)
@@ -148,11 +149,12 @@ private func checkRequest(_ inner: [String: Any], id: String, now: Double, t: St
         hops.append(Hop(hostKey: b.hostKey, fingerprint: SSH.fingerprint(b.hostKey), forwarded: b.forwarded))
     }
 
-    // 3. The login is for that last session — and, when the client says
-    //    which host it believes it talks to, for that very host key.
+    // 3. The login is for that last session and names that very host key.
+    //    Without the second check, whoever holds a pinned host key could
+    //    bind a session it opened with another server under its own key.
     let dest = binds[binds.count - 1]
     guard equal(request.sessionId, dest.sessionId) else { return .failure(.unverified) }
-    if let hostKey = request.hostKey, !equal(hostKey, dest.hostKey) { return .failure(.unverified) }
+    guard equal(request.hostKey, dest.hostKey) else { return .failure(.unverified) }
 
     // Unverified, for display only.
     var caller: Caller? = nil

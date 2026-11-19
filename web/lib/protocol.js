@@ -94,7 +94,8 @@ async function checkRequest(inner, { id, now, t, algorithms }) {
   const allowed = algorithms(key);
   if (!allowed) return refuse('unknown-key');
 
-  // 1. The bytes to sign are a public-key login made with that key.
+  // 1. The bytes to sign are a host-bound public-key login made with that
+  //    key (plain "publickey" is refused by the parser).
   const request = parseUserAuthRequest(data);
   if (!request || request.service !== 'ssh-connection' || !allowed.includes(request.algorithm)
       || !equal(request.keyBlob, key)) {
@@ -111,11 +112,12 @@ async function checkRequest(inner, { id, now, t, algorithms }) {
     hops.push({ hostKey: b.hostKey, fingerprint: await fingerprint(b.hostKey), forwarded: b.forwarded });
   }
 
-  // 3. The login is for that last session — and, when the client says
-  //    which host it believes it talks to, for that very host key.
+  // 3. The login is for that last session and names that very host key.
+  //    Without the second check, whoever holds a pinned host key could
+  //    bind a session it opened with another server under its own key.
   const dest = binds[binds.length - 1];
   if (!equal(request.sessionId, dest.sessionId)) return refuse('unverified');
-  if (request.hostKey && !equal(request.hostKey, dest.hostKey)) return refuse('unverified');
+  if (!request.hostKey || !equal(request.hostKey, dest.hostKey)) return refuse('unverified');
 
   // Unverified, for display only.
   const caller = inner.caller && typeof inner.caller === 'object'

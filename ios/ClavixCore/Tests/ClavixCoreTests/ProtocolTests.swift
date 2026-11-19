@@ -69,12 +69,39 @@ final class ProtocolTests: XCTestCase {
         }
     }
 
-    func testRequestWithoutHostBoundDataIsStillTiedToTheSession() throws {
+    func testRequestWithoutHostBoundDataIsRefusedEvenForTheBoundSession() throws {
         var s = try Scene()
         s.inner["data"] = userAuth(sessionId: SID, keyBlob: s.key.blob).b64u
-        XCTAssertNoThrow(try s.check().get())
-        s.inner["binds"] = [try sessionBind(s.host, Data("another-session".utf8))]
         XCTAssertEqual(refusal(s.check()), .unverified)
+    }
+
+    /// testdata/hostbound.json, shared with the agent and web/test: the two
+    /// audit scenarios (a forwarded hostile host, a compromised agent
+    /// holding a pinned host key) and the valid host-bound cases, checked
+    /// in both modes.
+    func testHostBoundVectors() throws {
+        let v = try JSONSerialization.jsonObject(with: vector("hostbound.json")) as! [String: Any]
+        let id = v["id"] as! String, now = (v["now"] as! NSNumber).doubleValue
+        let key = v["key"] as! String, keyBlob = try Data(b64u: key)
+        for c in v["cases"] as! [[String: Any]] {
+            let name = c["name"] as! String
+            let inner: [String: Any] = [
+                "t": "sign", "id": id, "iat": now - 1, "exp": v["exp"]!, "key": key, "data": c["data"]!,
+                "flags": 0, "binds": c["binds"]!, "agent": "vector", "hints": [String: Any](),
+            ]
+            var approve = inner
+            approve["t"] = "approve"
+            for result in [checkSignRequest(inner, id: id, keyBlob: keyBlob, now: now),
+                           checkApproveRequest(approve, id: id, now: now)] {
+                if c["ok"] as! Bool {
+                    let view = try result.get()
+                    XCTAssertEqual(view.destination.fingerprint, c["destination"] as? String, name)
+                    XCTAssertEqual(view.hops.count, (c["binds"] as! [Any]).count, name)
+                } else {
+                    XCTAssertEqual(refusal(result), .unverified, name)
+                }
+            }
+        }
     }
 
     func testForwardingChainIsShownWholeOutermostFirst() throws {
@@ -115,16 +142,16 @@ final class ProtocolTests: XCTestCase {
             }),
             ("not a login", { s in s.inner["data"] = (Data([0, 0, 0, 1, 0]) + Data("x".utf8)).b64u }),
             ("another service", { s in
-                s.inner["data"] = userAuth(sessionId: SID, keyBlob: s.key.blob, service: "other").b64u
+                s.inner["data"] = userAuth(sessionId: SID, keyBlob: s.key.blob, hostKey: s.host.blob, service: "other").b64u
             }),
             ("another algorithm", { s in
-                s.inner["data"] = userAuth(sessionId: SID, keyBlob: s.key.blob, algorithm: "ssh-ed25519").b64u
+                s.inner["data"] = userAuth(sessionId: SID, keyBlob: s.key.blob, hostKey: s.host.blob, algorithm: "ssh-ed25519").b64u
             }),
             ("login made with another key", { s in
-                s.inner["data"] = userAuth(sessionId: SID, keyBlob: ClientKey().blob).b64u
+                s.inner["data"] = userAuth(sessionId: SID, keyBlob: ClientKey().blob, hostKey: s.host.blob).b64u
             }),
             ("trailing bytes", { s in
-                s.inner["data"] = (userAuth(sessionId: SID, keyBlob: s.key.blob) + Data([0])).b64u
+                s.inner["data"] = (userAuth(sessionId: SID, keyBlob: s.key.blob, hostKey: s.host.blob) + Data([0])).b64u
             }),
         ]
         for (name, mutate) in cases {
