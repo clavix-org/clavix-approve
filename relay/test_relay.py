@@ -123,6 +123,52 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(self.relay.post_pair(CH, PAIR, {
             "signer": "d" * 16, "signer_auth": "0" * 64, "msg": "x"})[0], 401)
 
+    def test_the_agent_reveals_its_nonce_to_the_device_once(self):
+        nonce = "N" * 43
+        self.pair()
+        self.assertEqual(self.relay.get_reveal(CH, PHONE), (204, None))
+        # Only the agent reveals, only to a device of the channel, only a nonce.
+        self.assertEqual(self.relay.post_reveal(CH, PHONE, {"signer": SIGNER, "nonce": nonce})[0], 401)
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "short"})[0], 400)
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": "d" * 16, "nonce": nonce}),
+                         (200, {"state": "unknown-signer"}))
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": nonce}),
+                         (200, {"state": "revealed"}))
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "M" * 43}),
+                         (200, {"state": "exists"}))
+        self.assertEqual(self.relay.get_reveal(CH, PHONE), (200, {"nonce": nonce}))
+        self.assertEqual(self.relay.get_reveal(CH, AGENT)[0], 401)
+
+    def test_waiting_for_the_reveal_wakes_up_and_ends_with_the_device(self):
+        self.pair()
+        got = []
+        t = threading.Thread(target=lambda: got.append(self.relay.get_reveal(CH, PHONE, wait=5)))
+        t.start()
+        time.sleep(0.1)
+        self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "N" * 43})
+        t.join(5)
+        self.assertEqual(got, [(200, {"nonce": "N" * 43})])
+        self.relay.revoke(CH, PHONE)
+        self.assertEqual(self.relay.get_reveal(CH, PHONE, wait=1)[0], 401)
+
+    def test_a_reveal_is_stored_and_wakes_only_its_own_channel(self):
+        self.pair()
+        other = "e" * 32
+        self.relay.create_channel(ENROLL, {
+            "ch": other, "agent_auth": R.digest("agent2"), "pair_auth": R.digest("pair2"), "hello": "hi"})
+        self.relay.post_pair(other, "pair2", {"signer": SIGNER, "signer_auth": R.digest("phone2"), "msg": "a"})
+        got = []
+        t = threading.Thread(target=lambda: got.append(self.relay.get_reveal(other, "phone2", wait=1)))
+        t.start()
+        time.sleep(0.1)
+        self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "N" * 43})
+        t.join(5)
+        # The other channel's device gets nothing: a reveal is per channel and device.
+        self.assertEqual(got, [(204, None)])
+        again = R.Relay(self.dir.name, ENROLL, self.push, self.clock)
+        self.assertEqual(again.get_reveal(CH, PHONE), (200, {"nonce": "N" * 43}))
+        self.assertEqual(again.get_reveal(other, "phone2"), (204, None))
+
     def test_an_unpaired_channel_expires(self):
         self.create()
         self.clock.t += R.PAIR_WINDOW + 1
@@ -1182,6 +1228,32 @@ class HttpLimitsTest(unittest.TestCase):
         self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests", token=PHONE)[0], 200)   # no wait
         first.join(5)
         self.assertEqual(self.call("GET", f"/api/ch/{CH}/requests?wait=0.1&known=", token=PHONE)[0], 200)
+
+    def test_the_reveal_over_http_and_within_the_limits(self):
+        server = self.start(polls_per_token=1, max_body=1024)
+        relay = server.relay
+        relay.create_channel(None, {"ch": CH, "agent_auth": R.digest(AGENT),
+                                    "pair_auth": R.digest(PAIR), "hello": "hi"})
+        relay.post_pair(CH, PAIR, {"signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "a"})
+        path = f"/api/ch/{CH}/pair/reveal"
+        # Tokens: the agent posts, the device reads; nobody else.
+        self.assertEqual(self.call("GET", path, token=PHONE)[0], 204)
+        self.assertEqual(self.call("GET", path, token=AGENT)[0], 401)
+        self.assertEqual(self.call("GET", path, token=PAIR)[0], 401)
+        self.assertEqual(self.call("POST", path, token=PHONE, body={"signer": SIGNER, "nonce": "N" * 43})[0], 401)
+        self.assertEqual(self.call("POST", path, token=AGENT, body={"signer": SIGNER, "nonce": "x"})[0], 400)
+        # The body cap applies as on every route.
+        self.assertEqual(self.call("POST", path, token=AGENT, raw=b'{"x":"' + b"a" * 1100 + b'"}')[0], 400)
+        # The long-poll counts against the token's slots.
+        first = threading.Thread(target=self.call, args=("GET", f"{path}?wait=2", None, PHONE))
+        first.start()
+        threading.Event().wait(0.3)
+        self.assertEqual(self.call("GET", f"{path}?wait=2", token=PHONE)[0], 429)
+        status, _, body = self.call("POST", path, token=AGENT, body={"signer": SIGNER, "nonce": "N" * 43})
+        self.assertEqual((status, json.loads(body)), (200, {"state": "revealed"}))
+        first.join(5)
+        status, _, body = self.call("GET", f"{path}?wait=1", token=PHONE)
+        self.assertEqual((status, json.loads(body)), (200, {"nonce": "N" * 43}))
 
     def test_without_the_page_only_the_api_and_health_answer(self):
         self.start(serve_web=False)

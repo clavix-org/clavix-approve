@@ -190,6 +190,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "ClavixApprove-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Clavix;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_NSCameraUsageDescription = "La caméra lit le QR code d’appairage affiché par la machine.";
@@ -221,6 +222,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "ClavixApprove-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Clavix;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_NSCameraUsageDescription = "La caméra lit le QR code d’appairage affiché par la machine.";

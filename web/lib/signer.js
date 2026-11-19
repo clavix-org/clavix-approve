@@ -7,37 +7,58 @@
 // the SSH key; we return a proof made with our approval key). PROTOCOL.md,
 // "Approve mode".
 
-import { b64u, hex, randomBytes } from './bytes.js';
+import { b64u, hex, randomBytes, unb64u } from './bytes.js';
 import { openMessage, requestHeader, responseHeader, sealMessage } from './channel.js';
-import { buildAnswer, pairingFingerprint, pairToken, parsePairingCode, readHello } from './pairing.js';
+import {
+  buildAnswer, checkReveal, NONCE_LENGTH, pairingDigits, pairToken, parsePairingCode, readHello,
+} from './pairing.js';
 import {
   approvalBytes, approvedResponse, checkApproveRequest, checkSignRequest, deniedResponse, label, signedResponse,
   tokenAuth,
 } from './protocol.js';
 import { RelayClient } from './relay.js';
 
+// How long to wait for the agent's nonce once we have answered: it reveals
+// it as soon as it reads our answer.
+const REVEAL_WAIT_S = 60;
+
 // First half of a pairing: read and authenticate the agent's hello.
-// Returns { ch, secret, client, hello: { label, agent, mode } }; nothing is
-// sent yet, so the caller can still prepare the key the mode needs.
+// Returns { ch, secret, base, client, hello: { label, agent, mode, commit } };
+// nothing is sent yet, so the caller can show what it is about to pair
+// with, and prepare the key the mode needs.
 export async function openPairing({ base, code, fetchFn }) {
   const { ch, secret } = parsePairingCode(code);
   const client = new RelayClient(base, ch, await pairToken(secret), fetchFn);
   const hello = await readHello((await client.hello()).hello, ch, secret);
-  return { ch, secret, client, hello };
+  return { ch, secret, base, fetchFn, client, hello };
 }
 
-// Second half: answer with our keys. `keyBlob` is the key of the hello's
-// mode (the SSH key, or the approval key). Returns what must be stored:
-// { ch, signer, token, agent, label, mode, fingerprint }, `agent` being the
-// peer's public keys and `fingerprint` the six digits to compare with the
-// agent's display.
-export async function completePairing({ ch, secret, client, hello }, { me, keyBlob, comment }) {
-  const { mode } = hello;
+// Second half: answer with our keys and a fresh nonce, wait for the
+// agent's nonce, check it against the hello's commitment. `keyBlob` is the
+// key of the hello's mode (the SSH key, or the approval key). Returns what
+// must be stored: { ch, signer, token, agent, label, mode, fingerprint,
+// confirmed: false }, `agent` being the peer's public keys and
+// `fingerprint` the six digits. The pairing must accept no request until
+// the user has said the agent shows the same digits (`confirmed`).
+export async function completePairing(opening, { me, keyBlob, comment }) {
+  const { ch, secret, client, hello } = opening;
+  const { mode, commit } = hello;
   const signer = hex(randomBytes(8));
   const token = b64u(randomBytes(32));
-  const msg = await buildAnswer({ ch, signer, secret, me, agent: hello.agent, keyBlob, comment, mode });
+  const nonce = randomBytes(NONCE_LENGTH);
+  const msg = await buildAnswer({ ch, signer, secret, me, agent: hello.agent, keyBlob, comment, mode, nonce, commit });
   const res = await client.pair(signer, await tokenAuth(token), msg);
   if (res.state !== 'paired') throw new Error(`the relay refused the pairing (${res.state})`);
+
+  const own = new RelayClient(opening.base, ch, token, opening.fetchFn);
+  const deadline = Date.now() + REVEAL_WAIT_S * 1000;
+  let revealed = null;
+  while (!revealed) {
+    if (Date.now() > deadline) throw new Error('the machine did not finish the pairing');
+    revealed = await own.reveal(20);
+  }
+  const agentNonce = unb64u(revealed);
+  await checkReveal(agentNonce, commit);
 
   return {
     ch,
@@ -46,7 +67,10 @@ export async function completePairing({ ch, secret, client, hello }, { me, keyBl
     agent: hello.agent,
     label: label(hello.label) ?? '',
     mode,
-    fingerprint: await pairingFingerprint(hello.agent, me, keyBlob, mode),
+    fingerprint: await pairingDigits({
+      mode, ch, signer, agent: hello.agent, device: me, keyBlob, agentNonce, signerNonce: nonce,
+    }),
+    confirmed: false,
   };
 }
 

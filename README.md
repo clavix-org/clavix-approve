@@ -47,7 +47,7 @@ cargo build -p clavix-agent
 CLAVIX_ENROLL_SECRET=dev target/debug/clavix-agent pair --relay http://127.0.0.1:8765
 
 # …which the stand-in enters (or the page, at http://localhost:8765)
-node tools/fake-phone.mjs pair --relay http://127.0.0.1:8765 --state ./state/phone.json --code cva1-…
+node tools/fake-phone.mjs pair --relay http://127.0.0.1:8765 --state ./state/phone.json --code cva2-…
 
 # 3. run both, then use ssh with the agent's socket
 node tools/fake-phone.mjs run --state ./state/phone.json &
@@ -164,10 +164,12 @@ real clients. The relay only answers `GET`, `HEAD` and `POST`.
 - **A request left unanswered expires** after 90 seconds and `ssh` fails
   with `agent refused operation`.
 - **Pairing with a QR code**: `clavix-agent pair` prints the code, the
-  same code as a link carrying the relay address (one line, to copy), and
-  a QR code of that link. The phone's camera opens the page in the browser, which
-  only offers to copy the code; it must then be pasted in the installed
-  app, whose storage is separate.
+  same code as a `clavix-approve://pair?relay=…#cva2-…` link (one line, to
+  copy), and a QR code of that link, for the Clavix Approve app. The link
+  never points to a page of the relay: the pairing secret must not reach
+  code the relay serves. The web page pairs only with a pasted code.
+- **Pairing is version 2**: codes start with `cva2-`. Pairings made with
+  an earlier version are refused at both ends and must be made again.
 
 ## Needs the iPhone
 

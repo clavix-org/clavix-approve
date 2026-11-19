@@ -5,7 +5,7 @@ import { b64u, concat, unb64u, utf8 } from '../lib/bytes.js';
 import {
   generateIdentity, openMessage, pairHeader, peer, requestHeader, responseHeader, sealIntroduction, sealMessage,
 } from '../lib/channel.js';
-import { buildAnswer, pairingFingerprint, readHello } from '../lib/pairing.js';
+import { buildAnswer, pairingDigits, readHello } from '../lib/pairing.js';
 import { approve, deny, readRequest } from '../lib/signer.js';
 import { sshString } from '../lib/ssh.js';
 import { bind, clientKey, hostKey, userAuth } from './helpers.mjs';
@@ -46,14 +46,20 @@ test('headers and peers reject malformed input', async () => {
 });
 
 // The agent's side of the pairing, as agent/src/pairing.rs does it.
+const COMMIT = new Uint8Array(32).fill(5);
+
 async function agentHello(agent, secret, label = 'build-box') {
   const ikm = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveBits']);
   const raw = await crypto.subtle.deriveBits(
     { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: utf8('clavix-approve/v1/pair-mac') }, ikm, 256);
   const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const transcript = concat(...[utf8('hello'), utf8(CH), agent.kemPublic, agent.sigPublic, utf8(label)].map(sshString));
+  const transcript = concat(...[utf8('clavix-approve/v2/pair-hello'), utf8('sign'), utf8(CH), agent.kemPublic,
+    agent.sigPublic, utf8(label), COMMIT].map(sshString));
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, transcript));
-  return b64u(utf8(JSON.stringify({ label, kem: b64u(agent.kemPublic), sig: b64u(agent.sigPublic), mac: b64u(mac) })));
+  return b64u(utf8(JSON.stringify({
+    v: 2, mode: 'sign', label, kem: b64u(agent.kemPublic), sig: b64u(agent.sigPublic), commit: b64u(COMMIT),
+    mac: b64u(mac),
+  })));
 }
 
 test('the hello is accepted only with the pairing secret it was made with', async () => {
@@ -63,6 +69,7 @@ test('the hello is accepted only with the pairing secret it was made with', asyn
   const read = await readHello(hello, CH, secret);
   assert.equal(read.label, 'build-box');
   assert.deepEqual(read.agent, peerOf(agent));
+  assert.deepEqual(read.commit, COMMIT);
 
   // A relay substituting its own keys does not know the secret.
   const relayKeys = await generateIdentity();
@@ -74,22 +81,31 @@ test('the hello is accepted only with the pairing secret it was made with', asyn
 test('the pairing answer is an introduction sealed to the agent', async () => {
   const [agent, phone] = await Promise.all([generateIdentity(), generateIdentity()]);
   const key = await clientKey();
+  const nonce = new Uint8Array(32).fill(4);
   const msg = await buildAnswer({
     ch: CH, signer: SIGNER, secret: new Uint8Array(16).fill(9), me: phone, agent: peerOf(agent),
-    keyBlob: key.blob, comment: 'phone',
+    keyBlob: key.blob, comment: 'phone', mode: 'sign', nonce, commit: COMMIT,
   });
   const raw = unb64u(msg);
   assert.deepEqual(raw.subarray(0, 32), phone.sigPublic);
   const inner = await openMessage(agent, peerOf(phone), pairHeader(CH, SIGNER), b64u(raw.subarray(32)));
   assert.equal(inner.t, 'pair');
+  assert.equal(inner.v, 2);
   assert.equal(inner.key, b64u(key.blob));
   assert.equal(inner.kem, b64u(phone.kemPublic));
+  assert.equal(inner.nonce, b64u(nonce));
   assert.equal(await sealIntroduction(phone, peerOf(agent), pairHeader(CH, SIGNER), {}).then((m) => unb64u(m).length > 32), true);
 
-  const digits = await pairingFingerprint(peerOf(agent), phone, key.blob);
+  const input = {
+    mode: 'sign', ch: CH, signer: SIGNER, agent: peerOf(agent), device: phone, keyBlob: key.blob,
+    agentNonce: new Uint8Array(32).fill(1), signerNonce: nonce,
+  };
+  const digits = await pairingDigits(input);
   assert.match(digits, /^\d{3} \d{3}$/);
-  assert.equal(await pairingFingerprint(peerOf(agent), phone, key.blob), digits);
-  assert.notEqual(await pairingFingerprint(peerOf(await generateIdentity()), phone, key.blob), digits);
+  assert.equal(await pairingDigits(input), digits);
+  assert.notEqual(await pairingDigits({ ...input, agent: peerOf(await generateIdentity()) }), digits);
+  // The agent's nonce, hidden until the device has answered, changes them.
+  assert.notEqual(await pairingDigits({ ...input, agentNonce: new Uint8Array(32).fill(2) }), digits);
 });
 
 test('a signer reads, approves and denies requests through the channel', async () => {

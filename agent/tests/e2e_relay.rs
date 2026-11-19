@@ -151,7 +151,7 @@ impl Bench {
         let pairing = Lines::spawn(pair);
         let code = pairing.next("pairing code", |line| {
             line.trim()
-                .starts_with("cva1-")
+                .starts_with("cva2-")
                 .then(|| line.trim().to_string())
         });
         let phone = Command::new("node")
@@ -496,7 +496,7 @@ fn pairing_again_revokes_the_previous_pairing() {
     let pairing = Lines::spawn(pair);
     let code = pairing.next("pairing code", |line| {
         line.trim()
-            .starts_with("cva1-")
+            .starts_with("cva2-")
             .then(|| line.trim().to_string())
     });
     let phone = Command::new("node")
@@ -521,6 +521,54 @@ fn pairing_again_revokes_the_previous_pairing() {
         (line == bench.public_key).then_some(())
     });
     old_phone.event("revoked");
+}
+
+#[test]
+fn refusing_the_digits_of_a_first_pairing_revokes_its_channel() {
+    if !available() {
+        return;
+    }
+    let bench = Bench::new();
+    // No --yes and no answer on standard input: the digits are refused.
+    let mut pair = Command::new(AGENT);
+    pair.args(["pair", "--relay", &bench.relay_url, "--label", "test-bench"])
+        .env("CLAVIX_AGENT_DIR", bench.path("agent-state"))
+        .env("CLAVIX_ENROLL_SECRET", ENROLL_SECRET);
+    let pairing = Lines::spawn(pair);
+    let code = pairing.next("pairing code", |line| {
+        line.trim()
+            .starts_with("cva2-")
+            .then(|| line.trim().to_string())
+    });
+    let phone = Command::new("node")
+        .arg(repo().join("tools/fake-phone.mjs"))
+        .args([
+            "pair",
+            "--relay",
+            &bench.relay_url,
+            "--code",
+            &code,
+            "--state",
+        ])
+        .arg(bench.path("refused.json"))
+        .output()
+        .unwrap();
+    // The device that was refused finds its channel gone on the relay:
+    // while it waits for the agent's nonce, or right after.
+    if phone.status.success() {
+        let mut run = Command::new("node");
+        run.arg(repo().join("tools/fake-phone.mjs"))
+            .args(["run", "--state"])
+            .arg(bench.path("refused.json"));
+        Lines::spawn(run).event("revoked");
+    } else {
+        let err = String::from_utf8_lossy(&phone.stderr);
+        assert!(err.contains("HTTP 401"), "{err}");
+    }
+    // The pairing in place is untouched.
+    let (ok, out, _) = bench.cli(&["pubkey"]);
+    assert!(ok);
+    assert_eq!(out.trim(), bench.public_key);
 }
 
 #[test]
@@ -560,7 +608,7 @@ impl Bench {
         let pairing = Lines::spawn(pair);
         let code = pairing.next("pairing code", |line| {
             line.trim()
-                .starts_with("cva1-")
+                .starts_with("cva2-")
                 .then(|| line.trim().to_string())
         });
         let phone = Command::new("node")

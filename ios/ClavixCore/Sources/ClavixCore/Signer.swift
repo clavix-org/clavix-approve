@@ -16,14 +16,21 @@ public struct PairingRecord: Codable, Equatable {
     /// Set at pairing, for good. Records made before approve mode have none:
     /// they are in sign mode.
     public let mode: PairingMode
+    /// The pairing protocol version it was made with. Records of the first
+    /// version have none: they are obsolete, and must be made again.
+    public let version: Int
+    /// Whether the user said the machine shows the same digits. Until then
+    /// the pairing accepts no request.
+    public var confirmed: Bool
 
     public init(relay: URL, ch: String, signer: String, token: String, agent: Peer, label: String,
-                fingerprint: String, mode: PairingMode) {
+                fingerprint: String, mode: PairingMode, version: Int = Pairing.version, confirmed: Bool = false) {
         (self.relay, self.ch, self.signer, self.token, self.agent, self.label, self.fingerprint, self.mode)
             = (relay, ch, signer, token, agent, label, fingerprint, mode)
+        (self.version, self.confirmed) = (version, confirmed)
     }
 
-    enum CodingKeys: String, CodingKey { case relay, ch, signer, token, agent, label, fingerprint, mode }
+    enum CodingKeys: String, CodingKey { case relay, ch, signer, token, agent, label, fingerprint, mode, version, confirmed }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -35,7 +42,29 @@ public struct PairingRecord: Codable, Equatable {
         label = try c.decode(String.self, forKey: .label)
         fingerprint = try c.decode(String.self, forKey: .fingerprint)
         mode = try c.decodeIfPresent(PairingMode.self, forKey: .mode) ?? .sign
+        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        confirmed = try c.decodeIfPresent(Bool.self, forKey: .confirmed) ?? false
     }
+
+    /// Made with the current protocol: a record of the first version was
+    /// paired with digits a relay could steer, and is not used.
+    public var isCurrent: Bool { version >= Pairing.version }
+
+    /// May this pairing's requests be shown and answered?
+    public var isActive: Bool { isCurrent && confirmed }
+}
+
+/// A hello read and authenticated, nothing sent yet: what the user must
+/// see before the phone answers (relay, machine, mode).
+public struct PairingOffer {
+    public let relay: URL
+    public let code: PairingCode
+    public let hello: PairingHello
+
+    /// The machine's name, cleaned for display (unverified).
+    public var label: String { ClavixCore.label(hello.label) ?? "" }
+    public var mode: PairingMode { hello.mode }
+    public var isOfficialRelay: Bool { RelayAddress.isOfficial(relay) }
 }
 
 public struct SignerContext {
@@ -54,30 +83,66 @@ public struct SignerContext {
 }
 
 public enum Signer {
-    /// Pair with the agent that displayed `code`. `keyFor(mode)` gives the
-    /// key blob for the mode the agent asks for (the SSH key, or the
-    /// approval key), made then if need be.
-    public static func pair(relay: URL, code: PairingCode, me: Identity, comment: String,
-                            keyFor: (PairingMode) throws -> Data) async throws -> PairingRecord {
+    /// How long to wait for the agent's nonce after answering: it reveals
+    /// it as soon as it has read the answer.
+    static let revealWait: TimeInterval = 60
+
+    /// First half of a pairing: fetch and authenticate the agent's hello.
+    /// Nothing is sent: the caller shows the relay, the machine and the
+    /// mode, and answers only once the user agrees.
+    public static func open(relay: URL, code: PairingCode) async throws -> PairingOffer {
         let pairing = RelayClient(base: relay, ch: code.ch, token: Pairing.pairToken(code.secret))
         let hello = try Pairing.readHello(try await pairing.hello(), ch: code.ch, secret: code.secret)
-        let keyBlob = try keyFor(hello.mode)
+        return PairingOffer(relay: relay, code: code, hello: hello)
+    }
 
+    /// Second half: answer with our keys and a fresh nonce, wait for the
+    /// agent's nonce and check it against the hello's commitment.
+    /// `keyBlob` is the key of the offer's mode (the SSH key, or the
+    /// approval key). The record comes back unconfirmed: it accepts no
+    /// request until the user has said the machine shows the same digits.
+    public static func answer(_ offer: PairingOffer, me: Identity, keyBlob: Data,
+                              comment: String) async throws -> PairingRecord {
+        let code = offer.code
+        let pairing = RelayClient(base: offer.relay, ch: code.ch, token: Pairing.pairToken(code.secret))
         let signer = Data.random(8).hex
         let token = Data.random(32).b64u
-        let msg = try Pairing.buildAnswer(ch: code.ch, signer: signer, secret: code.secret, me: me, agent: hello.agent,
-                                          keyBlob: keyBlob, comment: comment, mode: hello.mode)
+        let nonce = Data.random(Pairing.nonceLength)
+        let msg = try Pairing.buildAnswer(ch: code.ch, signer: signer, secret: code.secret, me: me, hello: offer.hello,
+                                          keyBlob: keyBlob, nonce: nonce, comment: comment)
         let state = try await pairing.pair(signer: signer, signerAuth: tokenAuth(token), msg: msg)
         guard state == "paired" else { throw RelayError(status: 0, message: "the relay refused the pairing (\(state))") }
 
-        return PairingRecord(relay: relay, ch: code.ch, signer: signer, token: token, agent: hello.agent,
-                             label: label(hello.label) ?? "",
-                             fingerprint: Pairing.fingerprint(agent: hello.agent, me: me, keyBlob: keyBlob, mode: hello.mode),
-                             mode: hello.mode)
+        let own = RelayClient(base: offer.relay, ch: code.ch, token: token)
+        let deadline = Date().addingTimeInterval(revealWait)
+        var revealed: Data?
+        while revealed == nil {
+            guard Date() < deadline else {
+                _ = try? await own.revoke()
+                throw RelayError(status: 0, message: "the machine did not finish the pairing")
+            }
+            revealed = try await own.reveal(wait: 20)
+        }
+        do {
+            try Pairing.checkReveal(revealed!, commit: offer.hello.commit)
+        } catch {
+            // Someone in between: take this device off the channel at once.
+            _ = try? await own.revoke()
+            throw error
+        }
+
+        return PairingRecord(relay: offer.relay, ch: code.ch, signer: signer, token: token, agent: offer.hello.agent,
+                             label: offer.label,
+                             fingerprint: Pairing.digits(mode: offer.mode, ch: code.ch, signer: signer,
+                                                         agent: offer.hello.agent, me: me, keyBlob: keyBlob,
+                                                         agentNonce: revealed!, signerNonce: nonce),
+                             mode: offer.mode, version: Pairing.version, confirmed: false)
     }
 
     /// Open and check one entry of the relay's request list. Never throws.
+    /// A pairing the user has not confirmed answers nothing.
     public static func read(_ ctx: SignerContext, _ entry: RequestEntry, now: Double) -> Result<VerifiedRequest, Refusal> {
+        guard ctx.record.isActive else { return .failure(.unauthentic) }
         let inner: [String: Any]
         do {
             let hdr = Header.request(ch: ctx.record.ch, signer: ctx.record.signer, id: entry.id, exp: entry.exp)

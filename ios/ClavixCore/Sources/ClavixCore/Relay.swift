@@ -98,6 +98,16 @@ public struct RelayClient: Sendable {
         state(try await call("POST", "pair", body: ["signer": signer, "signer_auth": signerAuth, "msg": msg]))
     }
 
+    /// The agent's nonce, once it has read our answer (the token is the
+    /// signer's own, just enrolled). With `wait`, a long-poll; nil: not yet.
+    public func reveal(wait: Int = 0) async throws -> Data? {
+        let query = wait > 0 ? "?wait=\(wait)" : ""
+        guard let text = try await call("GET", "pair/reveal\(query)", timeout: TimeInterval(wait + 10))?["nonce"] as? String else {
+            return nil
+        }
+        return try Data(b64u: text)
+    }
+
     // ---- normal operation (the token is the signer's own) ----
 
     /// Register this device's push token. `sandbox` for a development build.

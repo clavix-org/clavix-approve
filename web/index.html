@@ -24,16 +24,6 @@
   </header>
 
   <main>
-    <section id="handoff" class="step" hidden>
-      <h2>Code d’appairage reçu</h2>
-      <p>Cette page est ouverte dans le navigateur, pas dans l’application installée : la clé de
-        signature n’est pas ici.</p>
-      <p>Copiez le code, ouvrez <strong>Clavix</strong> depuis l’écran d’accueil, puis collez-le à
-        l’étape « Appairage ».</p>
-      <pre id="handoff-code" class="wrap"></pre>
-      <button id="handoff-copy" type="button">Copier le code</button>
-    </section>
-
     <section id="requests" hidden>
       <h2>Demandes de signature</h2>
       <p id="no-request" class="muted">Aucune demande en attente.</p>
@@ -62,10 +52,16 @@
         <p>Sur la machine, lancez <code>clavix-agent pair</code> puis collez ici le code affiché.</p>
         <label for="pair-code">Code d’appairage</label>
         <input id="pair-code" type="text" autocomplete="off" autocapitalize="off" autocorrect="off"
-               spellcheck="false" placeholder="cva1-…">
+               spellcheck="false" placeholder="cva2-…">
         <button id="pair" type="button">Appairer</button>
         <button id="approve-key" type="button" hidden>Créer la clé de validation et appairer</button>
         <p id="pair-result" class="result"></p>
+        <div id="pair-check" hidden>
+          <p id="pair-check-text"></p>
+          <pre id="pair-digits" class="digits"></pre>
+          <button id="pair-confirm" type="button">Ce sont les mêmes chiffres</button>
+          <button id="pair-reject" type="button" class="secondary">Les chiffres diffèrent</button>
+        </div>
       </article>
 
       <article id="step-notify" class="step">

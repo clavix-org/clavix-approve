@@ -48,8 +48,19 @@ struct ContentView: View {
                     .toolbar { Button("Annuler") { addingMachine = false } }
             }
         }
-        .sheet(item: $model.justPaired) { record in PairedView(record: record) }
-        .onChange(of: model.justPaired?.id) { _, id in if id != nil { addingMachine = false } }
+        .sheet(item: $model.pairingSheet) { sheet in
+            switch sheet {
+            case .consent(let offer): PairingConsentView(offer: offer)
+            case .digits(let record): PairedView(record: record)
+            }
+        }
+        .onChange(of: model.pairingSheet?.id) { _, id in if id != nil { addingMachine = false } }
+        .alert("Appairage impossible", isPresented: Binding(get: { model.linkError != nil },
+                                                             set: { if !$0 { model.linkError = nil } })) {
+            Button("OK", role: .cancel) { model.linkError = nil }
+        } message: {
+            Text(model.linkError.map { "\($0)." } ?? "")
+        }
     }
 }
 
@@ -94,7 +105,7 @@ struct PairView: View {
     @State private var error: String?
     @State private var scanning = false
 
-    private var needsRelay: Bool { !code.contains("#" + PairingCode.prefix) }
+    private var needsRelay: Bool { !code.lowercased().hasPrefix(PairingCode.scheme + ":") }
 
     var body: some View {
         Form {
@@ -113,7 +124,7 @@ struct PairView: View {
             }
 
             Section {
-                Step(number: 2, text: "Scannez le QR code qu’elle affiche.")
+                Step(number: 2, text: "Scannez le QR code qu’elle affiche, ici ou avec l’appareil photo.")
                 if QRScanner.isAvailable {
                     Button {
                         scanning = true
@@ -131,7 +142,7 @@ struct PairView: View {
 
             Section {
                 HStack(alignment: .top) {
-                    TextField("cva1-…", text: $code, axis: .vertical)
+                    TextField("cva2-…", text: $code, axis: .vertical)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.system(.body, design: .monospaced))
@@ -174,7 +185,11 @@ struct PairView: View {
                 }
             }
         }
-        .onAppear { if relay.isEmpty { relay = model.remembered.lastRelay?.absoluteString ?? "" } }
+        .onAppear {
+            if relay.isEmpty {
+                relay = (model.remembered.lastRelay ?? RelayAddress.official).absoluteString
+            }
+        }
         .sheet(isPresented: $scanning) {
             ScanSheet { link in
                 code = link
@@ -183,13 +198,110 @@ struct PairView: View {
         }
     }
 
+    /// Reads the machine's hello; the pairing sheet then asks the user to
+    /// accept before anything is sent.
     private func pair() async {
         working = true
         error = nil
         defer { working = false }
         do {
-            try await model.pair(input: code, relayText: relay)
+            try await model.open(input: code, relayText: relay)
             code = ""
+        } catch {
+            self.error = "Échec : \(describe(error))."
+        }
+    }
+}
+
+/// Shown once the machine's hello is read, before the phone answers: the
+/// relay, the machine and the mode. Any relay but the official one needs
+/// an explicit extra step.
+struct PairingConsentView: View {
+    @EnvironmentObject private var model: Model
+    @Environment(\.dismiss) private var dismiss
+    let offer: PairingOffer
+    @State private var trustRelay = false
+    @State private var working = false
+    @State private var error: String?
+
+    private var host: String {
+        let h = offer.relay.host ?? offer.relay.absoluteString
+        return offer.relay.port.map { "\(h):\($0)" } ?? h
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    LabeledContent("Machine") {
+                        Text(offer.label.isEmpty ? "sans nom" : offer.label).bold()
+                    }
+                    LabeledContent("Mode") {
+                        Text(offer.mode == .approve ? "Validation" : "Signature").bold()
+                    }
+                    Text(offer.mode == .approve
+                         ? "L’ordinateur garde sa clé SSH et signe lui-même, une fois que cet iPhone a validé."
+                         : "Cet iPhone signera les connexions SSH de cette machine avec sa propre clé.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                } header: {
+                    Text("Appairer cet iPhone ?")
+                } footer: {
+                    Text("Le nom est celui que la machine se donne : vérifiez qu’il s’agit bien de la machine devant vous.")
+                }
+
+                Section {
+                    LabeledContent("Relais") {
+                        Text(host).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                    }
+                    if offer.isOfficialRelay {
+                        Label("Relais officiel de Clavix", systemImage: "checkmark.shield.fill")
+                            .foregroundStyle(Color.accentColor)
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Ce n’est pas le relais officiel de Clavix.", systemImage: "exclamationmark.triangle.fill")
+                                .font(.subheadline.weight(.semibold))
+                            Text("Ce relais verra quand cet iPhone est sollicité et pourra lui envoyer des notifications. N’acceptez que s’il est le vôtre ou celui de votre équipe. Si quelqu’un vous a envoyé ce code ou ce QR code, refusez.")
+                                .font(.footnote)
+                            Toggle("Je connais ce relais et je lui fais confiance", isOn: $trustRelay)
+                                .font(.footnote.weight(.semibold))
+                        }
+                        .padding(12)
+                        .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+
+                Section {
+                    Button {
+                        Task { await accept() }
+                    } label: {
+                        HStack {
+                            Text("Appairer").bold()
+                            if working { Spacer(); ProgressView() }
+                        }
+                    }
+                    .disabled(working || !(offer.isOfficialRelay || trustRelay))
+                } footer: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let error {
+                            Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                        }
+                        Text("Six chiffres s’afficheront ensuite, ici et sur la machine : ils doivent être les mêmes.")
+                    }
+                }
+            }
+            .navigationTitle("Nouvelle machine")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { Button("Annuler") { model.pairingSheet = nil; dismiss() }.disabled(working) }
+            .interactiveDismissDisabled(working)
+        }
+    }
+
+    private func accept() async {
+        working = true
+        error = nil
+        defer { working = false }
+        do {
+            try await model.accept(offer)
         } catch {
             self.error = "Échec : \(describe(error))."
         }
@@ -236,17 +348,21 @@ struct CommandBox: View {
     }
 }
 
+/// The digits of a pairing just answered. Until the user says the machine
+/// shows the same ones, the pairing accepts no request; once confirmed,
+/// what comes next for its mode.
 struct PairedView: View {
     @EnvironmentObject private var model: Model
     @Environment(\.dismiss) private var dismiss
     let record: PairingRecord
+    @State private var working = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     VStack(spacing: 8) {
-                        Image(systemName: "checkmark.seal.fill")
+                        Image(systemName: record.confirmed ? "checkmark.seal.fill" : "questionmark.diamond")
                             .font(.system(size: 44))
                             .foregroundStyle(Color.accentColor)
                         Text(record.fingerprint)
@@ -258,9 +374,37 @@ struct PairedView: View {
                 } header: {
                     Text("Chiffres de vérification")
                 } footer: {
-                    Text("La machine doit afficher les mêmes six chiffres. S’ils diffèrent, refusez sur la machine : quelqu’un s’est placé entre les deux.")
+                    Text(record.confirmed
+                         ? "Confirmés. Confirmez-les aussi sur la machine."
+                         : "La machine affiche six chiffres. Comparez-les : s’ils diffèrent, quelqu’un s’est placé entre les deux. Refusez alors ici et sur la machine.")
                 }
-                if record.mode == .approve {
+                if !record.confirmed {
+                    Section {
+                        Button {
+                            run { await model.confirm(record) }
+                        } label: {
+                            Label("Ce sont les mêmes chiffres", systemImage: "checkmark")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 6)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 4, trailing: 16))
+                        Button(role: .destructive) {
+                            run {
+                                await model.reject(record)
+                                dismiss()
+                            }
+                        } label: {
+                            Text("Les chiffres diffèrent").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 8, trailing: 16))
+                    } footer: {
+                        Text("Tant que vous n’avez pas confirmé, cette machine ne peut rien demander à cet iPhone.")
+                    }
+                    .disabled(working)
+                } else if record.mode == .approve {
                     Section {
                         Label("Validation seulement", systemImage: "checkmark.shield")
                             .font(.headline)
@@ -278,9 +422,26 @@ struct PairedView: View {
                     }
                 }
             }
-            .navigationTitle(record.label.isEmpty ? "Appairé" : "Appairé à \(record.label)")
+            .navigationTitle(record.label.isEmpty ? "Appairage" : "Appairage avec \(record.label)")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("Terminé") { model.justPaired = nil; dismiss() }.bold() }
+            .toolbar {
+                if record.confirmed {
+                    Button("Terminé") { model.pairingSheet = nil; dismiss() }.bold()
+                } else {
+                    // Left for later: the pairing stays unconfirmed, and
+                    // its card offers to compare the digits again.
+                    Button("Plus tard") { model.pairingSheet = nil; dismiss() }.disabled(working)
+                }
+            }
+            .interactiveDismissDisabled(!record.confirmed)
+        }
+    }
+
+    private func run(_ work: @escaping () async -> Void) {
+        working = true
+        Task {
+            await work()
+            working = false
         }
     }
 }
@@ -359,9 +520,11 @@ struct MachineCard: View {
     private var state: MachineState { model.state(of: pairing) }
     private var waiting: Int { model.requests.filter { $0.record.id == pairing.id }.count }
     private var stateText: String {
+        if !pairing.confirmed { return "À confirmer : comparez les chiffres" }
         if !state.text.isEmpty { return state.text }
         return waiting == 0 ? "Prêt" : waiting == 1 ? "1 demande en attente" : "\(waiting) demandes en attente"
     }
+    private var dotColor: Color { !pairing.confirmed ? .orange : state.isError ? .red : .green }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -376,11 +539,16 @@ struct MachineCard: View {
                     .foregroundStyle(.secondary)
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Circle()
-                        .fill(state.isError ? Color.red : Color.green)
+                        .fill(dotColor)
                         .frame(width: 8, height: 8)
                     Text(stateText)
                         .font(.subheadline)
-                        .foregroundStyle(state.isError ? .red : .secondary)
+                        .foregroundStyle(state.isError && pairing.confirmed ? .red : .secondary)
+                }
+                if !pairing.confirmed {
+                    Button("Voir les chiffres") { model.pairingSheet = .digits(pairing) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                 }
             }
         }
@@ -571,7 +739,7 @@ struct SettingsView: View {
                         Text(Model.machineName(p)).bold()
                         Text(p.mode == .approve ? "Validation (Clavix)" : "Signature (clavix-agent)")
                             .font(.caption).foregroundStyle(.secondary)
-                        Text("Chiffres \(p.fingerprint) · relais \(p.relay.host ?? p.relay.absoluteString)")
+                        Text("Chiffres \(p.fingerprint)\(p.confirmed ? "" : " (non confirmés)") · relais \(p.relay.host ?? p.relay.absoluteString)")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     .swipeActions { Button("Oublier", role: .destructive) { forgetting = p } }

@@ -9,7 +9,9 @@ import { test } from 'node:test';
 import { b64u, concat, hex, utf8 } from '../lib/bytes.js';
 import { generateIdentity, pairHeader, sealIntroduction } from '../lib/channel.js';
 import { approveWithWrappedKey, createWrappedApproveKey, createWrappedKey, signWithWrappedKey } from '../lib/lock.js';
-import { answerMac, buildAnswer, helloMac, pairingFingerprint, readHello } from '../lib/pairing.js';
+import {
+  answerMac, buildAnswer, checkReveal, commitment, helloMac, pairingDigits, parsePairingCode, readHello,
+} from '../lib/pairing.js';
 import { approvalBytes, checkApproveRequest, checkSignRequest, verifyApproval } from '../lib/protocol.js';
 import { approvalRequest, buildHello, newOffer, readAnswer, readApproval } from '../lib/requester.js';
 import { approvalData, deny, readRequest, sendApproval } from '../lib/signer.js';
@@ -22,30 +24,49 @@ const unb64u = (s) => new Uint8Array(Buffer.from(s, 'base64url'));
 
 // ---- the vectors --------------------------------------------------------------------
 
-test('the page reproduces the approve-mode pairing vectors', async () => {
-  const v = vector('approve-pairing.json');
+test('the page reproduces the pairing vectors, in both modes', async () => {
+  const v = vector('pairing.json');
   const secret = unhex(v.secret);
   const agent = { kemPublic: unhex(v.agent.kem), sigPublic: unhex(v.agent.sig) };
   const phone = { kemPublic: unhex(v.signer_keys.kem), sigPublic: unhex(v.signer_keys.sig) };
+  const agentNonce = unhex(v.agent_nonce), signerNonce = unhex(v.signer_nonce);
+  const commit = await commitment(agentNonce);
+  assert.equal(b64u(commit), v.commit);
+  assert.deepEqual(parsePairingCode(v.code), { ch: v.channel, secret });
+  await checkReveal(agentNonce, commit);
+  await assert.rejects(checkReveal(signerNonce, commit), /someone is in between/);
 
-  assert.equal(b64u(await helloMac(secret, 'approve', v.channel, agent, v.label)), v.hello_mac);
-  const hello = (extra) => b64u(utf8(JSON.stringify({
-    label: v.label, kem: b64u(agent.kemPublic), sig: b64u(agent.sigPublic), mac: v.hello_mac, ...extra,
-  })));
-  const read = await readHello(hello({ mode: 'approve' }), v.channel, secret);
-  assert.equal(read.mode, 'approve');
-  assert.equal(read.label, v.label);
-  // A relay that strips the mode, or makes it up, breaks the MAC.
-  await assert.rejects(readHello(hello({}), v.channel, secret), /does not match/);
-  await assert.rejects(readHello(hello({ mode: 'other' }), v.channel, secret), /unknown mode/);
+  for (const c of v.modes) {
+    assert.equal(b64u(await helloMac(secret, c.mode, v.channel, agent, v.label, commit)), c.hello_mac, c.mode);
+    const hello = (extra) => b64u(utf8(JSON.stringify({
+      v: 2, mode: c.mode, label: v.label, kem: b64u(agent.kemPublic), sig: b64u(agent.sigPublic), commit: v.commit,
+      mac: c.hello_mac, ...extra,
+    })));
+    const read = await readHello(hello({}), v.channel, secret);
+    assert.equal(read.mode, c.mode);
+    assert.equal(read.label, v.label);
+    // A relay that flips the mode or swaps the commitment breaks the MAC.
+    const other = c.mode === 'sign' ? 'approve' : 'sign';
+    await assert.rejects(readHello(hello({ mode: other }), v.channel, secret), /does not match/);
+    await assert.rejects(readHello(hello({ commit: b64u(new Uint8Array(32)) }), v.channel, secret), /does not match/);
+    await assert.rejects(readHello(hello({ mode: 'other' }), v.channel, secret), /unknown mode/);
+    // A hello of the first version is refused, with a reason.
+    await assert.rejects(readHello(hello({ v: undefined }), v.channel, secret), /older pairing protocol/);
 
-  for (const a of v.answers) {
-    const blob = unb64u(a.approve);
-    assert.equal(b64u(await answerMac(secret, 'approve', v.channel, v.signer, phone, blob, agent)), a.answer_mac, a.type);
-    assert.equal(await pairingFingerprint(agent, phone, blob, 'approve'), a.digits, a.type);
-    // Not the sign-mode digits: the mode is in the label.
-    assert.notEqual(await pairingFingerprint(agent, phone, blob), a.digits, a.type);
+    for (const a of c.answers) {
+      const blob = unb64u(a.key);
+      assert.equal(b64u(await answerMac(secret, c.mode, v.channel, v.signer, phone, blob, signerNonce, agent, commit)),
+        a.answer_mac, `${c.mode} ${a.type}`);
+      const digits = await pairingDigits({
+        mode: c.mode, ch: v.channel, signer: v.signer, agent, device: phone, keyBlob: blob, agentNonce, signerNonce,
+      });
+      assert.equal(digits, a.digits, `${c.mode} ${a.type}`);
+      assert.notEqual(await pairingDigits({
+        mode: other, ch: v.channel, signer: v.signer, agent, device: phone, keyBlob: blob, agentNonce, signerNonce,
+      }), a.digits);
+    }
   }
+  assert.throws(() => parsePairingCode(`cva1-${v.code.slice(5)}`), /older version/);
 });
 
 test('the page reproduces the approval bytes and verifies both proof vectors', async () => {
@@ -168,27 +189,44 @@ test('requester and signer pair in approve mode, and an approval goes through', 
   const secret = offer.secret;
 
   // Pairing: the hello says approve; the page answers with its approval key.
-  const hello = await readHello(await buildHello({ ch: offer.ch, secret, me: desktop, label: 'workstation' }), offer.ch, secret);
+  const built = await buildHello({ ch: offer.ch, secret, me: desktop, label: 'workstation', nonce: offer.nonce });
+  const hello = await readHello(built, offer.ch, secret);
   assert.equal(hello.mode, 'approve');
   const passkeySecret = crypto.getRandomValues(new Uint8Array(32));
   const approveKey = await createWrappedApproveKey(passkeySecret);
   const signer = '0123456789abcdef';
+  const nonce = crypto.getRandomValues(new Uint8Array(32));
+  const { commit } = hello;
   const msg = await buildAnswer({ ch: offer.ch, signer, secret, me: phone, agent: hello.agent,
-    keyBlob: approveKey.keyBlob, comment: 'clavix-approve', mode: 'approve' });
-  const device = await readAnswer({ ch: offer.ch, secret, me: desktop, answer: { signer, msg } });
+    keyBlob: approveKey.keyBlob, comment: 'clavix-approve', mode: 'approve', nonce, commit });
+  const device = await readAnswer({ ch: offer.ch, secret, me: desktop, answer: { signer, msg }, nonce: offer.nonce });
   assert.equal(hex(device.blob), hex(approveKey.keyBlob));
-  assert.equal(device.fingerprint, await pairingFingerprint(hello.agent, phone, approveKey.keyBlob, 'approve'));
+  // The device checks the nonce revealed after its answer, and both ends
+  // derive the same digits.
+  await checkReveal(offer.nonce, commit);
+  assert.equal(device.fingerprint, await pairingDigits({
+    mode: 'approve', ch: offer.ch, signer, agent: hello.agent, device: phone, keyBlob: approveKey.keyBlob,
+    agentNonce: offer.nonce, signerNonce: nonce,
+  }));
 
-  // A sign-mode answer (an old page) is refused by the requester…
+  // A sign-mode answer is refused by the requester…
   const signModeAnswer = await buildAnswer({ ch: offer.ch, signer, secret, me: phone, agent: hello.agent,
-    keyBlob: (await clientKey()).blob, comment: 'old', mode: 'sign' });
-  await assert.rejects(readAnswer({ ch: offer.ch, secret, me: desktop, answer: { signer, msg: signModeAnswer } }), /no approve key/);
+    keyBlob: (await clientKey()).blob, comment: 'old', mode: 'sign', nonce, commit });
+  await assert.rejects(readAnswer({ ch: offer.ch, secret, me: desktop, answer: { signer, msg: signModeAnswer },
+    nonce: offer.nonce }), /no approve key/);
   // … and so is an approve-mode answer under the sign-mode MAC.
   const forged = await sealIntroduction(phone, hello.agent, pairHeader(offer.ch, signer), {
-    t: 'pair', approve: b64u(approveKey.keyBlob), comment: '', kem: b64u(phone.kemPublic),
-    mac: b64u(await answerMac(secret, 'sign', offer.ch, signer, phone, approveKey.keyBlob, hello.agent)),
+    t: 'pair', v: 2, approve: b64u(approveKey.keyBlob), comment: '', kem: b64u(phone.kemPublic), nonce: b64u(nonce),
+    mac: b64u(await answerMac(secret, 'sign', offer.ch, signer, phone, approveKey.keyBlob, nonce, hello.agent, commit)),
   });
-  await assert.rejects(readAnswer({ ch: offer.ch, secret, me: desktop, answer: { signer, msg: forged } }), /not from the device/);
+  await assert.rejects(readAnswer({ ch: offer.ch, secret, me: desktop, answer: { signer, msg: forged },
+    nonce: offer.nonce }), /not from the device/);
+  // … and an answer of the first protocol version, with a reason.
+  const old = await sealIntroduction(phone, hello.agent, pairHeader(offer.ch, signer), {
+    t: 'pair', approve: b64u(approveKey.keyBlob), comment: '', kem: b64u(phone.kemPublic), mac: b64u(nonce),
+  });
+  await assert.rejects(readAnswer({ ch: offer.ch, secret, me: desktop, answer: { signer, msg: old },
+    nonce: offer.nonce }), /older pairing protocol/);
 
   // A request for `ssh deploy@host` with the requester's own key.
   const key = await requesterKey('ed25519');

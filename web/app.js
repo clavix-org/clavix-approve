@@ -12,7 +12,7 @@ import { generateIdentity, peer, withPublicBytes } from './lib/channel.js';
 import {
   approveWithWrappedKey, createPasskey, createWrappedApproveKey, createWrappedKey, signWithWrappedKey, unlock,
 } from './lib/lock.js';
-import { PAIR_CODE_PREFIX } from './lib/pairing.js';
+import { label } from './lib/protocol.js';
 import { RelayClient, RelayError } from './lib/relay.js';
 import {
   approvalData, approve, completePairing, deny, openPairing, readRequest, sendApproval,
@@ -32,8 +32,9 @@ const state = {
   credentialId: null,
   sshKey: null,     // { keyBlob, iv, ct }
   approveKey: null, // { keyBlob, iv, ct }, approve mode; made with the SSH key, or when first needed
-  pairing: null,    // { ch, signer, token, agentKem, agentSig, label, mode, fingerprint }
-  pins: {},         // host key fingerprint -> name chosen on this device
+  pairing: null,    // { ch, signer, token, agentKem, agentSig, label, mode, fingerprint }, confirmed
+  pending: null,    // the same, answered but not confirmed yet: accepts no request
+  pins: {},        // host key fingerprint -> name chosen on this device
   journal: [],      // [{ at, text }]
 };
 // Derived at start and after pairing.
@@ -175,11 +176,16 @@ async function pair() {
         + 'Il faut une clé de validation, protégée par la même passkey.');
       return;
     }
+    result('pair-result', `Machine « ${label(opening.hello.label) || 'sans nom'} », mode ${
+      approveMode ? 'validation' : 'signature'} : en attente de ses chiffres…`);
     const paired = await completePairing(opening, {
       me, keyBlob: approveMode ? state.approveKey.keyBlob : state.sshKey.keyBlob, comment: COMMENT,
     });
-    const previous = state.pairing;
-    state.pairing = {
+    // Held aside, unconfirmed: it accepts no request, and the pairing in
+    // place keeps working, until the user says the digits match.
+    await dropPending();
+    state.pending = {
+      v: 2,
       ch: paired.ch,
       signer: paired.signer,
       token: paired.token,
@@ -189,25 +195,59 @@ async function pair() {
       mode: paired.mode,
       fingerprint: paired.fingerprint,
     };
-    await store.set('pairing', state.pairing);
-    repairing = false;
-    stopWatching();
-    cards.forEach((_, id) => removeCard(id));
+    await store.set('pendingPairing', state.pending);
     $('pair-code').value = '';
     $('approve-key').hidden = true;
-    await journal(`Appairé avec ${paired.label || 'un agent'}${approveMode ? ' (validation seulement)' : ''}`);
-    if (previous && previous.ch !== paired.ch) {
-      // Best effort: the old channel is dead to us either way.
-      try {
-        await new RelayClient('', previous.ch, previous.token).revoke();
-        await journal(`Appairage précédent (${previous.label || 'sans nom'}) révoqué`);
-      } catch (_) { /* left on the relay, harmless */ }
-    }
-    await connect();
-    result('pair-result', `Appairé. Chiffres à comparer avec ceux de l’agent : ${paired.fingerprint}`, 'ok');
+    result('pair-result', '');
   } catch (e) {
     result('pair-result', `Échec : ${describe(e)}.`, 'error');
   }
+  draw();
+}
+
+// The user saw the same digits on the machine: the pending pairing
+// replaces the one in place, which is revoked (best effort).
+async function confirmPairing() {
+  const paired = state.pending;
+  if (!paired) return;
+  const previous = state.pairing;
+  state.pairing = paired;
+  state.pending = null;
+  await store.set('pairing', state.pairing);
+  await store.remove('pendingPairing');
+  repairing = false;
+  stopWatching();
+  cards.forEach((_, id) => removeCard(id));
+  await journal(`Appairé avec ${paired.label || 'un agent'}${paired.mode === 'approve' ? ' (validation seulement)' : ''}`);
+  if (previous && previous.ch !== paired.ch) {
+    // Best effort: the old channel is dead to us either way.
+    try {
+      await new RelayClient('', previous.ch, previous.token).revoke();
+      await journal(`Appairage précédent (${previous.label || 'sans nom'}) révoqué`);
+    } catch (_) { /* left on the relay, harmless */ }
+  }
+  await connect();
+  result('pair-result', `Appairé. Chiffres confirmés : ${paired.fingerprint}`, 'ok');
+  draw();
+}
+
+// The digits differ, or the pairing is abandoned: take this device off
+// that channel and forget it.
+async function dropPending() {
+  const pending = state.pending;
+  if (!pending) return;
+  state.pending = null;
+  await store.remove('pendingPairing');
+  try {
+    await new RelayClient('', pending.ch, pending.token).revoke();
+  } catch (_) { /* the machine revokes it too when its user refuses */ }
+}
+
+async function rejectPairing() {
+  const label = state.pending?.label || 'sans nom';
+  await dropPending();
+  await journal(`Appairage avec ${label} refusé : les chiffres différaient`);
+  result('pair-result', 'Appairage refusé. Refusez-le aussi sur la machine.', 'error');
   draw();
 }
 
@@ -705,8 +745,16 @@ function draw() {
   $('pair').disabled = !hasKey;
   $('pair-code').disabled = !hasKey;
   $('notify').disabled = !paired;
+  const pending = state.pending;
+  $('pair-check').hidden = !pending;
+  if (pending) {
+    $('pair-check-text').textContent = `Machine « ${pending.label || 'sans nom'} », mode ${
+      pending.mode === 'approve' ? 'validation' : 'signature'}. Elle affiche six chiffres : ce doivent être ceux-ci. `
+      + 'Tant que vous ne les avez pas confirmés, elle ne peut rien demander à cet appareil.';
+    $('pair-digits').textContent = pending.fingerprint;
+  }
 
-  $('setup').hidden = hasKey && paired && notified && !repairing;
+  $('setup').hidden = hasKey && paired && notified && !repairing && !pending;
   $('requests').hidden = !(hasKey && paired);
   $('details').hidden = !hasKey;
   drawDetails();
@@ -714,30 +762,9 @@ function draw() {
   else if (!paired) status('Clé prête. Il reste à appairer une machine.');
 }
 
-// A pairing code can arrive in the URL fragment, from the QR code the
-// agent displays. The fragment never reaches the server; it is removed
-// from the address at once so it does not linger there.
-function takeCodeFromAddress() {
-  const code = decodeURIComponent(location.hash.slice(1));
-  if (!code.startsWith(PAIR_CODE_PREFIX) || !/^[A-Za-z0-9_-]+$/.test(code)) return null;
-  history.replaceState(null, '', location.pathname);
-  return code;
-}
-
-function offerCode(code) {
-  $('pair-code').value = code;
-  if (state.sshKey) {
-    // The key is here: go straight to the pairing step.
-    repairing = Boolean(state.pairing);
-    return;
-  }
-  if (!standalone()) {
-    // Opened by the camera in the browser, whose storage is not the
-    // installed app's: all we can do here is hand the code over.
-    $('handoff-code').textContent = code;
-    $('handoff').hidden = false;
-  }
-}
+// A pairing code is only ever pasted here. The agent's QR code opens the
+// Clavix Approve app (clavix-approve://), never this page: a page served
+// by the relay must not be handed pairing secrets from a link.
 
 async function start() {
   state.identity = (await store.get('identity')) ?? null;
@@ -745,12 +772,22 @@ async function start() {
   state.sshKey = (await store.get('sshKey')) ?? null;
   state.approveKey = (await store.get('approveKey')) ?? null;
   state.pairing = (await store.get('pairing')) ?? null;
+  state.pending = (await store.get('pendingPairing')) ?? null;
   state.pins = (await store.get('pins')) ?? {};
   state.journal = (await store.get('journal')) ?? [];
+  if (state.pairing && state.pairing.v !== 2) {
+    // Made with the first pairing protocol, whose digits a relay could
+    // steer: dropped, to be made again.
+    state.pairing = null;
+    await store.remove('pairing');
+    await journal('Appairage d’une version précédente retiré : appairez à nouveau');
+  }
 
   onClick('create-key', createKey);
   onClick('protect-key', protectKey);
   onClick('pair', pair);
+  onClick('pair-confirm', confirmPairing);
+  onClick('pair-reject', rejectPairing);
   onClick('approve-key', createApproveKey);
   onClick('notify', enableNotifications);
   onClick('pair-again', async () => {
@@ -783,27 +820,7 @@ async function start() {
   }
   setInterval(tick, 1000);
 
-  onClick('handoff-copy', async () => {
-    try {
-      await navigator.clipboard.writeText($('handoff-code').textContent);
-      $('handoff-copy').textContent = 'Code copié — ouvrez Clavix';
-    } catch (_) {
-      $('handoff-copy').textContent = 'Copie impossible : sélectionnez le code';
-    }
-  });
-  // At start, and when the link is opened in a tab that already shows
-  // the page (which changes the fragment without reloading).
-  const receiveCode = () => {
-    const code = takeCodeFromAddress();
-    if (!code) return;
-    offerCode(code);
-    draw();
-    if (state.sshKey) $('step-pair').scrollIntoView();
-  };
-  window.addEventListener('hashchange', receiveCode);
-
   draw();
-  receiveCode();
   await connect();
   await refreshSubscription();
 }

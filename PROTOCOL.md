@@ -1,4 +1,4 @@
-# Protocol (version 1, prototype)
+# Protocol (pairing version 2, prototype)
 
 How the three parts talk: the **agent** (key-less, on the machine that
 needs SSH), the **signer** (the approval page; holds the SSH key) and the
@@ -6,7 +6,7 @@ needs SSH), the **signer** (the approval page; holds the SSH key) and the
 page). Design rationale is in [`DESIGN.md`](DESIGN.md); what each part can
 and cannot do to the others is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
-Implementations: `agent/src/{channel,pairing,relay}.rs` and
+Implementations: `core/src/{channel,pairing,relay}.rs`, `ios/ClavixCore` and
 `web/lib/{channel,pairing,protocol,signer}.js`. They are kept in step by
 shared vectors in `testdata/` and by end-to-end tests that run both.
 
@@ -60,40 +60,87 @@ pairing   kind "pair",     fields: channel, signer id
 
 ## Pairing
 
-In person, once. The agent shows a **pairing code**:
+Pairing protocol **version 2**. In person, once. The agent shows a
+**pairing code**:
 
 ```
-"cva1-" || b64u( channel id(16) || pairing secret(16) )
+"cva2-" || b64u( channel id(16) || pairing secret(16) )
 ```
 
-The agent also prints it as a QR code of `<relay URL>/#<code>`. The page
-takes a code found in its address fragment, removes it from the address,
-and fills the pairing field — or, when opened where no key exists (the
-browser rather than the installed app), only offers to copy it.
+and prints it as a QR code of the app link
+
+```
+clavix-approve://pair?relay=<relay URL>#<code>
+```
+
+(the relay URL as is, except that characters a query cannot hold are
+percent-encoded). The `clavix-approve` scheme belongs to the Clavix
+Approve app, so the system camera hands the link to the app: the secret
+never reaches a page, and above all not one the relay serves. The app
+accepts that link or a bare code; the page only a pasted bare code, and
+ignores any code in its address.
+
+Version 1 codes (`cva1-`), hellos without `v: 2` and answers without
+`v: 2` are refused, each with a message saying the other end must be
+updated and the pairing made again. There is no compatibility mode.
 
 Two values are derived from the secret with HKDF-SHA256 (no salt):
 `info = "clavix-approve/v1/relay-pair"` gives the token the relay sees;
 `info = "clavix-approve/v1/pair-mac"` gives a MAC key the relay never
-sees.
+sees (these two labels kept their `v1`). `mode` below is the text
+`"sign"` or `"approve"`; `channel`, `signer id` and `label` are the bytes
+of their text (the ids in lowercase hex).
 
-1. Agent → relay, `POST /api/channels` (relay enrolment secret): channel
-   id, SHA-256 of its own token and of the pairing token, and a `hello`:
-   `b64u(JSON { label, kem, sig, mac })` with
-   `mac = HMAC-SHA256(mac key, string("hello") || string(channel) || string(kem) || string(sig) || string(label))`.
+1. Agent: draws a 32-byte nonce `nA` and keeps it to itself. Agent →
+   relay, `POST /api/channels` (relay enrolment secret): channel id,
+   SHA-256 of its own token and of the pairing token, and a `hello`:
+   `b64u(JSON { v: 2, mode, label, kem, sig, commit, mac })` with
+   `commit = SHA-256(string("clavix-approve/v2/pair-commit") || string(nA))` and
+   `mac = HMAC-SHA256(mac key, string("clavix-approve/v2/pair-hello") || string(mode) || string(channel) || string(kem) || string(sig) || string(label) || string(commit))`.
 2. Signer, given the code: fetches the hello with the pairing token and
-   checks its MAC — the relay cannot substitute its own keys.
-3. Signer → relay, `POST …/pair`: a signer id, the SHA-256 of its new
-   token, and `b64u( signer Ed25519 key(32) || sealed message )` with
-   header kind `pair` and content
-   `{ t: "pair", key, comment, kem, mac }`,
-   `mac = HMAC-SHA256(mac key, string("answer") || string(channel) || string(signer id) || string(signer kem) || string(signer sig) || string(SSH key blob) || string(agent kem) || string(agent sig))`.
+   checks its MAC. It then **shows the user, before answering**, the
+   relay's host, the machine's label (the agent's word) and the mode; any
+   relay but the official one takes an explicit extra step (iOS app).
+3. Signer: draws its own 32-byte nonce `nB`. Signer → relay,
+   `POST …/pair`: a signer id, the SHA-256 of its new token, and
+   `b64u( signer Ed25519 key(32) || sealed message )` with header kind
+   `pair` and content `{ t: "pair", v: 2, key, comment, kem, nonce, mac }`,
+   `nonce = b64u(nB)`,
+   `mac = HMAC-SHA256(mac key, string("clavix-approve/v2/pair-answer") || string(mode) || string(channel) || string(signer id) || string(signer kem) || string(signer sig) || string(key blob) || string(nB) || string(agent kem) || string(agent sig) || string(commit))`.
    The pairing token works once.
-4. Agent: opens it with the key in front, checks the MAC, accepts only an
-   `ecdsa-sha2-nistp256` key.
-5. Both display **six digits**: the first four bytes of
-   `SHA-256(string("clavix-approve/v1/fingerprint") || string(agent kem) || string(agent sig) || string(signer kem) || string(signer sig) || string(SSH key blob))`
+4. Agent: opens it with the key in front, checks `v`, the MAC and the
+   nonce's length, accepts only a key of the mode's type
+   (`ecdsa-sha2-nistp256` in sign mode). Only then, agent → relay,
+   `POST …/pair/reveal` (agent token) `{ signer, nonce: b64u(nA) }`.
+5. Signer: long-polls `GET …/pair/reveal?wait=` with its own new token,
+   gets `{ nonce }`, and checks `SHA-256(string("clavix-approve/v2/pair-commit") || string(nA)) = commit`.
+   A mismatch means someone is in between: the signer revokes itself and
+   stops.
+6. Both display **six digits**: the first four bytes of
+   `SHA-256(string("clavix-approve/v2/pair-digits") || string(mode) || string(channel) || string(signer id) || string(agent kem) || string(agent sig) || string(signer kem) || string(signer sig) || string(key blob) || string(nA) || string(nB))`
    as a big-endian integer modulo 10⁶. The agent saves the pairing only
-   after the user confirms they match.
+   after the user confirms they match, and revokes the channel (first
+   pairing) or the device (`--add`) when the user says they differ. The
+   signer holds the pairing **unconfirmed** — it polls no request,
+   registers no push token and answers nothing — until the user confirms
+   on it too; "they differ" revokes the device there.
+
+Why the digits hold even against a relay that learnt the secret: the
+agent's hello fixes `nA` (through `commit`) before the relay sees any
+answer, and the agent reveals `nA` only after the answer — keys and `nB` —
+is fixed. A relay in the middle must pick the keys and nonce it gives
+the agent before knowing `nA`, and the `nA` it reveals to the phone
+before knowing `nB`: whatever it does, the two ends show the same digits
+with probability 10⁻⁶, once per code, and every failed try is a refused
+pairing the user sees.
+
+Vectors: `testdata/pairing.json` gives, from a fixed secret, fixed HPKE
+and identity keys and fixed nonces, the MAC key, the commitment, and for
+each mode the hello MAC, then for each key type the answer MAC and the
+six digits, with every transcript in hex. Made by
+`tools/pairing-vectors.mjs` (node:crypto only), recomputed with Python's
+standard library and OpenSSL by `tools/approve-vectors-check.sh`, and
+checked by the Rust, JavaScript and Swift tests.
 
 ## Sign request (agent → signer)
 
@@ -170,6 +217,8 @@ Same origin as the page, unless the relay does not serve it (`RELAY_SERVE_WEB=of
 | `GET /api/ch/{ch}/pair` | pairing | fetch the hello |
 | `POST /api/ch/{ch}/pair` | pairing | enrol the signer (once) |
 | `GET /api/ch/{ch}/pair/answer?wait=` | agent | fetch the signer's answer |
+| `POST /api/ch/{ch}/pair/reveal` | agent | reveal its nonce to a signer (`{ signer, nonce }`, once per signer) |
+| `GET /api/ch/{ch}/pair/reveal?wait=` | signer | fetch the agent's nonce (`{ nonce }`; `204` before) |
 | `POST /api/ch/{ch}/subscription` | signer | store the push subscription |
 | `POST /api/ch/{ch}/requests` | agent | queue a request, send the push |
 | `GET /api/ch/{ch}/requests?wait=&known=` | signer | pending requests |
@@ -328,35 +377,14 @@ The requester accepts no other key type.
 
 ### Pairing in approve mode
 
-As in "Pairing", with three changes, each one also changing a label so
-that what the relay could flip is covered by a MAC or by the digits:
-
-1. The hello gains `mode: "approve"`, and its MAC uses the label
-   `"approve-hello"` in place of `"hello"`:
-   `HMAC-SHA256(mac key, string("approve-hello") || string(channel) || string(kem) || string(sig) || string(label))`.
-   A signer that does not know approve mode checks the `"hello"` MAC,
-   which fails: it refuses the code instead of pairing in the wrong mode.
-   A relay that strips or adds `mode` breaks the MAC the same way.
-2. The signer's answer is `{ t: "pair", approve, comment, kem, mac }`,
-   with `approve` = `b64u(approval key's SSH public key blob)` and no
-   `key`. Its MAC is
-   `HMAC-SHA256(mac key, string("approve-answer") || string(channel) || string(signer id) || string(signer kem) || string(signer sig) || string(approve blob) || string(agent kem) || string(agent sig))`.
-   The requester accepts only an answer with `approve`, of an accepted
-   type, under this MAC. A sign-mode agent finds no `key` and refuses it.
-3. The six digits are the first four bytes of
-   `SHA-256(string("clavix-approve/v1/approve-fingerprint") || string(agent kem) || string(agent sig) || string(signer kem) || string(signer sig) || string(approve blob))`
-   as a big-endian integer modulo 10⁶.
-
-`channel`, `signer id` and `label` are, as in sign mode, the bytes of
-their text (the ids in lowercase hex). Adding a device
-(`POST …/pair/open`) sends an approve-mode hello.
-
-Vectors: `testdata/approve-pairing.json` gives, from fixed pairing
-secret, HPKE and identity keys, the MAC key, the hello MAC, and for each
-approval key type the answer MAC and the six digits, with every
-transcript in hex. Made by `tools/approve-pairing-vectors.mjs`, recomputed
-with Python's standard library and OpenSSL by
-`tools/approve-vectors-check.sh`.
+As in "Pairing", with `mode` = `"approve"` in the hello, in every MAC
+and in the digits, so that a relay flipping the mode breaks a MAC. The
+signer's answer carries `approve` = `b64u(approval key's SSH public key
+blob)` in place of `key`; that blob is the `key blob` of the answer MAC
+and of the digits. The requester accepts only an answer with `approve`,
+of an accepted type; a sign-mode agent finds no `key` and refuses it.
+Adding a device (`POST …/pair/open`) sends an approve-mode hello. The
+vectors in `testdata/pairing.json` cover both modes.
 
 ### Approval request (requester → signer)
 

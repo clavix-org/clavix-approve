@@ -100,19 +100,19 @@ fn default_socket() -> Result<PathBuf, String> {
     Ok(PathBuf::from(runtime).join("clavix-agent.sock"))
 }
 
-/// Print the pairing code, and the same code as a QR code: when the phone
-/// is not the screen this is displayed on, its camera opens the approval
-/// page with the code.
+/// Print the pairing code, and the same code as a QR code of a
+/// `clavix-approve://` link: it opens the Clavix Approve app, never a web
+/// page, so the code reaches nothing but the app.
 fn show_code(relay: &str, code: &str) {
     let url = pairing_url(relay, code);
     println!("Pairing code (valid 15 minutes, works once):\n\n    {code}\n");
-    // The same code with the relay address, on one line to copy: an app
-    // that reads it needs no relay typed in.
-    println!("As a link, with the relay address:\n\n    {url}\n");
+    // The same code with the relay address, on one line to copy: the app
+    // then needs no relay typed in.
+    println!("As a link for the app, with the relay address:\n\n    {url}\n");
     if let Some(qr) = terminal_qr(&url) {
-        println!("Or scan this with the phone's camera, then follow the page:\n\n{qr}");
+        println!("Or scan this with the Clavix Approve app:\n\n{qr}");
     }
-    println!("Enter the code in the approval app. Waiting…");
+    println!("Check on the phone the relay and this machine's name before answering. Waiting…");
 }
 
 async fn pair(args: &[String]) -> Result<(), String> {
@@ -150,7 +150,10 @@ async fn pair(args: &[String]) -> Result<(), String> {
         paired.fingerprint
     );
     if !yes && !confirmed("Does the device show the same digits? [y/N] ") {
-        return Err("pairing abandoned; nothing was saved".into());
+        // The channel is already on the relay, with a device nobody
+        // trusts: take it off again, or it would stay there for good.
+        let _ = revoke(&client, &offer.ch, &offer.agent_token).await;
+        return Err("pairing abandoned; the channel was revoked and nothing was saved".into());
     }
     let (kem_private, sig_private) = offer.identity.secrets();
     let state = State {

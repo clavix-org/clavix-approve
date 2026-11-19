@@ -65,7 +65,7 @@ use tokio::time::Instant;
 
 use crate::bytes::{b64u, hex, random, unb64u, write_string};
 use crate::channel::{self, request_header, response_header, Identity, Peer};
-use crate::pairing::{pairing_url, Mode, Offer, APPROVE_KEY_TYPES};
+use crate::pairing::{pairing_url, Mode, Offer, PairingError, APPROVE_KEY_TYPES};
 use crate::relay::{
     self, state_of, unix_now, RelayClient, RelayError, POLL_SECONDS, RETRY_PAUSE, THROTTLED_PAUSE,
 };
@@ -106,6 +106,16 @@ impl From<RelayError> for Error {
         match e {
             RelayError::Status(401) => Self::Revoked,
             e => Self::Relay(e),
+        }
+    }
+}
+
+impl From<PairingError> for Error {
+    fn from(e: PairingError) -> Self {
+        match e {
+            PairingError::Relay(e) => e.into(),
+            PairingError::Gone => Self::Revoked,
+            e => Self::Invalid(e.to_string()),
         }
     }
 }
@@ -243,14 +253,19 @@ impl ApproveOffer {
         &self.offer.code
     }
 
-    /// The code as a link carrying the relay address, for a QR code or to
-    /// copy: an app that reads it needs no relay typed in.
+    /// The code as a `clavix-approve://pair?relay=…#code` link, for a QR
+    /// code or to copy: it opens the Clavix Approve app, which then needs
+    /// no relay typed in. Never show the code as a link to a web page.
     pub fn link(&self) -> String {
         pairing_url(self.client.base(), &self.offer.code)
     }
 
     /// Wait for a device to answer, at most `max` (the relay keeps an
-    /// unanswered code 15 minutes).
+    /// unanswered code 15 minutes). Once the answer is authenticated, our
+    /// nonce is revealed to the device, which then shows its digits.
+    /// If the user says the digits differ, revoke the device
+    /// ([`ApproveChannel::revoke`] or the relay's revoke call) rather than
+    /// just dropping it.
     pub async fn wait(&self, max: Duration) -> Result<PairedDevice, Error> {
         let answer = self.offer.wait_for_answer(&self.client, max).await?;
         Ok(PairedDevice {

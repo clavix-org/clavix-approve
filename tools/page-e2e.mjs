@@ -190,6 +190,9 @@ async function main() {
   await until('the page', async () => (await browser.text('#status'))?.startsWith('Commencez'));
   await until('the version', async () => (await browser.text('#version')) === 'Version dev');
   check(true, 'the page loads and asks for a key first');
+  // The digits of a pairing answered but not confirmed yet, once shown.
+  const pendingDigits = async () => ((await browser.eval("document.querySelector('#pair-check').hidden")) === false
+    ? browser.text('#pair-digits') : null);
 
   // 1. Key: one click, the virtual passkey answers both ceremonies.
   await browser.click('#create-key');
@@ -201,18 +204,23 @@ async function main() {
   const agentEnv = { ...process.env, HOME: join(dir, 'home'), CLAVIX_AGENT_DIR: join(dir, 'agent'), CLAVIX_ENROLL_SECRET: 'page-e2e' };
   const pairing = start(AGENT, ['pair', '--yes', '--relay', `http://127.0.0.1:${relayPort}`, '--label', 'banc-de-test'],
     { env: agentEnv });
-  const code = await until('the pairing code', () => /cva1-\S+/.exec(pairing.output)?.[0]);
+  const code = await until('the pairing code', () => /cva2-\S+/.exec(pairing.output)?.[0]);
+  check(pairing.output.includes(`clavix-approve://pair?relay=http://127.0.0.1:${relayPort}#${code}`),
+    'the link for the QR code opens the app, never a page of the relay');
   await browser.type('#pair-code', code);
   await browser.click('#pair');
-  const pairResult = await until('the pairing', async () => {
-    const text = await browser.text('#pair-result');
-    return text && !text.startsWith('Appairage en cours') ? text : null;
-  });
-  const digits = /(\d{3} \d{3})$/.exec(pairResult)?.[1];
-  check(Boolean(digits), `the page is paired (${pairResult})`);
+  const digits = await until('the digits to compare', pendingDigits);
+  check(/^\d{3} \d{3}$/.test(digits), `the page shows six digits (${digits})`);
   await until('the agent', () => pairing.output.includes('Paired.'));
   check(pairing.output.includes(digits), 'the agent shows the same verification digits');
   check(pairing.output.includes(publicKey), 'the agent shows the same public key');
+  check(!(await browser.text('#status'))?.startsWith('Prêt'), 'unconfirmed, the pairing is not in use yet');
+  await browser.click('#pair-confirm');
+  const pairResult = await until('the pairing', async () => {
+    const text = await browser.text('#pair-result');
+    return text?.startsWith('Appairé') ? text : null;
+  });
+  check(pairResult.endsWith(digits), `the page is paired once the digits are confirmed (${pairResult})`);
 
   // 3. A login: the page shows what it verified, not what it was told.
   const server = await sshd(publicKey);
@@ -281,15 +289,16 @@ async function main() {
   // 7. The relay lost its state, or the agent was reinstalled: pairing
   //    again keeps the SSH key, so servers need no change.
   const again = start(AGENT, ['pair', '--yes', '--relay', `http://127.0.0.1:${relayPort}`], { env: agentEnv });
-  const secondCode = await until('a second pairing code', () => /cva1-\S+/.exec(again.output)?.[0]);
-  // This time the code arrives as the QR code's link would bring it.
-  await browser.send('Page.navigate', { url: `${origin}/#${secondCode}` });
-  await until('the code in the pairing field', async () => (await browser.eval("document.querySelector('#pair-code')?.value")) === secondCode);
-  check((await browser.eval('location.hash')) === '', 'a code received in the address is taken and removed from it');
-  check(!(await browser.eval("document.querySelector('#setup').hidden")), 'and the pairing step is shown again');
+  const secondCode = await until('a second pairing code', () => /cva2-\S+/.exec(again.output)?.[0]);
+  await browser.click('#pair-again');
+  check(!(await browser.eval("document.querySelector('#setup').hidden")), 'the pairing step is shown again');
+  await browser.type('#pair-code', secondCode);
   await browser.click('#pair');
+  const secondDigits = await until('the second digits', pendingDigits);
   await until('the second pairing', () => again.output.includes('Paired.'));
+  check(again.output.includes(secondDigits), 'the agent shows the same digits again');
   check(again.output.includes(publicKey), 'pairing again keeps the same SSH public key');
+  await browser.click('#pair-confirm');
   await until('the page after pairing again', async () => (await browser.text('#status'))?.startsWith('Prêt'));
 
   const api = browser.requests.filter((r) => r.url.includes('/api/'));
@@ -345,14 +354,13 @@ async function main() {
   await until('the offer of an approval key', async () => (await browser.eval("document.querySelector('#approve-key').hidden")) === false);
   check((await browser.text('#pair-result')).includes('validation seulement'), 'an approve-mode code asks for an approval key first');
   await browser.click('#approve-key');
-  const approvePaired = await until('the approve-mode pairing', async () => {
-    const text = await browser.text('#pair-result');
-    return text?.startsWith('Appairé') ? text : null;
-  });
+  const approveDigits = await until('the approve-mode digits', pendingDigits);
   await closed(desktop);
   const desktopPaired = jsonEvent(desktop, 'paired');
-  check(desktopPaired && approvePaired.endsWith(desktopPaired.fingerprint),
+  check(desktopPaired && approveDigits === desktopPaired.fingerprint,
     `page and requester show the same digits (${desktopPaired?.fingerprint})`);
+  await browser.click('#pair-confirm');
+  await until('the approve-mode pairing', async () => (await browser.text('#pair-result'))?.startsWith('Appairé'));
   check(desktopPaired.approveKeyType === 'ssh-ed25519', 'the page answers with an Ed25519 approval key');
   check((await browser.text('#journal')).includes('Clé de validation créée'), 'made under the passkey when first needed');
   check((await browser.text('#pairing-info')).includes('validation seulement'), 'the pairing is shown as approve mode');
@@ -385,17 +393,16 @@ async function main() {
   check(jsonEvent(asking, 'denied')?.reason === 'malformed', 'a request of the other mode is refused as malformed');
   check((await browser.text('#journal')).includes('Demande écartée (malformed'), 'and the journal says so');
 
-  // 8. The same link opened where there is no key (the phone's browser
-  //    rather than the installed app): the page only hands the code over.
+  // 8. A code in the page's address is not taken: pairing secrets never
+  //    reach a page the relay serves by a link.
   const main = browser.session;
   browser.session = undefined; // browser-level commands
   const { browserContextId } = await browser.send('Target.createBrowserContext');
-  const { targetId } = await browser.send('Target.createTarget', { url: `${origin}/#cva1-${'A'.repeat(43)}`, browserContextId });
+  const { targetId } = await browser.send('Target.createTarget', { url: `${origin}/#cva2-${'A'.repeat(43)}`, browserContextId });
   browser.session = (await browser.send('Target.attachToTarget', { targetId, flatten: true })).sessionId;
   await browser.send('Runtime.enable');
-  await until('the hand-over notice', async () => (await browser.eval("document.querySelector('#handoff')?.hidden")) === false);
-  check((await browser.text('#handoff-code')) === `cva1-${'A'.repeat(43)}`, 'without a key, the page shows the code to copy into the app');
-  check((await browser.eval('location.hash')) === '', 'and removes it from the address there too');
+  await until('the page in another browser', async () => (await browser.text('#status'))?.startsWith('Commencez'));
+  check((await browser.eval("document.querySelector('#pair-code').value")) === '', 'a code in the address is ignored');
   browser.session = main;
 
   // The 401s are step 9's: a revoked pairing is told by the relay that way
