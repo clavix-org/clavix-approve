@@ -61,6 +61,13 @@ export class RelayClient {
     return this.call('POST', 'pair', { signer, signer_auth: signerAuth, msg });
   }
 
+  // The agent's nonce, once it has read our answer (the token is the
+  // signer's own, just enrolled). With `wait`, a long-poll; null: not yet.
+  async reveal(wait = 0, signal) {
+    const res = await this.call('GET', `pair/reveal${wait ? `?wait=${wait}` : ''}`, undefined, signal);
+    return res?.nonce ?? null;
+  }
+
   // Normal operation (the token is the signer's own).
   subscribe(subscription) {
     return this.call('POST', 'subscription', subscription);

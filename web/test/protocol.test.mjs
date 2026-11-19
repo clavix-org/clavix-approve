@@ -158,12 +158,13 @@ test('responses name the request they answer', async () => {
 
 test('pairing code and tokens match the agent side', async () => {
   const raw = new Uint8Array(32).fill(0xab, 0, 16).fill(0xcd, 16);
-  const { ch, secret } = parsePairingCode(` cva1-${b64u(raw)}\n`);
+  const { ch, secret } = parsePairingCode(` cva2-${b64u(raw)}\n`);
   assert.equal(ch, 'ab'.repeat(16));
   assert.equal(hex(secret), 'cd'.repeat(16));
   assert.throws(() => parsePairingCode(b64u(raw)));
-  assert.throws(() => parsePairingCode('cva1-AAAA'));
-  assert.throws(() => parsePairingCode('cva1-not base64'));
+  assert.throws(() => parsePairingCode('cva2-AAAA'));
+  assert.throws(() => parsePairingCode('cva2-not base64'));
+  assert.throws(() => parsePairingCode(`cva1-${b64u(raw)}`), /older version/);
 
   // Same vector as the Rust test (agent/src/pairing.rs).
   const vector = readFileSync(new URL('../../testdata/pair-token-07.txt', import.meta.url), 'utf8').trim();

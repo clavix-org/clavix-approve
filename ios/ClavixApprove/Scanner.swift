@@ -1,6 +1,7 @@
 // Reads the QR code that `clavix-agent pair` prints. Its payload is the
-// pairing link `<relay>/#cva1-…`, which PairingCode already accepts: one
-// scan fills in both the code and the relay.
+// pairing link `clavix-approve://pair?relay=<relay>#cva2-…`, which
+// PairingCode accepts (https relays only, or http on loopback): one scan
+// fills in both the code and the relay.
 
 import ClavixCore
 import SwiftUI

@@ -51,10 +51,10 @@ async function pair({ relay, state: file, label = 'fake-desktop' }) {
   if (!enroll) throw new Error('set CLAVIX_ENROLL_SECRET to the relay\'s enrolment secret');
   const me = await generateIdentity(true);
   const offer = newOffer();
-  const hello = await buildHello({ ch: offer.ch, secret: offer.secret, me, label });
+  const hello = await buildHello({ ch: offer.ch, secret: offer.secret, me, label, nonce: offer.nonce });
   const created = await RequesterRelay.createChannel(relay, enroll, await channelBody(offer, hello));
   if (created !== 'created') throw new Error(`the relay did not create the channel (${created})`);
-  say({ event: 'code', code: offer.code, link: `${relay.replace(/\/+$/, '')}/#${offer.code}` });
+  say({ event: 'code', code: offer.code, link: `clavix-approve://pair?relay=${relay.replace(/\/+$/, '')}#${offer.code}` });
 
   const client = new RequesterRelay(relay, offer.ch, offer.token);
   const deadline = Date.now() + PAIR_WINDOW_S * 1000;
@@ -63,7 +63,9 @@ async function pair({ relay, state: file, label = 'fake-desktop' }) {
     if (Date.now() > deadline) throw new Error('no device answered in time');
     answer = await client.pairAnswer(20);
   }
-  const device = await readAnswer({ ch: offer.ch, secret: offer.secret, me, answer });
+  const device = await readAnswer({ ch: offer.ch, secret: offer.secret, me, answer, nonce: offer.nonce });
+  const revealed = await client.reveal(device.signer, offer.nonce);
+  if (revealed !== 'revealed') throw new Error(`the relay did not pass the nonce on (${revealed})`);
   save(file, {
     relay,
     ch: offer.ch,

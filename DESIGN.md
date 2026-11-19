@@ -130,17 +130,19 @@ One-time, in person, by QR code:
 2. The phone scans it, generates its own identity key pair and the SSH
    signing key, and posts both public keys to the agent through the
    relay, authenticated by the pairing secret.
-3. Both sides display a short fingerprint of the two identity keys for
-   the user to compare. The agent prints the SSH public key to install
-   in `authorized_keys`.
+3. Both sides display six digits for the user to compare: a short
+   authentication string over both key sets and two nonces, the agent's
+   committed to before the phone answers and revealed after, so that a
+   relay holding the secret cannot steer them. The agent prints the SSH
+   public key to install in `authorized_keys`.
 
-Phase 0 replaces the QR code by a short code typed or pasted into the
-approval page: the central use case drives the remote machine from the
-very phone that would have to scan it, and the phone's camera app would
-open the browser rather than the installed web app. The exchange is the
-same; see `PROTOCOL.md`. A QR code of the same code is printed too,
-for when the terminal is on another screen: it leads to the page in the
-browser, from which the code is copied into the installed app.
+The code can also be typed or pasted: the central use case drives the
+remote machine from the very phone that would have to scan it. The QR
+code is a `clavix-approve://` link: the system camera hands it to the
+native app, never to a page, so the secret reaches no code the relay
+serves. The app shows the relay, the machine and the mode before
+answering, and keeps the new pairing unconfirmed, unused, until the user
+says the digits match. See `PROTOCOL.md`, "Pairing" (version 2).
 
 After pairing, every message is encrypted to the peer's static key and
 signed by the sender's (HPKE, RFC 9180, plus Ed25519 — no bespoke

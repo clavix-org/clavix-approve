@@ -33,8 +33,11 @@ final class Model: ObservableObject {
     @Published private(set) var requests: [PendingRequest] = []
     @Published private(set) var busy: Set<String> = []
     @Published private(set) var states: [String: MachineState] = [:]
-    /// Set by a pairing just made, until the user has compared the digits.
-    @Published var justPaired: PairingRecord?
+    /// The pairing sheet: what the user must accept before the phone
+    /// answers, then the digits to compare.
+    @Published var pairingSheet: PairingSheet?
+    /// A pairing link that could not be opened (from the camera or another app).
+    @Published var linkError: String?
     @Published private(set) var now = Date()
 
     private var seen: Set<String> = [] // every request already handled or shown
@@ -43,6 +46,17 @@ final class Model: ObservableObject {
     var pushToken: Data? { didSet { Task { await registerPush() } } }
 
     static let comment = "clavix-approve-iphone"
+
+    init() {
+        // Pairings of the first protocol version were confirmed with digits
+        // a relay could steer: they are dropped, and must be made again.
+        let current = pairings.filter(\.isCurrent)
+        if current.count != pairings.count {
+            try? Keys.save(pairings: current)
+            pairings = current
+            journal("Appairages d’une version précédente retirés : appairez à nouveau ces machines")
+        }
+    }
 
     var publicKeyLine: String? { keyBlob.map { SSH.publicKeyLine(keyBlob: $0, comment: Self.comment) } }
 
@@ -74,47 +88,92 @@ final class Model: ObservableObject {
 
     // ---- pairing ----
 
-    /// Pair with the agent that shows `input` (code or link). `relayText`
-    /// is used when the input is a bare code. The mode is the agent's: the
-    /// key it needs is made then if this device has none yet.
-    func pair(input: String, relayText: String) async throws {
+    /// First step of a pairing: read the hello of the agent that shows
+    /// `input` (a bare code, or the `clavix-approve://` link). `relayText`
+    /// is used for a bare code. Nothing is sent: the pairing sheet asks the
+    /// user to accept the relay, the machine and the mode first.
+    func open(input: String, relayText: String) async throws {
         let code = try PairingCode(input)
-        var relay = code.relay
-        if relay == nil {
+        let relay: URL
+        if let linked = code.relay {
+            relay = linked
+        } else {
             let text = relayText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let url = URL(string: text.contains("://") ? text : "https://" + text), url.host != nil else {
-                throw AppError("indiquez l’adresse du relais, ou collez le lien complet")
-            }
-            relay = url
+            guard !text.isEmpty else { throw AppError("indiquez l’adresse du relais, ou scannez le QR code") }
+            relay = try RelayAddress.parse(text)
         }
+        pairingSheet = .consent(try await Signer.open(relay: relay, code: code))
+    }
+
+    /// A `clavix-approve://pair?…` link, from the system camera.
+    func open(link: URL) async {
+        guard link.scheme?.lowercased() == PairingCode.scheme else { return }
+        do {
+            try await open(input: link.absoluteString, relayText: "")
+        } catch {
+            linkError = describe(error)
+        }
+    }
+
+    /// Second step, once the user accepted: answer with the key of the
+    /// agent's mode (made then if this device has none yet), receive the
+    /// agent's nonce, show the digits. The pairing is stored unconfirmed:
+    /// it accepts no request until the user says the digits match.
+    func accept(_ offer: PairingOffer) async throws {
         let identity = try Keys.identity()
-        let record = try await Signer.pair(relay: relay!, code: code, me: identity, comment: Self.comment) { mode in
-            switch mode {
-            case .sign: return try Keys.sshKeyBlob ?? Keys.createSSHKey()
-            case .approve: return try Keys.approveKeyBlob ?? Keys.createApproveKey()
-            }
+        let blob: Data
+        switch offer.mode {
+        case .sign: blob = try Keys.sshKeyBlob ?? Keys.createSSHKey()
+        case .approve: blob = try Keys.approveKeyBlob ?? Keys.createApproveKey()
         }
         keyBlob = Keys.sshKeyBlob
-        // The same channel paired again replaces its entry, whose device id
-        // is revoked (best effort); any other machine stays.
-        let replaced = pairings.filter { $0.ch == record.ch }
-        var next = pairings.filter { $0.ch != record.ch }
+        let record = try await Signer.answer(offer, me: identity, keyBlob: blob, comment: Self.comment)
+        var next = pairings
         next.append(record)
         try Keys.save(pairings: next)
         pairings = next
-        justPaired = record
-        remembered.lastRelay = relay
+        remembered.lastRelay = offer.relay
         Store.save(remembered)
+        pairingSheet = .digits(record)
+    }
+
+    /// The user saw the same digits on the machine: the pairing goes live.
+    /// The same channel paired before is replaced, its device id revoked
+    /// (best effort); any other machine stays.
+    func confirm(_ record: PairingRecord) async {
+        guard let i = pairings.firstIndex(where: { $0.id == record.id }) else { return }
+        var confirmed = pairings[i]
+        confirmed.confirmed = true
+        let replaced = pairings.filter { $0.ch == record.ch && $0.id != record.id }
+        var next = pairings.filter { $0.ch != record.ch }
+        next.append(confirmed)
+        do {
+            try Keys.save(pairings: next)
+        } catch {
+            linkError = describe(error)
+            return
+        }
+        pairings = next
+        pairingSheet = .digits(confirmed)
         journal(record.mode == .approve
                 ? "Appairé en validation avec \(Self.machineName(record))"
                 : "Appairé avec \(Self.machineName(record))")
-        for old in replaced where old.signer != record.signer {
+        for old in replaced {
             stopWatching(old)
+            states[old.id] = nil
             _ = try? await RelayClient(base: old.relay, ch: old.ch, token: old.token).revoke()
         }
         AppDelegate.askForPush()
         await registerPush()
         start()
+    }
+
+    /// The digits differ: someone is in between. This device is taken off
+    /// the channel and the pairing forgotten.
+    func reject(_ record: PairingRecord) async {
+        pairingSheet = nil
+        journal("Appairage avec \(Self.machineName(record)) refusé : les chiffres différaient")
+        await forget(machine: record)
     }
 
     /// Revoke this device on the relay for that machine, then forget it.
@@ -144,7 +203,9 @@ final class Model: ObservableObject {
         #else
         let sandbox = false
         #endif
-        for p in pairings {
+        // A pairing not confirmed yet gets no push token: it may be a relay
+        // the user turns down.
+        for p in pairings where p.isActive {
             do {
                 let state = try await RelayClient(base: p.relay, ch: p.ch, token: p.token)
                     .subscribeAPNs(deviceToken: token, sandbox: sandbox)
@@ -176,7 +237,8 @@ final class Model: ObservableObject {
             }
         }
         guard let identity = try? Keys.identity() else { return }
-        for p in pairings {
+        // An unconfirmed pairing accepts no request: it is not even polled.
+        for p in pairings where p.isActive {
             // A call left from before the app went to the background may be
             // dead: drop it and ask again.
             polling[p.id]?.cancel()
@@ -331,6 +393,21 @@ final class Model: ObservableObject {
 
 extension PairingRecord: @retroactive Identifiable {
     public var id: String { ch + signer }
+}
+
+/// What the pairing sheet shows.
+enum PairingSheet: Identifiable {
+    /// The hello was read; nothing sent yet.
+    case consent(PairingOffer)
+    /// Answered: the digits to compare (and, once confirmed, what next).
+    case digits(PairingRecord)
+
+    var id: String {
+        switch self {
+        case .consent(let offer): return "consent" + offer.code.ch
+        case .digits(let record): return "digits" + record.id
+        }
+    }
 }
 
 struct AppError: LocalizedError {

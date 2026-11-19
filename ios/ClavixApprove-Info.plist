@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged with the keys the build generates (INFOPLIST_KEY_* in the
+  project). Kept outside ClavixApprove/, whose files are all copied into
+  the app. The URL scheme lets the system camera hand the pairing link
+  clavix-approve://pair?relay=…#cva2-… to the app, never to a web page.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>org.clavix.approve.pair</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>clavix-approve</string>
+			</array>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+		</dict>
+	</array>
+</dict>
+</plist>

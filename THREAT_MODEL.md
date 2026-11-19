@@ -52,7 +52,22 @@ one connection.
 
 At pairing it cannot substitute its own keys: both directions carry a MAC
 keyed from the pairing secret, of which the relay only sees an unrelated
-derivation. The six verification digits are a second, human check.
+derivation. The secret never travels in a link to a page of the relay:
+the QR code is a `clavix-approve://` link that opens the app.
+
+Should the relay learn the secret all the same (a code pasted into the
+page it serves, a code shown to the wrong person), the six verification
+digits are a real short authentication string (pairing version 2): the
+agent commits to a random nonce in its hello and reveals it only after
+the device's keys and nonce have reached it, and the digits hash both
+key sets, both nonces and the mode. A relay in the middle can no longer
+search for keys that give matching digits: it has one chance in a
+million per code, and each failed try is a pairing the user refuses. The
+digits protect only if the user compares them, at both ends: the agent
+saves nothing until the user confirms, and the iPhone app holds a new
+pairing unconfirmed — no request read, no push token sent — until the
+user confirms there too. Refusing on either end revokes what the relay
+holds.
 
 It can withhold service, and it can send notifications at will (they
 carry no content and lead to an empty list).
@@ -76,6 +91,19 @@ hosts without checking the fingerprint defeats this protection.**
 It can bury the user under requests. Mitigations: at most 4 waiting, a
 5-second silence after each denial, at most 8 queued at the relay, no
 "approve all".
+
+### Someone who hands the user a pairing code (phishing)
+
+A QR code or link from an attacker ("re-pair your device") would pair
+the phone with the attacker's machine, which could then send genuine
+requests under a familiar label. The iPhone app answers nothing before
+showing the relay's host, the machine's name (labelled as the machine's
+own word) and the mode, and asking the user to accept; any relay other
+than the official `approve.clavix.org` takes a second, explicit step
+under a warning. The phone sends its public key, and registers its push
+token, only after that. An attacker running its machine on the official
+relay is not caught by the relay check: the user's judgement of "is this
+the machine in front of me" is the last line.
 
 ### Another user of the machine running the agent
 
@@ -121,10 +149,16 @@ and a short `ControlPersist` on the server side are outside this project.
 - **Storage may be evicted** by the browser, and is erased when the web
   app is removed from the home screen (observed). The key is then lost,
   not leaked; servers must always have another way in.
-- **The pairing code travels in a URL fragment** when the QR code is
-  used. It is not sent to the server and is removed from the address, but
-  it passes through the phone's camera and browser. It works once, for 15
-  minutes, and the verification digits still have to match.
+- **A code pasted into the page goes to code the relay serves.** The QR
+  link opens the native app, never the page, and the page ignores any
+  code in its address; but the page itself still runs whatever the relay
+  serves, so a hostile relay can read a code typed there. The commitment
+  in the digits keeps that from winning the pairing unnoticed; the page
+  has no relay check of its own (it is the relay's origin), and holds a
+  new pairing aside, unused, until its digits are confirmed.
+- **Relay addresses**: the agent, Clavix desktop and the iPhone app accept
+  only https, or http to a loopback address, since bearer tokens travel
+  in a header.
 - **Metadata**: the relay and the push service (Apple's for the app)
   learn when the user authenticates, and how often.
 - **Revocation cuts the channel, not the key.** Either end can delete

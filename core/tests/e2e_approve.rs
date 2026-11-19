@@ -234,7 +234,16 @@ async fn approve_mode_end_to_end() {
     let offer = ApproveOffer::open(&bench.relay_url, ENROLL_SECRET, "desk")
         .await
         .unwrap();
-    assert!(offer.link().ends_with(&format!("/#{}", offer.code())));
+    // The link opens the app, with the relay in the query: never a page.
+    assert_eq!(
+        offer.link(),
+        format!(
+            "clavix-approve://pair?relay={}#{}",
+            bench.relay_url,
+            offer.code()
+        )
+    );
+    assert!(offer.code().starts_with("cva2-"));
     let (first, device) = bench.pair_phone(&offer, "phone1.json").await;
     let mut channel: ApproveChannel = offer.into_channel(serde_json::from_str(&device).unwrap());
     assert_eq!(channel.label, "desk");

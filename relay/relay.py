@@ -65,6 +65,7 @@ CHANNEL_RE = re.compile(r"^[0-9a-f]{32}$")
 REQUEST_RE = re.compile(r"^[0-9a-f]{32}$")
 SIGNER_RE = re.compile(r"^[0-9a-f]{16}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")   # 32 bytes, base64url
 KNOWN_RE = re.compile(r"^([0-9a-f]{32}(,[0-9a-f]{32}){0,31})?$")
 # An APNs device token: 32 bytes today, Apple says the length may grow.
 APNS_TOKEN_RE = re.compile(r"^(?:[0-9a-f]{2}){32,100}$")
@@ -493,6 +494,43 @@ class Relay:
                 return 204, None
             return 200, {"state": "answered", **answer}
 
+    def post_reveal(self, ch, token, body):
+        """The agent hands a device the nonce its hello committed to.
+
+        Opaque here: the device checks it against the commitment. Accepted
+        once per device; the device fetches it with its own token.
+        """
+        signer, nonce = body.get("signer"), body.get("nonce")
+        if not (isinstance(signer, str) and SIGNER_RE.match(signer)
+                and isinstance(nonce, str) and NONCE_RE.match(nonce)):
+            return self.BAD
+        with self.cond:
+            c, _ = self._channel(ch, token, "agent")
+            if c is None:
+                return self.DENIED
+            s = c["signers"].get(signer)
+            if s is None:
+                return 200, {"state": "unknown-signer"}
+            if s.get("reveal") is not None:
+                return 200, {"state": "exists"}
+            s["reveal"] = nonce
+            self._save()
+            self.cond.notify_all()
+        return 200, {"state": "revealed"}
+
+    def get_reveal(self, ch, token, wait=0):
+        with self.cond:
+            c, sid = self._channel(ch, token, "signer")
+            if c is None:
+                return self.DENIED
+            nonce = self._wait(lambda: c["signers"][sid].get("reveal")
+                               if sid in c["signers"] else None, wait, ch, c, sid)
+            if nonce is self.GONE:
+                return self.DENIED
+            if not nonce:
+                return 204, None
+            return 200, {"nonce": nonce}
+
     def revoke(self, ch, token, body=None):
         """Revoke a pairing, or one device of it.
 
@@ -737,7 +775,7 @@ ICON_ALIAS = re.compile(r"^/(apple-touch-icon[0-9a-z-]*\.png|favicon\.ico|icon\.
 MAIN_ICON = "/clavix-icon-180.png"
 
 
-ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|pair/open|subscription|requests|revoke|"
+ROUTE = re.compile(r"^/api/ch/([0-9a-f]{32})/(pair|pair/answer|pair/open|pair/reveal|subscription|requests|revoke|"
                    r"responses/([0-9a-f]{32})|requests/([0-9a-f]{32})/cancel)$")
 
 
@@ -819,6 +857,8 @@ def make_handler(relay, static, vapid_public):
                 return self.reply(*relay.get_hello(ch, self.token()))
             if what == "pair/answer":
                 return self.reply(*relay.get_pair_answer(ch, self.token(), self.wait(url.query)))
+            if what == "pair/reveal":
+                return self.reply(*relay.get_reveal(ch, self.token(), self.wait(url.query)))
             if what == "requests":
                 try:
                     known = self.known(url.query)
@@ -851,6 +891,8 @@ def make_handler(relay, static, vapid_public):
                 return self.reply(*relay.revoke(ch, self.token(), body))
             if what == "pair/open":
                 return self.reply(*relay.open_pairing(ch, self.token(), body))
+            if what == "pair/reveal":
+                return self.reply(*relay.post_reveal(ch, self.token(), body))
             if m.group(4):
                 return self.reply(*relay.cancel(ch, self.token(), m.group(4)))
             if what == "requests":

@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -106,6 +107,34 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(self.relay.get_hello(CH, PAIR)[0], 401)
         self.assertEqual(self.relay.post_pair(CH, PAIR, {
             "signer": "d" * 16, "signer_auth": "0" * 64, "msg": "x"})[0], 401)
+
+    def test_the_agent_reveals_its_nonce_to_the_device_once(self):
+        nonce = "N" * 43
+        self.pair()
+        self.assertEqual(self.relay.get_reveal(CH, PHONE), (204, None))
+        # Only the agent reveals, only to a device of the channel, only a nonce.
+        self.assertEqual(self.relay.post_reveal(CH, PHONE, {"signer": SIGNER, "nonce": nonce})[0], 401)
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "short"})[0], 400)
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": "d" * 16, "nonce": nonce}),
+                         (200, {"state": "unknown-signer"}))
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": nonce}),
+                         (200, {"state": "revealed"}))
+        self.assertEqual(self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "M" * 43}),
+                         (200, {"state": "exists"}))
+        self.assertEqual(self.relay.get_reveal(CH, PHONE), (200, {"nonce": nonce}))
+        self.assertEqual(self.relay.get_reveal(CH, AGENT)[0], 401)
+
+    def test_waiting_for_the_reveal_wakes_up_and_ends_with_the_device(self):
+        self.pair()
+        got = []
+        t = threading.Thread(target=lambda: got.append(self.relay.get_reveal(CH, PHONE, wait=5)))
+        t.start()
+        time.sleep(0.1)
+        self.relay.post_reveal(CH, AGENT, {"signer": SIGNER, "nonce": "N" * 43})
+        t.join(5)
+        self.assertEqual(got, [(200, {"nonce": "N" * 43})])
+        self.relay.revoke(CH, PHONE)
+        self.assertEqual(self.relay.get_reveal(CH, PHONE, wait=1)[0], 401)
 
     def test_an_unpaired_channel_expires(self):
         self.create()

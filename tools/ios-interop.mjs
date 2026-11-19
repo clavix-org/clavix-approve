@@ -19,7 +19,7 @@ import { b64u, concat, sha256, unb64u, utf8 } from '../web/lib/bytes.js';
 import {
   generateIdentity, openMessage, pairHeader, peer, requestHeader, responseHeader, sealMessage,
 } from '../web/lib/channel.js';
-import { buildAnswer, pairingFingerprint } from '../web/lib/pairing.js';
+import { answerMac, buildAnswer, commitment, pairingDigits } from '../web/lib/pairing.js';
 import { fingerprint, sshString, verifySignature } from '../web/lib/ssh.js';
 import { bind, clientKey, hostKey, userAuth } from '../web/test/helpers.mjs';
 
@@ -39,16 +39,20 @@ async function importIdentity(e) {
     sig: { privateKey: sigPriv }, kemPublic, sigPublic };
 }
 
-// The agent's hello, built as agent/src/pairing.rs does.
-async function hello(ch, secret, agent, label) {
+// The agent's hello (protocol version 2, sign mode), built as
+// core/src/pairing.rs does.
+async function hello(ch, secret, agent, label, commit) {
   const ikm = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveBits']);
   const macKey = new Uint8Array(await crypto.subtle.deriveBits(
     { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: utf8('clavix-approve/v1/pair-mac') }, ikm, 256));
   const k = await crypto.subtle.importKey('raw', macKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const transcript = concat(sshString(utf8('hello')), sshString(utf8(ch)), sshString(agent.kemPublic),
-    sshString(agent.sigPublic), sshString(utf8(label)));
+  const transcript = concat(...[utf8('clavix-approve/v2/pair-hello'), utf8('sign'), utf8(ch), agent.kemPublic,
+    agent.sigPublic, utf8(label), commit].map(sshString));
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC', k, transcript));
-  return b64u(utf8(JSON.stringify({ label, kem: b64u(agent.kemPublic), sig: b64u(agent.sigPublic), mac: b64u(mac) })));
+  return b64u(utf8(JSON.stringify({
+    v: 2, mode: 'sign', label, kem: b64u(agent.kemPublic), sig: b64u(agent.sigPublic), commit: b64u(commit),
+    mac: b64u(mac),
+  })));
 }
 
 async function make(file) {
@@ -73,8 +77,12 @@ async function make(file) {
   const request = await sealMessage(agent, peer(phone.kemPublic, phone.sigPublic), requestHeader(ch, signer, id, exp), inner);
 
   const secret = crypto.getRandomValues(new Uint8Array(16));
-  const answer = await buildAnswer({ ch, signer, secret, me: phone, agent: peer(agent.kemPublic, agent.sigPublic),
-    keyBlob: ssh.blob, comment: 'page' });
+  const agentNonce = crypto.getRandomValues(new Uint8Array(32));
+  const signerNonce = crypto.getRandomValues(new Uint8Array(32));
+  const commit = await commitment(agentNonce);
+  const agentPeer = peer(agent.kemPublic, agent.sigPublic);
+  const answer = await buildAnswer({ ch, signer, secret, me: phone, agent: agentPeer,
+    keyBlob: ssh.blob, comment: 'page', mode: 'sign', nonce: signerNonce, commit });
 
   writeFileSync(file, JSON.stringify({
     agent: await exportIdentity(agent),
@@ -85,9 +93,13 @@ async function make(file) {
     ch, signer, id, exp, now,
     request,
     secret: b64u(secret),
-    hello: await hello(ch, secret, agent, 'build-box'),
+    hello: await hello(ch, secret, agent, 'build-box', commit),
+    agentNonce: b64u(agentNonce),
+    signerNonce: b64u(signerNonce),
     answer,
-    digits: await pairingFingerprint(peer(agent.kemPublic, agent.sigPublic), phone, ssh.blob),
+    digits: await pairingDigits({
+      mode: 'sign', ch, signer, agent: agentPeer, device: phone, keyBlob: ssh.blob, agentNonce, signerNonce,
+    }),
   }, null, 1));
   console.log(`wrote ${file}`);
 }
@@ -111,9 +123,15 @@ async function check(file, out) {
   const introKey = raw.subarray(0, 32);
   const sealed = b64u(raw.subarray(32));
   const pair = await openMessage(agent, { sigPublic: introKey, kemPublic: agent.kemPublic }, pairHeader(v.ch, 'swift-signer'), sealed);
-  if (pair.t !== 'pair' || pair.key !== swift.keyBlob) fail('pairing answer does not carry the SSH key');
+  if (pair.t !== 'pair' || pair.v !== 2 || pair.key !== swift.keyBlob) fail('pairing answer does not carry the SSH key');
   if (b64u(introKey) !== swift.phoneSig || pair.kem !== swift.phoneKem) fail('pairing answer carries other keys');
-  const digits = await pairingFingerprint(peer(agent.kemPublic, agent.sigPublic), phone, unb64u(swift.keyBlob));
+  const expectedMac = await answerMac(unb64u(v.secret), 'sign', v.ch, 'swift-signer', phone, unb64u(swift.keyBlob),
+    unb64u(pair.nonce), peer(agent.kemPublic, agent.sigPublic), await commitment(unb64u(v.agentNonce)));
+  if (b64u(expectedMac) !== pair.mac) fail('pairing answer MAC differs');
+  const digits = await pairingDigits({
+    mode: 'sign', ch: v.ch, signer: 'swift-signer', agent: peer(agent.kemPublic, agent.sigPublic), device: phone,
+    keyBlob: unb64u(swift.keyBlob), agentNonce: unb64u(v.agentNonce), signerNonce: unb64u(pair.nonce),
+  });
   if (digits !== swift.digits) fail(`six digits differ: page ${digits}, app ${swift.digits}`);
 
   console.log('interop: the page opens what the app sealed');

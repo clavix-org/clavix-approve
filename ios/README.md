@@ -37,9 +37,15 @@ The app holds one pairing per machine, each in the mode its hello names
   key. Nothing goes on the servers.
 
 Add a machine with the + button. The pairing code is read from the QR code
-(camera) or pasted, as a bare `cva1-…` code or as a link. Pairing again
-with the same channel replaces that machine only; Réglages → Machines
-appairées forgets one.
+(the in-app scanner, or the system camera through the `clavix-approve://`
+URL scheme declared in `ClavixApprove-Info.plist`) or pasted, as a bare
+`cva2-…` code or as the `clavix-approve://pair?relay=…#cva2-…` link. The
+app then shows the relay, the machine's name and the mode, and answers
+only once the user accepts; any relay but `approve.clavix.org` needs an
+extra, explicit step. The new pairing accepts no request until the user
+says the machine shows the same six digits. Relays must be https (http
+only on a loopback address). Pairing again with the same channel replaces
+that machine once confirmed; Réglages → Machines appairées forgets one.
 
 To try approve mode without Clavix, against a local relay:
 

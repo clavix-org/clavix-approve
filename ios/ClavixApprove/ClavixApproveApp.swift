@@ -13,6 +13,10 @@ struct ClavixApproveApp: App {
             ContentView()
                 .environmentObject(model)
                 .onAppear { delegate.model = model }
+                // The pairing link, clavix-approve://pair?relay=…#cva2-…,
+                // scanned with the system camera. It only opens the
+                // pairing sheet: nothing is sent before the user accepts.
+                .onOpenURL { url in Task { await model.open(link: url) } }
         }
         .onChange(of: phase) { _, now in
             switch now {

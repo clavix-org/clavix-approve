@@ -59,6 +59,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
 .small { font-size: 0.85rem; }
 .wrap { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
 .result { min-height: 1.2em; overflow-wrap: anywhere; }
+.digits { font-size: 2.2rem; font-weight: 600; letter-spacing: 0.08em; text-align: center; margin: 8px 0; }
 .result.ok { color: var(--ok); }
 .result.error { color: var(--danger); }
 

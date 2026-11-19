@@ -1,9 +1,9 @@
 #!/bin/sh
-# Verifies testdata/approve-proof.json and approve-pairing.json, independently of the
+# Verifies testdata/approve-proof.json and pairing.json, independently of the
 # Node code that generated it: the SSH blobs are taken apart by Python's
 # standard library, the signatures checked by `openssl`.
 #
-#   tools/approve-vectors-check.sh [testdata/approve-proof.json [testdata/approve-pairing.json]]
+#   tools/approve-vectors-check.sh [testdata/approve-proof.json [testdata/pairing.json]]
 set -eu
 vectors=${1:-testdata/approve-proof.json}
 work=$(mktemp -d)
@@ -63,8 +63,8 @@ openssl pkeyutl -verify -pubin -inkey "$work/ed.pem" -rawin -in "$work/signed" -
 openssl pkey -pubin -inform DER -in "$work/ecdsa-sha2-nistp256.pub.der" -out "$work/p256.pem"
 openssl dgst -sha256 -verify "$work/p256.pem" -signature "$work/ecdsa-sha2-nistp256.sig" "$work/signed"
 
-# ---- testdata/approve-pairing.json: MACs and digits, recomputed --------------
-pairing=${2:-testdata/approve-pairing.json}
+# ---- testdata/pairing.json: MACs and digits, recomputed --------------
+pairing=${2:-testdata/pairing.json}
 python3 -I - "$pairing" "$vectors" "$work" <<'EOF'
 import base64, hashlib, hmac, json, struct, sys
 
@@ -82,29 +82,41 @@ def hkdf(ikm, info):
     return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
 
 secret = bytes.fromhex(v["secret"])
-raw = unb64u(v["code"][len("cva1-"):])
-assert v["code"].startswith("cva1-") and raw[:16].hex() == v["channel"] and raw[16:] == secret, "code"
+assert v["version"] == 2, "version"
+raw = unb64u(v["code"][len("cva2-"):])
+assert v["code"].startswith("cva2-") and raw[:16].hex() == v["channel"] and raw[16:] == secret, "code"
 key = hkdf(secret, b"clavix-approve/v1/pair-mac")
 assert key.hex() == v["mac_key"], "mac key"
 ch, signer, label = v["channel"].encode(), v["signer"].encode(), v["label"].encode()
 akem, asig = bytes.fromhex(v["agent"]["kem"]), bytes.fromhex(v["agent"]["sig"])
 skem, ssig = bytes.fromhex(v["signer_keys"]["kem"]), bytes.fromhex(v["signer_keys"]["sig"])
 assert len(akem) == len(skem) == 65 and akem[0] == skem[0] == 4 and len(asig) == len(ssig) == 32, "key sizes"
+na, nb = bytes.fromhex(v["agent_nonce"]), bytes.fromhex(v["signer_nonce"])
+assert len(na) == len(nb) == 32, "nonce sizes"
 
-t = transcript("approve-hello", ch, akem, asig, label)
-assert t.hex() == v["hello_transcript"], "hello transcript"
-assert b64u(hmac.new(key, t, hashlib.sha256).digest()) == v["hello_mac"], "hello mac"
+t = transcript("clavix-approve/v2/pair-commit", na)
+assert t.hex() == v["commit_transcript"], "commit transcript"
+commit = hashlib.sha256(t).digest()
+assert b64u(commit) == v["commit"], "commit"
 
-assert [a["approve"] for a in v["answers"]] == [k["approve"] for k in proofs["keys"]], "approve blobs"
-for a in v["answers"]:
-    blob = unb64u(a["approve"])
-    t = transcript("approve-answer", ch, signer, skem, ssig, blob, akem, asig)
-    assert t.hex() == a["answer_transcript"], a["type"] + " answer transcript"
-    assert b64u(hmac.new(key, t, hashlib.sha256).digest()) == a["answer_mac"], a["type"] + " answer mac"
-    t = transcript("clavix-approve/v1/approve-fingerprint", akem, asig, skem, ssig, blob)
-    assert t.hex() == a["fingerprint_transcript"], a["type"] + " fingerprint transcript"
-    n = struct.unpack(">I", hashlib.sha256(t).digest()[:4])[0] % 1_000_000
-    assert f"{n // 1000:03d} {n % 1000:03d}" == a["digits"], a["type"] + " digits"
+keys = {k["type"]: k["approve"] for k in proofs["keys"]}
+assert [c["mode"] for c in v["modes"]] == ["sign", "approve"], "modes"
+for c in v["modes"]:
+    mode = c["mode"].encode()
+    t = transcript("clavix-approve/v2/pair-hello", mode, ch, akem, asig, label, commit)
+    assert t.hex() == c["hello_transcript"], c["mode"] + " hello transcript"
+    assert b64u(hmac.new(key, t, hashlib.sha256).digest()) == c["hello_mac"], c["mode"] + " hello mac"
+    for a in c["answers"]:
+        what = c["mode"] + " " + a["type"]
+        assert a["key"] == keys[a["type"]], what + " key blob"
+        blob = unb64u(a["key"])
+        t = transcript("clavix-approve/v2/pair-answer", mode, ch, signer, skem, ssig, blob, nb, akem, asig, commit)
+        assert t.hex() == a["answer_transcript"], what + " answer transcript"
+        assert b64u(hmac.new(key, t, hashlib.sha256).digest()) == a["answer_mac"], what + " answer mac"
+        t = transcript("clavix-approve/v2/pair-digits", mode, ch, signer, akem, asig, skem, ssig, blob, na, nb)
+        assert t.hex() == a["digits_transcript"], what + " digits transcript"
+        n = struct.unpack(">I", hashlib.sha256(t).digest()[:4])[0] % 1_000_000
+        assert f"{n // 1000:03d} {n % 1000:03d}" == a["digits"], what + " digits"
 
 # The public keys must come from the fixed private keys: OpenSSL derives them.
 p256 = bytes.fromhex("3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420")
@@ -114,11 +126,11 @@ for side, name in ((v["agent"], "agent"), (v["signer_keys"], "signer")):
     open(f"{work}/{name}-kem.expect", "w").write(side["kem"])
     open(f"{work}/{name}-sig.der", "wb").write(ed + bytes.fromhex(side["sig_seed"]))
     open(f"{work}/{name}-sig.expect", "w").write(side["sig"])
-print("approve-pairing: MACs and digits recomputed")
+print("pairing: MACs and digits recomputed")
 EOF
 for k in agent-kem signer-kem agent-sig signer-sig; do
   got=$(openssl pkey -inform DER -in "$work/$k.der" -pubout -outform DER | od -An -v -tx1 | tr -d ' \n')
   case $k in *-kem) got=$(printf %s "$got" | tail -c 130) ;; *) got=$(printf %s "$got" | tail -c 64) ;; esac
   [ "$got" = "$(cat "$work/$k.expect")" ] || { echo "public key mismatch: $k" >&2; exit 1; }
 done
-echo "approve-pairing: public keys match their private keys"
+echo "pairing: public keys match their private keys"

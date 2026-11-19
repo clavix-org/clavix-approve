@@ -1,6 +1,6 @@
 // Approve mode (PROTOCOL.md, "Approve mode"), against the vectors the page
-// and the Python check share: testdata/approve-pairing.json and
-// testdata/approve-proof.json.
+// and the Python check share: testdata/approve-proof.json (the pairing vectors are in
+// PairingTests).
 
 import CryptoKit
 import Foundation
@@ -10,53 +10,6 @@ import XCTest
 final class ApproveTests: XCTestCase {
     private func json(_ name: String) throws -> [String: Any] {
         try JSONSerialization.jsonObject(with: vector(name)) as! [String: Any]
-    }
-
-    func testPairingVectors() throws {
-        let v = try json("approve-pairing.json")
-        let code = try PairingCode(v["code"] as! String)
-        XCTAssertEqual(code.ch, v["channel"] as? String)
-        XCTAssertEqual(code.secret.hex, v["secret"] as? String)
-        XCTAssertEqual(Pairing.derive(code.secret, "pair-mac").hex, v["mac_key"] as? String)
-
-        let a = v["agent"] as! [String: String], s = v["signer_keys"] as! [String: String]
-        let agentKem = Data(hex: a["kem"]!)!, agentSig = Data(hex: a["sig"]!)!
-        let kem = Data(hex: s["kem"]!)!, sig = Data(hex: s["sig"]!)!
-        let ch = code.ch, signer = v["signer"] as! String, label = v["label"] as! String
-
-        // The hello, as the agent sends it, read by readHello().
-        let helloTranscript = Pairing.transcript(PairingMode.approve.helloLabel,
-                                                 [utf8(ch), agentKem, agentSig, utf8(label)])
-        XCTAssertEqual(helloTranscript.hex, v["hello_transcript"] as? String)
-        let helloMac = v["hello_mac"] as! String
-        func hello(_ fields: [String: Any]) throws -> String {
-            try JSONSerialization.data(withJSONObject: fields.merging([
-                "label": label, "kem": agentKem.b64u, "sig": agentSig.b64u, "mac": helloMac,
-            ]) { a, _ in a }).b64u
-        }
-        let read = try Pairing.readHello(hello(["mode": "approve"]), ch: ch, secret: code.secret)
-        XCTAssertEqual(read.mode, .approve)
-        XCTAssertEqual(read.label, label)
-        // The relay strips the mode, or names another: refused.
-        XCTAssertThrowsError(try Pairing.readHello(hello([:]), ch: ch, secret: code.secret))
-        XCTAssertThrowsError(try Pairing.readHello(hello(["mode": "sign"]), ch: ch, secret: code.secret))
-
-        // The answer's MAC and the six digits, for each approval key type.
-        let me = Identity(kem: try P256.KeyAgreement.PrivateKey(rawRepresentation: Data(hex: s["kem_private"]!)!),
-                          sig: try Curve25519.Signing.PrivateKey(rawRepresentation: Data(hex: s["sig_seed"]!)!))
-        XCTAssertEqual(me.kemPublic, kem)
-        XCTAssertEqual(me.sigPublic, sig)
-        for answer in v["answers"] as! [[String: String]] {
-            let blob = try Data(b64u: answer["approve"]!)
-            XCTAssertEqual(SSH.keyType(blob), answer["type"])
-            let mac = Pairing.answerMac(secret: code.secret, mode: .approve, ch: ch, signer: signer, me: me,
-                                        keyBlob: blob, agent: read.agent)
-            XCTAssertEqual(mac.b64u, answer["answer_mac"], answer["type"]!)
-            XCTAssertEqual(Pairing.fingerprint(agent: read.agent, me: me, keyBlob: blob, mode: .approve),
-                           answer["digits"], answer["type"]!)
-            // The sign-mode labels give other digits: a flipped mode shows.
-            XCTAssertNotEqual(Pairing.fingerprint(agent: read.agent, me: me, keyBlob: blob, mode: .sign), answer["digits"])
-        }
     }
 
     func testProofVectors() throws {
@@ -118,13 +71,19 @@ final class ApproveTests: XCTestCase {
         XCTAssertEqual(refusal(checkApproveRequest(inner, id: "r1", now: 1010)), .malformed)
     }
 
-    func testOldRecordsAreInSignMode() throws {
+    /// Records of the first pairing protocol still decode, in sign mode,
+    /// but are obsolete: never active, whatever they say.
+    func testOldRecordsAreInSignModeAndObsolete() throws {
         let old = """
         {"relay":"https://relay.example","ch":"\(String(repeating: "0", count: 32))","signer":"0011223344556677",
          "token":"t","agent":\(String(data: try JSONEncoder().encode(peer(of: softwareIdentity())), encoding: .utf8)!),
-         "label":"box","fingerprint":"123 456"}
+         "label":"box","fingerprint":"123 456","confirmed":true}
         """
-        XCTAssertEqual(try JSONDecoder().decode(PairingRecord.self, from: Data(old.utf8)).mode, .sign)
+        let record = try JSONDecoder().decode(PairingRecord.self, from: Data(old.utf8))
+        XCTAssertEqual(record.mode, .sign)
+        XCTAssertEqual(record.version, 1)
+        XCTAssertFalse(record.isCurrent)
+        XCTAssertFalse(record.isActive)
     }
 
     private func refusal(_ r: Result<VerifiedRequest, Refusal>) -> Refusal? {

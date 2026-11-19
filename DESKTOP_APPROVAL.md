@@ -126,10 +126,12 @@ kinds of statement; a key per purpose keeps them apart.
 
 ### Pairing
 
-Same exchange as `PROTOCOL.md`, "Pairing", with the hello marked
-`mode: "approve"` and the approval key in place of the SSH key. Each
-change also changes a MAC or fingerprint label, so the relay cannot pair
-a device in the wrong mode. The desktop shows "approval only, nothing to
+Same exchange as `PROTOCOL.md`, "Pairing" (version 2: committed nonce,
+revealed after the answer), with the hello marked `mode: "approve"` and
+the approval key in place of the SSH key. The mode is in every MAC and
+in the digits, so the relay cannot pair a device in the wrong mode. The
+QR code is the `clavix-approve://pair?relay=…#code` link of
+`ApproveOffer::link()`, never a link to a web page. The desktop shows "approval only, nothing to
 install on servers".
 
 A phone can be paired with a desktop and with `clavix-agent`s; each

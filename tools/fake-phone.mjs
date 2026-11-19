@@ -71,6 +71,10 @@ async function pair({ relay, state: file, code }) {
     approve: approveJwk,
     approveKey: b64u(approveBlob),
     pins: {},
+    // A test stand-in compares nothing: the test checks that both ends
+    // printed the same digits. The app holds this false until the user
+    // has confirmed them.
+    confirmed: true,
   });
   say({
     event: 'paired', agent: paired.label, fingerprint: paired.fingerprint, mode: paired.mode,
