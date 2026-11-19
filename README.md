@@ -26,7 +26,7 @@ phone yet, and nothing here has been audited. Do not rely on it.
 |---|---|
 | `core/` | `clavix-approve-core` (Rust library): the sealed channel, pairing in both modes, the relay client, and both requesters: approve mode (Clavix desktop) and sign mode (the agent, and Clavix desktop while its vault is locked) |
 | `agent/` | `clavix-agent` (Rust, on `core/`): the SSH agent protocol on a Unix socket, no private key; forwards each signature request to the paired device through the relay |
-| `relay/` | the relay (Python, standard library + `cryptography`, plus `httpx[http2]` for APNs): opaque messages, Web Push or APNs wake-up, serves the page |
+| `relay/` | the relay (Python, standard library + `cryptography`, plus `httpx[http2]` for APNs): opaque messages, Web Push or APNs wake-up, per-client limits, serves the page (optional) |
 | `web/` | the approval page (plain ES modules, no build step, no third-party code); `web/lib` holds everything security-relevant |
 | `tools/fake-phone.mjs` | command-line stand-in for the phone, running the page's own modules |
 | `tools/fake-desktop.mjs` | command-line stand-in for Clavix desktop in approve mode ([`DESKTOP_APPROVAL.md`](DESKTOP_APPROVAL.md)): holds the SSH key, asks the device for an approval |
@@ -39,7 +39,7 @@ phone yet, and nothing here has been audited. Do not rely on it.
 Needs Rust, Python 3 with `cryptography`, Node 22 and OpenSSH.
 
 ```sh
-# 1. the relay (push disabled)
+# 1. the relay (push disabled; without the secret, enrolment is open)
 RELAY_ENROLL_SECRET=dev RELAY_STATE_DIR=./state RELAY_PUSH=off python3 relay/relay.py
 
 # 2. pair: the agent prints a code…
@@ -75,28 +75,73 @@ skipped when a tool is missing.
 
 ## Running the relay
 
-One HTTP service serves the API and the page; put a TLS-terminating
-reverse proxy in front. The host name is permanent in practice: the
-passkey is bound to it, and nothing else should be served there.
+One HTTP service serves the API and, unless told not to, the page; put a
+TLS-terminating reverse proxy in front. When it serves the page, the host
+name is permanent in practice: the passkey is bound to it, and nothing
+else should be served there. A public relay should not serve the page
+(`RELAY_SERVE_WEB=off`): the code that handles keys then lives on an
+origin of its own.
 
-| Variable | |
-|---|---|
-| `RELAY_ENROLL_SECRET` | required; lets an agent create a channel |
-| `RELAY_STATE_DIR` | required; the only directory written to (VAPID key, channels, subscriptions) |
-| `RELAY_BIND`, `RELAY_PORT` | default `127.0.0.1`, `8765` |
-| `RELAY_VAPID_SUB` | contact sent to the push service, `mailto:` or `https:` |
-| `RELAY_PUSH` | `off` logs instead of sending |
-| `RELAY_WEB_DIR` | the page, default `../web` |
-| `RELAY_APNS_KEY_FILE` | APNs auth key (`.p8`) from the Apple developer account, to wake the iOS app; APNs is off without it |
-| `RELAY_APNS_KEY_ID`, `RELAY_APNS_TEAM_ID` | that key's id and the developer team id |
-| `RELAY_APNS_TOPIC` | the app's bundle id, default `org.clavix.approve` |
+| Variable | Default | |
+|---|---|---|
+| `RELAY_STATE_DIR` | required | the only directory written to (VAPID key, `state.db`) |
+| `RELAY_ENROLL_SECRET` | unset | when set, an agent needs it to create a channel (closed enrolment) |
+| `RELAY_ENROLL` | after the secret | `open`: anyone may create a channel, any or no secret accepted; `closed`: the secret is required |
+| `RELAY_BIND`, `RELAY_PORT` | `127.0.0.1`, `8765` | |
+| `RELAY_SERVE_WEB` | `on` | `off` serves the API and `/healthz` only |
+| `RELAY_WEB_DIR` | `../web` | the page |
+| `RELAY_VAPID_SUB` | `mailto:webpush@example.com` | contact sent to the push service, `mailto:` or `https:` |
+| `RELAY_PUSH` | `on` | `off` logs instead of sending |
+| `RELAY_APNS_KEY_FILE` | unset | APNs auth key (`.p8`) from the Apple developer account, to wake the iOS app; APNs is off without it |
+| `RELAY_APNS_KEY_ID`, `RELAY_APNS_TEAM_ID` | | that key's id and the developer team id |
+| `RELAY_APNS_TOPIC` | `org.clavix.approve` | the app's bundle id |
+
+Client address, which the per-address limits count against:
+
+| Variable | Default | |
+|---|---|---|
+| `RELAY_CLIENT_IP_HEADER` | unset | a header the proxy sets to the client address, overwriting the client's own (for example `X-Real-IP`). When set it is the only source; a missing, malformed, private, loopback or link-local value counts as one shared address |
+| `RELAY_TRUSTED_PROXIES` | `0` | without the header: how many proxies append to `X-Forwarded-For`, read from the right. `0` uses the TCP peer |
+
+Limits, all positive integers:
+
+| Variable | Default | |
+|---|---|---|
+| `RELAY_CHANNELS_PER_IP_HOUR`, `RELAY_CHANNELS_PER_IP_DAY` | `10`, `30` | channels one address may create (IPv6 by /64) |
+| `RELAY_MAX_CHANNELS` | `100000` | global safety cap; past it, creation answers `full` |
+| `RELAY_CHANNEL_IDLE_DAYS` | `90` | a channel unused that long is deleted, paired or not |
+| `RELAY_MAX_DEVICES` | `4` | devices on one channel |
+| `RELAY_REQUESTS_PER_MINUTE` | `60` | requests one channel may post |
+| `RELAY_MAX_PENDING` | `8` | live requests on one channel (`busy` past it) |
+| `RELAY_MAX_ENTRIES` | `32` | requests kept on one channel, answered, cancelled and expired ones included |
+| `RELAY_MAX_MSG` | `16384` | bytes of one request or response |
+| `RELAY_MAX_BODY` | `32768` | bytes of one HTTP body |
+| `RELAY_PENDING_BUDGET` | `67108864` | bytes of request and response data held across all channels (`503` past it) |
+| `RELAY_PUSH_INTERVAL`, `RELAY_PUSH_PER_DAY` | `10`, `100` | at most one push per interval, and so many a day, per channel and per device |
+| `RELAY_PUSH_WORKERS`, `RELAY_PUSH_QUEUE` | `4`, `1000` | threads sending pushes, and pushes waiting (more are dropped) |
+| `RELAY_POLLS_PER_TOKEN`, `RELAY_POLLS_PER_IP` | `8`, `64` | concurrent long-polls |
+| `RELAY_MAX_CONNECTIONS` | `512` | concurrent connections; more get an immediate `503` |
+| `RELAY_SOCKET_TIMEOUT` | `30` | seconds a client may stay silent in the middle of a request |
+
+A client over a limit gets `429` with `Retry-After`; over the global data
+budget, `503` with `Retry-After`. Clients must honour it and back off: a
+proxy that bans an address after a burst of 4xx would otherwise ban it. A
+channel that was revoked or expired answers `401` to every call; clients
+stop polling it (and on `404`). The `429` and `413` a proxy sends may have
+an HTML body: clients must not expect JSON on those statuses.
+
+Channels are kept in SQLite (`state.db`, WAL), one row each; pending
+requests live in memory. A `state.json` from an older version is imported
+on first start and renamed `state.json.migrated`.
 
 The `Dockerfile` builds an image that runs as an unprivileged user on a
 read-only root filesystem, with `/state` as its volume and `GET /healthz`
 as health check. Requirements on the proxy: forward `Authorization`,
 allow a 25-second response time, leave the service's own
 `Content-Security-Policy` and `Permissions-Policy` headers in place, do
-not cache.
+not cache, cap request bodies above `RELAY_MAX_BODY`, and set the client
+address header (or append to `X-Forwarded-For`) so per-address limits see
+real clients. The relay only answers `GET`, `HEAD` and `POST`.
 
 ## Things to know before relying on it
 

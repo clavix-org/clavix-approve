@@ -192,7 +192,9 @@ an explicit "destination unknown" warning.
 - No "approve everything" switch, on either side.
 - The agent rate-limits requests and queues at most a few; the phone
   shows a counter when requests arrive faster than a human could have
-  caused them.
+  caused them. The relay enforces its own limits as well (requests per
+  channel per minute, stored requests per channel, pushes per channel and
+  per device), since a compromised agent ignores its own.
 - A denied request triggers a short back-off on the agent.
 - Fleet operations (one playbook, twenty hosts) mean twenty approvals.
   **This is accepted for the first versions**: one approval per
@@ -339,14 +341,17 @@ state survives long idle periods. Phase 0 exists to answer those.
   Clavix feature or a companion product sharing the protocol core?
 - **Hosted relay.** Do we run a public relay, or ship self-hosting
   only? A public one is a service to operate and a metadata sink.
-- **Enrolment secret per agent (deferred).** Every agent of a relay
-  creates its channels with the same secret. Whoever holds it can fill
-  the relay with channels (1000 at most) and so block new pairings; it
-  cannot read, sign or touch an existing pairing. Taking that right from
-  one machine means changing the secret for all. Low stakes for one
-  person's relay; needed before a relay serves several people (hosted
-  relay, team offer), where enrolment tokens would be issued, listed and
-  withdrawn one by one, and logged.
+- **Enrolment (open with limits; accounts deferred).** A relay runs with
+  open enrolment (anyone may create a channel) or closed enrolment (one
+  shared secret, as the development instance does). Either way the
+  relay bounds what one client can take: channels per address per hour
+  and per day, devices and requests per channel, pushes per channel and
+  per device, concurrent long-polls, message sizes and a global byte
+  budget; idle channels expire after 90 days and the global channel cap
+  is only a safety net. Every limit is an environment variable of the
+  relay (README, "Running the relay"). Still missing for a paid offer:
+  accounts with quotas, enrolment credentials issued, listed and
+  withdrawn one by one, and App Attest on the iOS side.
 - **Audit scope.** Pairing, the sealed channel and the phone-side
   verification are new security-critical code; `AUDIT_SCOPE.md` needs
   an entry before phase 1 ships.

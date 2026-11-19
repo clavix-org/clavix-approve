@@ -21,6 +21,9 @@ ENV RELAY_BIND=0.0.0.0 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Enrolment is open unless RELAY_ENROLL_SECRET is set; a public instance
+# also sets RELAY_SERVE_WEB=off and its client address header or proxies.
+# Every setting and limit is listed at the top of relay.py and in README.
 USER 10001:10001
 VOLUME /state
 EXPOSE 8765

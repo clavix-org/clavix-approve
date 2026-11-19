@@ -162,11 +162,11 @@ request that fails to open gets no response at all.
 
 ## Relay API
 
-Same origin as the page. JSON bodies, bearer tokens in `Authorization`.
+Same origin as the page, unless the relay does not serve it (`RELAY_SERVE_WEB=off`). JSON bodies, bearer tokens in `Authorization`. Only `GET`, `HEAD` and `POST` are used.
 
 | Method and path | Token | Purpose |
 |---|---|---|
-| `POST /api/channels` | enrolment secret | create a channel |
+| `POST /api/channels` | enrolment secret (closed enrolment) | create a channel |
 | `GET /api/ch/{ch}/pair` | pairing | fetch the hello |
 | `POST /api/ch/{ch}/pair` | pairing | enrol the signer (once) |
 | `GET /api/ch/{ch}/pair/answer?wait=` | agent | fetch the signer's answer |
@@ -187,10 +187,20 @@ pending set differs from it, so a request that stays on screen does not
 make the long-poll return in a loop. "Nothing yet" is `204`. Normal outcomes are `200` with a `state`
 (`queued`, `busy`, `duplicate`, `expired`, `unknown`, `accepted`, …);
 `401` and `400` mean a wrong token or a malformed call and are never
-retried by a client. `429` and `5xx` (from the relay or a proxy in front,
-whose body may be HTML) are retried with a growing pause. The page starts
-at most one call every 350 ms, whatever triggers it. Limits: 64 KiB per body, 8 pending requests per
-channel, 300 s maximum lifetime, 15 minutes to complete a pairing.
+retried by a client; a channel that was revoked or has expired answers
+`401` to everything, and its clients stop polling it. `429` and `5xx`
+(from the relay or a proxy in front, whose body may be HTML, as may a
+proxy's `413`) are retried with a growing pause, never shorter than
+`Retry-After` when present: the relay sends it with every `429` and with
+its own `503`. The page starts at most one call every 350 ms, whatever
+triggers it. Limits (defaults, each configurable on the relay): 32 KiB per
+body, 16 KiB per `msg`, 8 live and 32 stored requests per channel, 60
+requests per channel per minute, 4 devices per channel, 300 s maximum
+lifetime, 15 minutes to complete a pairing, 8 concurrent long-polls per
+token, 10 channels per client address per hour and 30 per day.
+
+`POST /api/channels` takes the relay's enrolment secret when the relay
+has closed enrolment; with open enrolment any token, or none, is accepted.
 
 The push is VAPID-signed, `aes128gcm`-encrypted, and its payload is the
 constant `{"t":"sign"}`: the notification says only that a request waits.
@@ -207,6 +217,13 @@ shown instead of adding one, so a device shows at most one per channel,
 and Apple never sees the channel id. A withdrawn request sends no push:
 the app clears its delivered notifications when opened. A token APNs reports dead (`410`, `BadDeviceToken`)
 is forgotten, like a Web Push subscription answering `404` or `410`.
+The relay sends at most one push per 10 seconds and 100 a day to one
+channel or one device; a request queued without a push says
+`"push": false`, and the device finds it at its next poll. A device
+(APNs token or Web Push endpoint) wakes for one channel only: registering
+it on another channel removes it from the first. A Web Push subscription
+whose `p256dh` is not a P-256 point or whose `auth` is not 16 bytes is
+refused with `400`.
 
 ## Several devices
 
