@@ -14,7 +14,7 @@ final class Subscriptions: ObservableObject {
     /// The two plans, cheapest first; empty until the App Store answered.
     @Published private(set) var products: [Product] = []
     /// Nil until StoreKit has been read once.
-    @Published private(set) var status: SubscriptionStatus?
+    @Published private(set) var status: ClavixCore.SubscriptionStatus?
     /// The purchase whose proof the hosted relay must hold.
     @Published private(set) var current: SubscriptionPurchase?
     /// Whether this Apple ID may still take the free trial.
