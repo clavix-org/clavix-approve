@@ -199,3 +199,29 @@ pub async fn cancel(
         .await
         .map(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_url_must_be_https_unless_loopback() {
+        assert!(RelayClient::new("https://relay.example").is_ok());
+        assert!(RelayClient::new("http://127.0.0.1:8765/").is_ok());
+        assert!(RelayClient::new("http://localhost:8765").is_ok());
+        assert!(RelayClient::new("http://relay.example").is_err());
+        assert!(RelayClient::new("ftp://relay.example").is_err());
+        assert!(RelayClient::new("not a url").is_err());
+    }
+
+    #[test]
+    fn only_server_errors_and_network_errors_are_retried() {
+        assert!(RelayError::Status(502).is_transient());
+        assert!(RelayError::Transport("reset".into()).is_transient());
+        assert!(RelayError::Status(429).is_transient());
+        for code in [400, 401, 403, 404] {
+            assert!(!RelayError::Status(code).is_transient(), "{code}");
+        }
+        assert!(!RelayError::Protocol("html".into()).is_transient());
+    }
+}

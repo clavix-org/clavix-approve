@@ -14,9 +14,7 @@ clavix-approve-core = { path = "../core" }
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "rsa", "p256", "p384", "p521"] }
 signature = "2"
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "sync", "signal"] }
-serde_json = "1"
 base64 = "0.22"
-sha2 = "0.10"
 hmac = "0.12"
 # Hashed known_hosts entries are HMAC-SHA1.
 sha1 = "0.10"
@@ -27,4 +25,5 @@ qrcode = { version = "0.14.1", default-features = false }
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "rsa", "p256", "p384", "p521", "rand_core"] }
 ed25519-dalek = "2"
 rand = "0.8"
+serde_json = "1"
 tempfile = "3"
