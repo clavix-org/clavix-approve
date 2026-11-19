@@ -4,7 +4,7 @@ import { test } from 'node:test';
 
 import { b64u, hex, sha256, utf8 } from '../lib/bytes.js';
 import { pairToken, parsePairingCode } from '../lib/pairing.js';
-import { checkSignRequest, deniedResponse, label, signedResponse, tokenAuth } from '../lib/protocol.js';
+import { checkApproveRequest, checkSignRequest, deniedResponse, label, signedResponse, tokenAuth } from '../lib/protocol.js';
 import { fingerprint } from '../lib/ssh.js';
 import { bind, clientKey, hostKey, userAuth } from './helpers.mjs';
 
@@ -45,13 +45,35 @@ test('an honest request yields the verified destination', async () => {
   assert.equal(b64u(result.data), inner.data);
 });
 
-test('a request without host-bound data is still tied to the bound session', async () => {
-  const { key, host, inner, check } = await scene();
+test('a request without host-bound data is refused, even for the bound session', async () => {
+  const { key, inner, check } = await scene();
   inner.data = b64u(userAuth({ sessionId: SID, keyBlob: key.blob }));
-  assert.equal((await check()).ok, true);
-  // … but not when the binding is for another session.
-  inner.binds = [await bind(host, utf8('another-session'))];
   assert.deepEqual(await check(), { ok: false, reason: 'unverified' });
+});
+
+// testdata/hostbound.json, shared with the agent and the iOS tests: the
+// two audit scenarios (a forwarded hostile host, a compromised agent
+// holding a pinned host key) and the valid host-bound cases, checked in
+// both modes.
+test('the shared host-bound vectors', async () => {
+  const v = JSON.parse(readFileSync(new URL('../../testdata/hostbound.json', import.meta.url), 'utf8'));
+  const keyBlob = new Uint8Array(Buffer.from(v.key, 'base64url'));
+  for (const c of v.cases) {
+    const inner = { t: 'sign', id: v.id, iat: v.now - 1, exp: v.exp, key: v.key, data: c.data, flags: 0,
+      binds: c.binds, caller: null, agent: 'vector', hints: {} };
+    for (const view of [
+      await checkSignRequest(inner, { id: v.id, keyBlob, now: v.now }),
+      await checkApproveRequest({ ...inner, t: 'approve' }, { id: v.id, now: v.now }),
+    ]) {
+      if (c.ok) {
+        assert.equal(view.ok, true, c.name);
+        assert.equal(view.hops.at(-1).fingerprint, c.destination, c.name);
+        assert.equal(view.hops.length, c.binds.length, c.name);
+      } else {
+        assert.deepEqual(view, { ok: false, reason: 'unverified' }, c.name);
+      }
+    }
+  }
 });
 
 test('a forwarding chain is shown whole, outermost first', async () => {
@@ -82,8 +104,8 @@ test('a falsified destination is refused', async (t) => {
   await forged('host key swapped for a friendly-looking one', async ({ inner }) => {
     inner.binds[0].hostkey = b64u((await hostKey('ed25519')).blob);
   });
-  await forged('real binding of a trusted host, login data of another session', async ({ key, inner }) => {
-    inner.data = b64u(userAuth({ sessionId: utf8('session-with-the-real-target'), keyBlob: key.blob }));
+  await forged('real binding of a trusted host, login data of another session', async ({ key, host, inner }) => {
+    inner.data = b64u(userAuth({ sessionId: utf8('session-with-the-real-target'), keyBlob: key.blob, hostKey: host.blob }));
   });
   await forged('login data naming another host key than the binding', async ({ key, inner }) => {
     const other = await hostKey('ed25519');

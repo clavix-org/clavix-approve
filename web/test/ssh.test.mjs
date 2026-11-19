@@ -20,27 +20,28 @@ test('Reader reads what sshString writes and refuses truncated input', () => {
   assert.throws(() => new Reader(Uint8Array.of(0, 0, 1)).u32());
 });
 
-test('parseUserAuthRequest accepts only public-key requests', () => {
+test('parseUserAuthRequest accepts only host-bound public-key requests', () => {
   const sessionId = utf8('session');
   const keyBlob = utf8('key');
-  const plain = parseUserAuthRequest(userAuth({ sessionId, keyBlob }));
-  assert.deepEqual([...plain.sessionId], [...sessionId]);
-  assert.deepEqual([...plain.user], [...utf8('deploy')]);
-  assert.equal(plain.service, 'ssh-connection');
-  assert.equal(plain.algorithm, 'ecdsa-sha2-nistp256');
-  assert.deepEqual([...plain.keyBlob], [...keyBlob]);
-  assert.equal(plain.hostKey, null);
+  const hostKey = utf8('hk');
+  const bound = parseUserAuthRequest(userAuth({ sessionId, keyBlob, hostKey }));
+  assert.deepEqual([...bound.sessionId], [...sessionId]);
+  assert.deepEqual([...bound.user], [...utf8('deploy')]);
+  assert.equal(bound.service, 'ssh-connection');
+  assert.equal(bound.algorithm, 'ecdsa-sha2-nistp256');
+  assert.deepEqual([...bound.keyBlob], [...keyBlob]);
+  assert.deepEqual([...bound.hostKey], [...hostKey]);
 
-  const bound = parseUserAuthRequest(userAuth({ sessionId, keyBlob, hostKey: utf8('hk') }));
-  assert.deepEqual([...bound.hostKey], [...utf8('hk')]);
+  // Plain "publickey" does not name the server: refused.
+  assert.equal(parseUserAuthRequest(userAuth({ sessionId, keyBlob })), null);
 
-  assert.equal(parseUserAuthRequest(concat(userAuth({ sessionId, keyBlob }), Uint8Array.of(0))), null);
+  assert.equal(parseUserAuthRequest(concat(userAuth({ sessionId, keyBlob, hostKey }), Uint8Array.of(0))), null);
   assert.equal(parseUserAuthRequest(utf8('SSHSIG')), null);
   assert.equal(parseUserAuthRequest(new Uint8Array(0)), null);
   // A key query (no signature will follow) and another auth method.
-  const query = userAuth({ sessionId, keyBlob, hasSignature: false });
+  const query = userAuth({ sessionId, keyBlob, hostKey, hasSignature: false });
   assert.equal(parseUserAuthRequest(query), null);
-  assert.equal(parseUserAuthRequest(userAuth({ sessionId, keyBlob, method: 'password' })), null);
+  assert.equal(parseUserAuthRequest(userAuth({ sessionId, keyBlob, hostKey, method: 'password' })), null);
 });
 
 for (const type of ['ed25519', 'P-256', 'P-384', 'P-521', 'rsa']) {

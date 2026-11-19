@@ -14,7 +14,8 @@ public enum SSH {
         public let service: String
         public let algorithm: String
         public let keyBlob: Data
-        public let hostKey: Data?
+        /// The server host key the client authenticates to.
+        public let hostKey: Data
     }
 
     /// "SHA256:…" as printed by `ssh-keygen -l`.
@@ -23,8 +24,11 @@ public enum SSH {
     }
 
     /// The data an SSH client asks an agent to sign for public-key
-    /// authentication (RFC 4252 §7, plus OpenSSH's host-bound variant).
-    /// Nil for anything else, including trailing bytes.
+    /// authentication, host-bound variant only (RFC 4252 §7 with OpenSSH's
+    /// publickey-hostbound-v00@openssh.com, OpenSSH 8.9+). Plain
+    /// "publickey" does not name the server in the signed bytes, so a
+    /// holder of a pinned host key could pass a login to another server off
+    /// as one to itself. Nil for anything else, including trailing bytes.
     public static func parseUserAuthRequest(_ data: Data) -> UserAuthRequest? {
         var r = Reader(data)
         do {
@@ -33,11 +37,11 @@ public enum SSH {
             let user = try r.string()
             let service = try r.text()
             let method = try r.text()
-            guard method == "publickey" || method == "publickey-hostbound-v00@openssh.com" else { return nil }
+            guard method == "publickey-hostbound-v00@openssh.com" else { return nil }
             guard try r.u8() == 1 else { return nil }
             let algorithm = try r.text()
             let keyBlob = try r.string()
-            let hostKey = method == "publickey" ? nil : try r.string()
+            let hostKey = try r.string()
             guard r.done else { return nil }
             return UserAuthRequest(sessionId: sessionId, user: user, service: service, algorithm: algorithm,
                                    keyBlob: keyBlob, hostKey: hostKey)

@@ -1,0 +1,125 @@
+{
+  "source": "tools/hostbound-vectors.mjs; see PROTOCOL.md, \"What the signer checks\"",
+  "id": "fedcba9876543210fedcba9876543210",
+  "now": 1800000000,
+  "exp": 1800000090,
+  "key": "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDrThhqVYhOSUWu1k-8FWD7S5YZvXLYmCjAXI3_Ym5Cv0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0",
+  "cases": [
+    {
+      "name": "host-bound login, direct",
+      "data": "AAAAIABqfaL3lF_T30nH-v2xYIocI6iY5SM1fkWijwndEdwSMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAjcHVibGlja2V5LWhvc3Rib3VuZC12MDBAb3BlbnNzaC5jb20BAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAABoAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDrThhqVYhOSUWu1k-8FWD7S5YZvXLYmCjAXI3_Ym5Cv0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0AAAAzAAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV_VLbLTy6XXLKZwm_HZQSG_N0iAG0D29c",
+      "binds": [
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV_VLbLTy6XXLKZwm_HZQSG_N0iAG0D29c",
+          "sid": "AGp9oveUX9PfScf6_bFgihwjqJjlIzV-RaKPCd0R3BI",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQHVF2BbGzpdjQILCDyXemZA63hxwAbwZBKIgb100aU_4FIRADFIBLtG7yA0EB8LsqJrhOBAQMnB3dMcborjErwk",
+          "fwd": false
+        }
+      ],
+      "ok": true,
+      "destination": "SHA256:fe85JkIjo8VPe+XqXJGH5Mau1EMFdK1OdKvJUFicyA8"
+    },
+    {
+      "name": "host-bound login, through a forwarded agent",
+      "data": "AAAAIABqfaL3lF_T30nH-v2xYIocI6iY5SM1fkWijwndEdwSMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAjcHVibGlja2V5LWhvc3Rib3VuZC12MDBAb3BlbnNzaC5jb20BAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAABoAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDrThhqVYhOSUWu1k-8FWD7S5YZvXLYmCjAXI3_Ym5Cv0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0AAAAzAAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV_VLbLTy6XXLKZwm_HZQSG_N0iAG0D29c",
+      "binds": [
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOU",
+          "sid": "QtS9IjGVHHY3NPpDZL1BfWcWZ1gds_jgvEEu8FxRzkA",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQDVx5pPRXPLUxLdBL03d2ge7R-AuR5r_6p9GaJPk0IMNVVG1jk-EpAXHvc-B-0sNhiPrdJ8W8FLQjLBbbM4-dgQ",
+          "fwd": true
+        },
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV_VLbLTy6XXLKZwm_HZQSG_N0iAG0D29c",
+          "sid": "AGp9oveUX9PfScf6_bFgihwjqJjlIzV-RaKPCd0R3BI",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQHVF2BbGzpdjQILCDyXemZA63hxwAbwZBKIgb100aU_4FIRADFIBLtG7yA0EB8LsqJrhOBAQMnB3dMcborjErwk",
+          "fwd": false
+        }
+      ],
+      "ok": true,
+      "destination": "SHA256:fe85JkIjo8VPe+XqXJGH5Mau1EMFdK1OdKvJUFicyA8"
+    },
+    {
+      "name": "plain publickey login for a bound session",
+      "data": "AAAAIABqfaL3lF_T30nH-v2xYIocI6iY5SM1fkWijwndEdwSMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAAaAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQ604YalWITklFrtZPvBVg-0uWGb1y2JgowFyN_2JuQr9CWHH43B1pnkaOcYfVilbArbSZWe2FeYKpB7hyOgziN",
+      "binds": [
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV_VLbLTy6XXLKZwm_HZQSG_N0iAG0D29c",
+          "sid": "AGp9oveUX9PfScf6_bFgihwjqJjlIzV-RaKPCd0R3BI",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQHVF2BbGzpdjQILCDyXemZA63hxwAbwZBKIgb100aU_4FIRADFIBLtG7yA0EB8LsqJrhOBAQMnB3dMcborjErwk",
+          "fwd": false
+        }
+      ],
+      "ok": false,
+      "refused": "not host-bound"
+    },
+    {
+      "name": "forwarded hostile host, plain publickey for its own session with another server",
+      "data": "AAAAIHNhBl5d0Kb_49cRXxPknrKy04L1yiZmjOEG-aJ-gJDIMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAAaAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQ604YalWITklFrtZPvBVg-0uWGb1y2JgowFyN_2JuQr9CWHH43B1pnkaOcYfVilbArbSZWe2FeYKpB7hyOgziN",
+      "binds": [
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIO1JKMYo0cLG6ukDOJBZlWEpWSc6XGP5NjbBRhSshzfR",
+          "sid": "kpgD8xZSkbb4PtfBd_YGiAAojapC108KKgyFHAAE8CA",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQOR-7caFnXJW5pbOTxWUH0KMfss--7Zopz_b0aUsWLiICOzyimaulKE17Riim3QeYdy8Lx4henxj5mldHlcwjws",
+          "fwd": true
+        },
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIO1JKMYo0cLG6ukDOJBZlWEpWSc6XGP5NjbBRhSshzfR",
+          "sid": "c2EGXl3Qpv_j1xFfE-SesrLTgvXKJmaM4Qb5on6AkMg",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQG0qsZ2BAps4EuIkHip8DHkdrzGNNHRTNs-P39B5u5UsD_r-6NVp6kEof8UWlnNm9rYSa7QKoUyA4wK1E4795Q0",
+          "fwd": false
+        }
+      ],
+      "ok": false,
+      "refused": "not host-bound"
+    },
+    {
+      "name": "forwarded hostile host, host-bound login naming the real server",
+      "data": "AAAAIHNhBl5d0Kb_49cRXxPknrKy04L1yiZmjOEG-aJ-gJDIMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAjcHVibGlja2V5LWhvc3Rib3VuZC12MDBAb3BlbnNzaC5jb20BAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAABoAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDrThhqVYhOSUWu1k-8FWD7S5YZvXLYmCjAXI3_Ym5Cv0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0AAAAzAAAAC3NzaC1lZDI1NTE5AAAAIMqTrBcFGHBx1nuDx_8O_oEI6OxFMFdddyaHkzPb2r58",
+      "binds": [
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIO1JKMYo0cLG6ukDOJBZlWEpWSc6XGP5NjbBRhSshzfR",
+          "sid": "kpgD8xZSkbb4PtfBd_YGiAAojapC108KKgyFHAAE8CA",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQOR-7caFnXJW5pbOTxWUH0KMfss--7Zopz_b0aUsWLiICOzyimaulKE17Riim3QeYdy8Lx4henxj5mldHlcwjws",
+          "fwd": true
+        },
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIO1JKMYo0cLG6ukDOJBZlWEpWSc6XGP5NjbBRhSshzfR",
+          "sid": "c2EGXl3Qpv_j1xFfE-SesrLTgvXKJmaM4Qb5on6AkMg",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQG0qsZ2BAps4EuIkHip8DHkdrzGNNHRTNs-P39B5u5UsD_r-6NVp6kEof8UWlnNm9rYSa7QKoUyA4wK1E4795Q0",
+          "fwd": false
+        }
+      ],
+      "ok": false,
+      "refused": "host key differs from the last binding"
+    },
+    {
+      "name": "compromised agent with a pinned host key, plain publickey",
+      "data": "AAAAIHNhBl5d0Kb_49cRXxPknrKy04L1yiZmjOEG-aJ-gJDIMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAAaAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQ604YalWITklFrtZPvBVg-0uWGb1y2JgowFyN_2JuQr9CWHH43B1pnkaOcYfVilbArbSZWe2FeYKpB7hyOgziN",
+      "binds": [
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIO1JKMYo0cLG6ukDOJBZlWEpWSc6XGP5NjbBRhSshzfR",
+          "sid": "c2EGXl3Qpv_j1xFfE-SesrLTgvXKJmaM4Qb5on6AkMg",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQG0qsZ2BAps4EuIkHip8DHkdrzGNNHRTNs-P39B5u5UsD_r-6NVp6kEof8UWlnNm9rYSa7QKoUyA4wK1E4795Q0",
+          "fwd": false
+        }
+      ],
+      "ok": false,
+      "refused": "not host-bound"
+    },
+    {
+      "name": "compromised agent with a pinned host key, host-bound login naming the real server",
+      "data": "AAAAIHNhBl5d0Kb_49cRXxPknrKy04L1yiZmjOEG-aJ-gJDIMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAjcHVibGlja2V5LWhvc3Rib3VuZC12MDBAb3BlbnNzaC5jb20BAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAABoAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDrThhqVYhOSUWu1k-8FWD7S5YZvXLYmCjAXI3_Ym5Cv0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0AAAAzAAAAC3NzaC1lZDI1NTE5AAAAIMqTrBcFGHBx1nuDx_8O_oEI6OxFMFdddyaHkzPb2r58",
+      "binds": [
+        {
+          "hostkey": "AAAAC3NzaC1lZDI1NTE5AAAAIO1JKMYo0cLG6ukDOJBZlWEpWSc6XGP5NjbBRhSshzfR",
+          "sid": "c2EGXl3Qpv_j1xFfE-SesrLTgvXKJmaM4Qb5on6AkMg",
+          "sig": "AAAAC3NzaC1lZDI1NTE5AAAAQG0qsZ2BAps4EuIkHip8DHkdrzGNNHRTNs-P39B5u5UsD_r-6NVp6kEof8UWlnNm9rYSa7QKoUyA4wK1E4795Q0",
+          "fwd": false
+        }
+      ],
+      "ok": false,
+      "refused": "host key differs from the last binding"
+    }
+  ]
+}

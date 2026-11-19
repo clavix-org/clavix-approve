@@ -63,7 +63,13 @@ Can ask for signatures, at any time, and gets a live session for each one
 the user approves — see "Residual risk". Cannot sign without the phone.
 Cannot make the phone display another destination than the real one: the
 phone checks the server's own signature over the session being
-authenticated, and that the bytes to sign are a login for that session.
+authenticated, and that the bytes to sign are a host-bound login for that
+session naming that same host key. Plain `publickey` logins, whose bytes
+do not name the server, are refused: otherwise a machine holding the
+private key of any pinned host (its own sshd host key, say) could bind a
+session it opened with another server under that key and have the phone
+show the pinned host. The server checks the host key named in the login
+against its own, so the signature is good only where the phone says.
 Names come from the phone's pinned list, never from the request; what the
 machine supplies (process name, its own label, a suggested host name) is
 displayed as unverified and stripped of control characters.
@@ -91,7 +97,12 @@ keys alone let them read incoming requests, nothing more.
 
 Receives one signature bound to its own session and host key. With a
 forwarded agent (`ssh -A`) it can ask for more; each one shows the
-forwarding chain and needs its own approval.
+forwarding chain and needs its own approval. It cannot pass a login to
+another server off as a login to itself: it can bind a session it opened
+elsewhere under its own host key, but the host-bound login for that
+session names the other server's key, which the agent and the phone
+compare with the bind and refuse. This relies on refusing plain
+`publickey` logins, so client and servers must run OpenSSH 8.9 or later.
 
 ## Residual risk
 
