@@ -11,6 +11,7 @@ The native signer: the same protocol and relay as the approval page
 | `ClavixCore/` | Swift package: the protocol, signer side. A line-for-line port of `web/lib` (HPKE, sealed channel, pairing, the checks of a sign request, relay client). No dependency beyond Apple's frameworks. |
 | `ClavixApprove/` | The app: keys, state, screens. |
 | `ClavixApprove.xcodeproj` | Xcode project; its source folder is synchronised, so new files need no project edit. |
+| `ClavixApprove.storekit` | StoreKit configuration for local testing: the two plans and their free trial. |
 
 ## Keys
 
@@ -95,6 +96,48 @@ a development build). A relay without an APNs key answers
 `{"state": "unsupported"}`: the app notes it in its journal and shows
 requests only while it is open. The push is content-free, as for the page,
 and time-sensitive (entitlement in `ClavixApprove.entitlements`).
+
+## Subscription (hosted relay only)
+
+Machines paired through the hosted relay, `approve.clavix.org`, need a
+subscription; machines paired through any other relay never do, and the
+app says nothing about it for them. One subscription covers up to 10
+machines.
+
+| Product | Period | Introductory offer |
+|---|---|---|
+| `org.clavix.approve.personal.monthly` | 1 month | free trial, 14 days |
+| `org.clavix.approve.personal.yearly` | 1 year | free trial, 14 days |
+
+Both are in one subscription group. App Store Connect sets the prices
+(2,99 € and 24,99 € at launch); the app only shows StoreKit's
+`displayPrice`.
+
+StoreKit 2 lives in `ClavixApprove/Subscriptions.swift`: it listens to
+`Transaction.updates` from launch, reads `Transaction.currentEntitlements`
+(and each plan's latest transaction, to tell « Expiré » from « Aucun »),
+buys through SwiftUI's `purchase` action, restores with `AppStore.sync()`,
+and finishes each verified transaction once taken into account. The
+decisions are in ClavixCore (`RelaySubscription.swift`, tested): the status
+shown, the purchase in force, and which pairings need its proof.
+
+The app hands the hosted relay the proof, for every confirmed pairing on
+it: `POST /api/ch/{ch}/dev/{signer}/entitlement` with the pairing's own
+bearer token, body `{"jws": "<Transaction.jwsRepresentation>"}`. The relay
+answers `200 {"ok":true,"expires":<unix>}`, or `403
+{"error":"machine_limit"}` past 10 machines (shown on the machine's card
+and in Réglages → Abonnement), or `400`/`401`. It is sent at launch, after
+a purchase or a restore, on each transaction update, when a pairing is
+confirmed, and again when the app comes to the front if it did not get
+through; network failures are retried with a growing pause. Approvals
+never wait for it.
+
+To try it in Xcode without App Store Connect: the shared scheme
+`ClavixApprove` runs with `ClavixApprove.storekit` (Product → Scheme →
+Edit Scheme → Run → Options → StoreKit Configuration). Debug → StoreKit →
+Manage Transactions shows, refunds and expires the purchases; the file's
+editor speeds up renewals. A purchase made this way is signed by Xcode,
+not by the App Store: the relay refuses its JWS, which is expected.
 
 ## Not done yet
 

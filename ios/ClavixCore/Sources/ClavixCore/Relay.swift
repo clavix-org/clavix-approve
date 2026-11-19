@@ -9,6 +9,9 @@ public struct RelayError: Error, CustomStringConvertible {
     public let message: String
     /// The call outlived its bound: a connection that died, not a refusal.
     public var timedOut = false
+    /// The `error` field of the relay's JSON answer, when it gave one
+    /// (`machine_limit`, …).
+    public var code: String? = nil
 
     public var description: String { message }
 
@@ -76,7 +79,11 @@ public struct RelayClient: Sendable {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 204 { return nil }
         // A proxy in front may answer with its own HTML error page.
-        guard (200..<300).contains(status) else { throw RelayError(status: status, message: "relay answered HTTP \(status)") }
+        guard (200..<300).contains(status) else {
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            throw RelayError(status: status, message: "relay answered HTTP \(status)" + (code.map { " (\($0))" } ?? ""),
+                             code: code)
+        }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw RelayError(status: status, message: "relay answer is not JSON")
         }
@@ -131,6 +138,17 @@ public struct RelayClient: Sendable {
 
     public func respond(id: String, msg: String) async throws -> String {
         state(try await call("POST", "responses/\(id)", body: ["msg": msg]))
+    }
+
+    /// Hand the hosted relay the App Store's signed transaction of this
+    /// device's subscription (`Transaction.jwsRepresentation`). Returns the
+    /// time up to which the relay serves this device, when it says.
+    /// `403` with code `machine_limit`: the subscription already covers
+    /// `RelaySubscription.machineLimit` machines.
+    public func postEntitlement(signer: String, jws: String) async throws -> Date? {
+        let obj = try await call("POST", "dev/\(signer)/entitlement", body: ["jws": jws])
+        guard let n = obj?["expires"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        return Date(timeIntervalSince1970: n.doubleValue)
     }
 
     /// Delete this device's pairing on the relay. True when this call did

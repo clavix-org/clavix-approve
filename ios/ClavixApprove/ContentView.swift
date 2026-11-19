@@ -5,6 +5,8 @@ enum Links {
     static let site = URL(string: "https://clavix.org")!
     static let source = URL(string: "https://github.com/clavix-org/clavix-approve")!
     static let threatModel = URL(string: "https://github.com/clavix-org/clavix-approve/blob/master/THREAT_MODEL.md")!
+    static let privacy = URL(string: "https://clavix.org/approve/privacy/")!
+    static let appleEULA = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
 }
 
 struct ContentView: View {
@@ -481,9 +483,14 @@ struct PublicKeyView: View {
 
 struct RequestsView: View {
     @EnvironmentObject private var model: Model
+    @EnvironmentObject private var subscriptions: Subscriptions
 
     var body: some View {
         List {
+            if RelaySubscription.shouldPrompt(status: subscriptions.status, pairings: model.pairings) {
+                Section { SubscriptionBanner() }
+                    .listRowBackground(Color.accentColor.opacity(0.12))
+            }
             Section {
                 ForEach(model.pairings) { p in MachineCard(pairing: p) }
             }
@@ -544,6 +551,11 @@ struct MachineCard: View {
                     Text(stateText)
                         .font(.subheadline)
                         .foregroundStyle(state.isError && pairing.confirmed ? .red : .secondary)
+                }
+                if let issue = model.entitlementIssue(of: pairing) {
+                    Label(issue, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
                 }
                 if !pairing.confirmed {
                     Button("Voir les chiffres") { model.pairingSheet = .digits(pairing) }
@@ -750,6 +762,7 @@ struct SettingsView: View {
             } footer: {
                 Text("Glissez vers la gauche pour oublier une machine : cet iPhone est retiré du relais et n’en reçoit plus de demandes. En mode signature, la clé reste valable sur les serveurs qui la listent ; retirez-la aussi de leur authorized_keys.")
             }
+            SubscriptionSection()
             Section("Serveurs retenus") {
                 if model.remembered.pins.isEmpty { Text("Aucun.").foregroundStyle(.secondary) }
                 ForEach(model.remembered.pins.sorted(by: { $0.value < $1.value }), id: \.key) { fp, name in

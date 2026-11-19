@@ -15,6 +15,7 @@
 		C1A0000000000000000000A2 /* ClavixApprove.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ClavixApprove.entitlements; sourceTree = "<group>"; };
 		C1A0000000000000000000A4 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		C1A0000000000000000000A5 /* ClavixApprove-NoPush.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "ClavixApprove-NoPush.entitlements"; sourceTree = "<group>"; };
+		C1A0000000000000000000A6 /* ClavixApprove.storekit */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstorekit; path = ClavixApprove.storekit; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -40,6 +41,7 @@
 				C1A0000000000000000000A4 /* Base.xcconfig */,
 				C1A0000000000000000000A2 /* ClavixApprove.entitlements */,
 				C1A0000000000000000000A5 /* ClavixApprove-NoPush.entitlements */,
+				C1A0000000000000000000A6 /* ClavixApprove.storekit */,
 				C1A0000000000000000000F2 /* Products */,
 			);
 			sourceTree = "<group>";

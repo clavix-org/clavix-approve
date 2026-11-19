@@ -39,11 +39,19 @@ final class Model: ObservableObject {
     /// A pairing link that could not be opened (from the camera or another app).
     @Published var linkError: String?
     @Published private(set) var now = Date()
+    /// The hosted relay's last answer to the subscription proof, per
+    /// pairing (`EntitlementSync.key`).
+    @Published private(set) var deliveries: [String: EntitlementDelivery] = [:]
 
     private var seen: Set<String> = [] // every request already handled or shown
     private var polling: [String: Task<Void, Never>] = [:]
     private var ticker: Task<Void, Never>?
     var pushToken: Data? { didSet { Task { await registerPush() } } }
+    private weak var subscriptions: Subscriptions?
+    private var sendingEntitlement = false
+    private var entitlementAgain = false
+    private var entitlementRetry: Task<Void, Never>?
+    private var entitlementBackoff: UInt64 = 0 // seconds
 
     static let comment = "clavix-approve-iphone"
 
@@ -166,6 +174,7 @@ final class Model: ObservableObject {
         AppDelegate.askForPush()
         await registerPush()
         start()
+        await sendEntitlement()
     }
 
     /// The digits differ: someone is in between. This device is taken off
@@ -192,6 +201,13 @@ final class Model: ObservableObject {
         pairings = next
         requests.removeAll { $0.record.id == p.id }
         states[p.id] = nil
+        deliveries[EntitlementSync.key(p)] = nil
+        if RelaySubscription.needed(by: p) {
+            // A place freed under the machine limit: those refused for it
+            // are tried again.
+            deliveries = deliveries.filter { $0.value.outcome != .machineLimit }
+            await sendEntitlement()
+        }
     }
 
     // ---- push ----
@@ -221,6 +237,78 @@ final class Model: ObservableObject {
         }
     }
 
+    // ---- subscription (hosted relay only) ----
+
+    func attach(_ s: Subscriptions) {
+        guard subscriptions !== s else { return }
+        subscriptions = s
+        s.onChange = { [weak self] in Task { await self?.sendEntitlement() } }
+        Task { await sendEntitlement() }
+    }
+
+    /// Why this pairing is not covered by the subscription, if the relay said so.
+    func entitlementIssue(of p: PairingRecord) -> String? {
+        guard let d = deliveries[EntitlementSync.key(p)], d.transactionID == subscriptions?.current?.transactionID,
+              d.outcome == .machineLimit else { return nil }
+        return "Non couverte : l’abonnement couvre déjà \(RelaySubscription.machineLimit) machines. Oubliez-en une dans Réglages pour couvrir celle-ci."
+    }
+
+    /// Posts the current subscription's proof to every confirmed pairing on
+    /// the hosted relay that does not hold it yet. Quiet and best effort:
+    /// approvals never wait for it, network failures are retried later.
+    func sendEntitlement() async {
+        guard !sendingEntitlement else { entitlementAgain = true; return }
+        sendingEntitlement = true
+        defer { sendingEntitlement = false }
+        var failed = false
+        repeat {
+            entitlementAgain = false
+            failed = false
+            guard let current = subscriptions?.current else { break }
+            for p in EntitlementSync.pending(pairings, current: current, delivered: deliveries) {
+                let result: Result<Date?, Error>
+                do {
+                    let expires = try await RelayClient(base: p.relay, ch: p.ch, token: p.token)
+                        .postEntitlement(signer: p.signer, jws: current.jws)
+                    result = .success(expires)
+                } catch {
+                    result = .failure(error)
+                }
+                let outcome = EntitlementOutcome(result)
+                let key = EntitlementSync.key(p)
+                if outcome == .machineLimit && deliveries[key]?.outcome != .machineLimit {
+                    journal("Abonnement : \(Self.machineName(p)) n’est pas couverte, limite de \(RelaySubscription.machineLimit) machines atteinte")
+                }
+                // A proof the relay could not check. A 401 means the pairing
+                // is gone, which its card already says.
+                if outcome == .refused(status: 400) {
+                    journal("Abonnement non transmis pour \(Self.machineName(p)) : le relais a refusé la preuve d’achat")
+                }
+                // Forgotten meanwhile: nothing to remember.
+                guard pairings.contains(where: { $0.id == p.id }) else { continue }
+                deliveries[key] = EntitlementDelivery(transactionID: current.transactionID, outcome: outcome)
+                if outcome == .failed { failed = true }
+            }
+        } while entitlementAgain
+        if failed {
+            scheduleEntitlementRetry()
+        } else {
+            entitlementBackoff = 0
+        }
+    }
+
+    private func scheduleEntitlementRetry() {
+        guard entitlementRetry == nil else { return }
+        entitlementBackoff = min(entitlementBackoff > 0 ? entitlementBackoff * 2 : 60, 1800)
+        let delay = entitlementBackoff
+        entitlementRetry = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.entitlementRetry = nil
+            await self?.sendEntitlement()
+        }
+    }
+
     // ---- watching the relay ----
 
     /// The app comes to the front, or a notification was tapped.
@@ -236,6 +324,8 @@ final class Model: ObservableObject {
                 }
             }
         }
+        // Back in front: a proof that did not reach the relay is tried again.
+        Task { await sendEntitlement() }
         guard let identity = try? Keys.identity() else { return }
         // An unconfirmed pairing accepts no request: it is not even polled.
         for p in pairings where p.isActive {

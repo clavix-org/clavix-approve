@@ -6,13 +6,19 @@ import UserNotifications
 struct ClavixApproveApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model = Model()
+    /// Made at launch: it listens to StoreKit's transaction updates.
+    @StateObject private var subscriptions = Subscriptions()
     @Environment(\.scenePhase) private var phase
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .onAppear { delegate.model = model }
+                .environmentObject(subscriptions)
+                .onAppear {
+                    delegate.model = model
+                    model.attach(subscriptions)
+                }
                 // The pairing link, clavix-approve://pair?relay=…#cva2-…,
                 // scanned with the system camera. It only opens the
                 // pairing sheet: nothing is sent before the user accepts.
