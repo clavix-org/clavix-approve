@@ -456,7 +456,9 @@ struct RequestCard: View {
                 Button(role: .destructive) {
                     run { try await model.deny(request) }
                 } label: {
-                    Text("Refuser").frame(maxWidth: .infinity)
+                    // Unknown host: the approve title is long, so "Refuser"
+                    // keeps its natural width and leaves it the room.
+                    Text("Refuser").lineLimit(1).frame(maxWidth: known == nil ? nil : .infinity)
                 }
                 .buttonStyle(.bordered)
                 Button {
@@ -466,7 +468,7 @@ struct RequestCard: View {
                     // symbol took the tint and vanished into the background.
                     HStack(spacing: 6) {
                         Image(systemName: "lock.open.fill")
-                        Text(approveTitle)
+                        Text(approveTitle).lineLimit(1).minimumScaleFactor(0.8)
                     }
                     .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
