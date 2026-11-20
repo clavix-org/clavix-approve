@@ -7,7 +7,10 @@
 //!   one of its own requests is waiting;
 //! - one POST per request, then long-poll GETs;
 //! - a 4xx answer is never retried — it means our configuration is wrong
-//!   — except 429, which is retried slowly.
+//!   — except 429, which is retried slowly;
+//! - a hosted relay may require a subscription: `402` is
+//!   [`RelayError::SubscriptionRequired`], which only the user can fix (on
+//!   the phone), so it is never retried either.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +39,13 @@ pub enum RelayError {
     Transport(String),
     /// The relay answered something we do not understand.
     Protocol(String),
+    /// HTTP 402 `subscription_required`: the relay serves subscribers only
+    /// and no current subscription covers this channel. The user
+    /// subscribes, or renews, in the iPhone app.
+    SubscriptionRequired,
+    /// HTTP 403 `machine_limit`: the subscription already covers as many
+    /// machines as it may.
+    MachineLimit,
 }
 
 impl RelayError {
@@ -44,7 +54,7 @@ impl RelayError {
         match self {
             Self::Status(code) => *code >= 500 || *code == 429,
             Self::Transport(_) => true,
-            Self::Protocol(_) => false,
+            Self::Protocol(_) | Self::SubscriptionRequired | Self::MachineLimit => false,
         }
     }
 }
@@ -55,6 +65,12 @@ impl std::fmt::Display for RelayError {
             Self::Status(code) => write!(f, "relay answered HTTP {code}"),
             Self::Transport(reason) => write!(f, "relay unreachable: {reason}"),
             Self::Protocol(reason) => write!(f, "unexpected relay answer: {reason}"),
+            Self::SubscriptionRequired => {
+                f.write_str("the relay requires a subscription: open Clavix Approve on the iPhone")
+            }
+            Self::MachineLimit => {
+                f.write_str("the subscription already covers as many machines as it may")
+            }
         }
     }
 }
@@ -108,7 +124,15 @@ impl RelayClient {
             return Ok(None);
         }
         if !status.is_success() {
-            return Err(RelayError::Status(status.as_u16()));
+            let code = status.as_u16();
+            // Only a 403 needs its body; a proxy's may be a page of its
+            // own, which names no relay error.
+            let body = if code == 403 {
+                response.json::<Value>().await.unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            return Err(status_error(code, &body));
         }
         // A proxy may answer 200 with a page of its own: not JSON.
         response
@@ -128,6 +152,15 @@ impl RelayClient {
     pub async fn get(&self, path: &str, token: &str) -> Result<Option<Value>, RelayError> {
         self.send(self.http.get(format!("{}{path}", self.base)), token)
             .await
+    }
+}
+
+/// The error for a refusal with this status and JSON body.
+fn status_error(code: u16, body: &Value) -> RelayError {
+    match (code, body.get("error").and_then(Value::as_str)) {
+        (402, _) => RelayError::SubscriptionRequired,
+        (403, Some("machine_limit")) => RelayError::MachineLimit,
+        _ => RelayError::Status(code),
     }
 }
 
@@ -223,5 +256,27 @@ mod tests {
             assert!(!RelayError::Status(code).is_transient(), "{code}");
         }
         assert!(!RelayError::Protocol("html".into()).is_transient());
+    }
+
+    #[test]
+    fn a_missing_subscription_is_its_own_error_and_never_retried() {
+        assert!(!RelayError::SubscriptionRequired.is_transient());
+        assert!(!RelayError::MachineLimit.is_transient());
+        let body = json!({ "error": "subscription_required" });
+        assert_eq!(status_error(402, &body), RelayError::SubscriptionRequired);
+        assert_eq!(
+            status_error(402, &Value::Null),
+            RelayError::SubscriptionRequired
+        );
+        let body = json!({ "error": "machine_limit", "limit": 10 });
+        assert_eq!(status_error(403, &body), RelayError::MachineLimit);
+        assert_eq!(status_error(403, &Value::Null), RelayError::Status(403));
+        assert_eq!(
+            status_error(403, &json!({ "error": "invalid_transaction" })),
+            RelayError::Status(403)
+        );
+        assert!(RelayError::SubscriptionRequired
+            .to_string()
+            .contains("open Clavix Approve on the iPhone"));
     }
 }

@@ -3,7 +3,9 @@
 
 Run: python3 -m unittest discover -s relay
 """
+import base64
 import collections
+import datetime
 import json
 import os
 import socket
@@ -16,9 +18,11 @@ import unittest
 import urllib.error
 import urllib.request
 
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
+from cryptography.x509.oid import NameOID
 
 try:
     import httpx
@@ -1289,6 +1293,408 @@ class HttpLimitsTest(unittest.TestCase):
                 pass
             threading.Event().wait(0.1)
         self.assertEqual(self.call("GET", "/healthz")[0], 200)
+
+
+# ---- Subscriptions ----------------------------------------------------------
+
+DAY = 86400
+OTID = "2000000100"
+MONTHLY = "org.clavix.approve.personal.monthly"
+
+
+class FakeApple:
+    """A certificate chain shaped like the one Apple signs App Store data
+    with: a self-signed P-384 root, a CA intermediate carrying the marker
+    1.2.840.113635.100.6.2.1, a P-256 leaf carrying 1.2.840.113635.100.6.11.1.
+    Each part can be made wrong on purpose."""
+
+    def __init__(self, leaf_marker=True, intermediate_marker=True, intermediate_ca=True,
+                 leaf_until=datetime.datetime(2100, 1, 1)):
+        self.root_key = ec.generate_private_key(ec.SECP384R1())
+        self.root = self.cert("Fake Root CA - G3", self.root_key, None, self.root_key, ca=True)
+        self.inter_key = ec.generate_private_key(ec.SECP384R1())
+        self.inter = self.cert("Fake WWDR CA - G6", self.inter_key, self.root, self.root_key,
+                               ca=intermediate_ca,
+                               marker=R.APPLE_INTERMEDIATE_OID if intermediate_marker else None)
+        self.leaf_key = ec.generate_private_key(ec.SECP256R1())
+        self.leaf = self.cert("Fake Prod ECC Mac App Store", self.leaf_key, self.inter,
+                              self.inter_key, ca=False, until=leaf_until,
+                              marker=R.APPLE_LEAF_OID if leaf_marker else None)
+
+    @staticmethod
+    def cert(name, key, issuer, issuer_key, ca, marker=None, until=datetime.datetime(2100, 1, 1)):
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name),
+                             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Not Apple")])
+        builder = (x509.CertificateBuilder().subject_name(subject)
+                   .issuer_name(issuer.subject if issuer else subject)
+                   .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                   .not_valid_before(datetime.datetime(1970, 1, 1)).not_valid_after(until)
+                   .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True))
+        if marker is not None:
+            builder = builder.add_extension(x509.UnrecognizedExtension(marker, b"\x05\x00"),
+                                            critical=False)
+        return builder.sign(issuer_key, hashes.SHA384())
+
+    def x5c(self):
+        return [base64.b64encode(c.public_bytes(serialization.Encoding.DER)).decode()
+                for c in (self.leaf, self.inter, self.root)]
+
+    def sign(self, payload, alg="ES256", x5c=None, key=None):
+        def part(obj):
+            return R.b64u(json.dumps(obj, separators=(",", ":")).encode())
+        signed = f"{part({'alg': alg, 'x5c': x5c or self.x5c()})}.{part(payload)}"
+        r, s = decode_dss_signature((key or self.leaf_key).sign(signed.encode(),
+                                                                ec.ECDSA(hashes.SHA256())))
+        return f"{signed}.{R.b64u(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
+
+
+_FAKE_APPLE = []
+
+
+def fake_apple():
+    """One chain for the whole run: generating keys takes time."""
+    if not _FAKE_APPLE:
+        _FAKE_APPLE.append(FakeApple())
+    return _FAKE_APPLE[0]
+
+
+class EntitlementTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.clock = Clock()
+        self.apple = fake_apple()
+        self.relay = self.make()
+
+    def make(self, **settings):
+        settings = {"enabled": True, "root": self.apple.root, **settings}
+        self.state = tempfile.mkdtemp(dir=self.dir.name)   # each relay its own state
+        relay = R.Relay(self.state, None, FakePush(), self.clock,
+                        entitlements=R.Entitlements(**settings))
+        self.addCleanup(relay.close)
+        LimitsTest.paired(relay)
+        return relay
+
+    def tx(self, days=30, signed=0, **fields):
+        """A transaction payload, signed `signed` seconds from now, expiring
+        `days` days from now."""
+        now = self.clock.t
+        return {"transactionId": "2000000123", "originalTransactionId": OTID,
+                "bundleId": "org.clavix.approve", "productId": MONTHLY,
+                "purchaseDate": int(now * 1000), "expiresDate": int((now + days * DAY) * 1000),
+                "type": "Auto-Renewable Subscription", "inAppOwnershipType": "PURCHASED",
+                "environment": "Production", "signedDate": int((now + signed) * 1000), **fields}
+
+    def send(self, jws=None, relay=None, ch=CH, token=PHONE, dev=SIGNER, **fields):
+        relay = relay or self.relay
+        return relay.post_entitlement(ch, dev, token,
+                                      {"jws": jws if jws is not None else self.apple.sign(self.tx(**fields))})
+
+    def request(self, relay=None, ch=CH, rid=RID):
+        return (relay or self.relay).post_request(
+            ch, AGENT, {"id": rid, "to": SIGNER, "exp": self.clock.t + 90, "msg": "sealed"})
+
+    def refused(self, answer):
+        self.assertEqual(answer[0], 403, answer)
+        self.assertEqual(answer[1]["error"], "invalid_transaction")
+        return answer[1]["reason"]
+
+    # -- the route --
+
+    def test_a_request_needs_a_subscription_which_the_device_hands_over(self):
+        self.assertEqual(self.request(), (402, {"error": "subscription_required"}))
+        expires = int(self.clock.t) + 30 * DAY
+        self.assertEqual(self.send(), (200, {"ok": True, "expires": expires, "required": True}))
+        self.assertEqual(self.request(rid="1" * 32)[1]["state"], "queued")
+
+    def test_pairing_and_the_rest_stay_free(self):
+        relay = self.relay
+        self.assertEqual(LimitsTest.channel(relay, "e" * 32), (200, {"state": "created"}))
+        self.assertEqual(relay.post_pair("e" * 32, PAIR, {
+            "signer": SIGNER, "signer_auth": R.digest("p2"), "msg": "a"}), (200, {"state": "paired"}))
+        self.assertEqual(relay.put_subscription(CH, PHONE, {"endpoint": APPLE, "keys": KEYS}),
+                         (200, {"state": "stored"}))
+        self.assertEqual(relay.get_requests(CH, PHONE), (200, {"requests": []}))
+
+    def test_only_the_device_itself_may_hand_it_over(self):
+        self.assertEqual(self.send(token=AGENT), Relay401)
+        self.assertEqual(self.send(token="nope"), Relay401)
+        self.assertEqual(self.send(dev="d" * 16), Relay401)   # another id than its own
+        self.assertEqual(self.relay.post_entitlement(CH, SIGNER, PHONE, {"jws": 3})[0], 400)
+        self.assertEqual(self.relay.post_entitlement(CH, SIGNER, PHONE, {})[0], 400)
+
+    # -- the JWS and its chain --
+
+    def test_the_chain_must_end_at_the_pinned_root(self):
+        other = FakeApple()   # same shape, another root
+        self.assertEqual(self.refused(self.send(other.sign(self.tx()))), "chain")
+        # The pinned root sent along does not help a chain that is not its own.
+        mixed = other.x5c()[:2] + [self.apple.x5c()[2]]
+        self.assertEqual(self.refused(self.send(other.sign(self.tx(), x5c=mixed))), "chain")
+        # A leaf of ours with another intermediate.
+        forged = [self.apple.x5c()[0], other.x5c()[1], self.apple.x5c()[2]]
+        self.assertEqual(self.refused(self.send(self.apple.sign(self.tx(), x5c=forged))), "chain")
+        # The root may be left out: ours is pinned anyway.
+        self.assertEqual(self.send(self.apple.sign(self.tx(), x5c=self.apple.x5c()[:2]))[0], 200)
+
+    def test_the_real_apple_root_is_pinned_by_default(self):
+        root = R.load_apple_root()
+        self.assertIn("Apple Root CA - G3", root.subject.rfc4514_string())
+        self.assertEqual(root.fingerprint(hashes.SHA256()).hex(),
+                         "63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179")
+        self.assertEqual(R.Entitlements().root, root)
+        with self.assertRaises(R.JwsError):
+            R.verify_apple_jws(self.apple.sign(self.tx()), root, self.clock.t)
+
+    def test_apples_marker_extensions_and_the_ca_flag_are_required(self):
+        for shape in ({"leaf_marker": False}, {"intermediate_marker": False},
+                      {"intermediate_ca": False}):
+            with self.subTest(**shape):
+                odd = FakeApple(**shape)
+                relay = self.make(root=odd.root)
+                self.assertEqual(self.refused(self.send(odd.sign(self.tx()), relay=relay)), "chain")
+
+    def test_the_signature_is_es256_by_the_leaf(self):
+        jws = self.apple.sign(self.tx())
+        head, body, sig = jws.split(".")
+        other_body = R.b64u(json.dumps(self.tx(days=365)).encode())
+        self.assertEqual(self.refused(self.send(f"{head}.{other_body}.{sig}")), "signature")
+        self.assertEqual(self.refused(self.send(f"{head}.{body}.{R.b64u(b'x' * 64)}")), "signature")
+        self.assertEqual(self.refused(self.send(f"{head}.{body}.{R.b64u(b'x' * 10)}")), "signature")
+        # Signed by the intermediate's key instead of the leaf's.
+        wrong = ec.generate_private_key(ec.SECP256R1())
+        self.assertEqual(self.refused(self.send(self.apple.sign(self.tx(), key=wrong))), "signature")
+        for alg in ("none", "HS256", "ES384", "RS256"):
+            self.assertEqual(self.refused(self.send(self.apple.sign(self.tx(), alg=alg))), "algorithm")
+        for junk in ("", "a.b", "a.b.c.d", "!!.!!.!!", f"{head}.{body}"):
+            self.assertEqual(self.refused(self.send(junk)), "format", junk)
+
+    def test_certificates_must_be_valid_when_it_was_signed(self):
+        old = FakeApple(leaf_until=datetime.datetime(1970, 1, 5))   # before the clock's date
+        relay = self.make(root=old.root)
+        self.assertEqual(self.refused(self.send(old.sign(self.tx()), relay=relay)), "validity")
+        # Signed in the future: refused, beyond a small clock skew.
+        self.assertEqual(self.refused(self.send(signed=R.CLOCK_SKEW + 60)), "date")
+        self.assertEqual(self.send(signed=R.CLOCK_SKEW - 60)[0], 200)
+
+    # -- the transaction --
+
+    def test_the_transaction_must_be_for_this_app_and_product(self):
+        self.assertEqual(self.refused(self.send(bundleId="org.example.other")), "bundle")
+        self.assertEqual(self.refused(self.send(productId="org.clavix.approve.lifetime")), "product")
+        self.assertEqual(self.refused(self.send(expiresDate=None)), "format")
+        self.assertEqual(self.refused(self.send(originalTransactionId="../x")), "format")
+        self.assertEqual(self.send(productId="org.clavix.approve.personal.yearly")[0], 200)
+
+    def test_sandbox_only_when_allowed(self):
+        self.assertEqual(self.refused(self.send(environment="Sandbox")), "environment")
+        self.assertEqual(self.refused(self.send(environment="Xcode")), "environment")
+        self.assertEqual(self.request()[0], 402)
+        relay = self.make(sandbox=True)
+        self.assertEqual(self.send(relay=relay, environment="Sandbox")[0], 200)
+        self.assertEqual(self.request(relay)[1]["state"], "queued")
+        self.assertEqual(self.refused(self.send(relay=relay, environment="Xcode")), "environment")
+
+    def test_an_expired_or_revoked_transaction_is_no_subscription(self):
+        self.assertEqual(self.send(days=-1),
+                         (402, {"error": "subscription_required", "state": "expired",
+                                "expires": int(self.clock.t) - DAY}))
+        self.assertEqual(self.request()[0], 402)
+        answer = self.send(revocationDate=int(self.clock.t * 1000), revocationReason=0, signed=1)
+        self.assertEqual((answer[0], answer[1]["state"]), (402, "revoked"))
+        self.assertEqual(self.request()[0], 402)
+
+    def test_an_older_jws_does_not_undo_a_newer_one(self):
+        self.send(days=60, signed=10)
+        self.assertEqual(self.send(days=30, signed=0)[1]["expires"], int(self.clock.t) + 60 * DAY)
+        # Revoked, then the phone sends its older cached JWS: still revoked.
+        self.send(revocationDate=int(self.clock.t * 1000), signed=20)
+        self.assertEqual(self.send(days=60, signed=10)[0], 402)
+        self.assertEqual(self.request()[0], 402)
+
+    # -- enforcement --
+
+    def test_a_grace_after_expiry_covers_a_renewal_not_yet_sent(self):
+        relay = self.make(grace_hours=48)
+        self.send(relay=relay, days=1)
+        self.clock.t += DAY + 47 * 3600
+        self.assertEqual(self.request(relay)[1]["state"], "queued")
+        self.clock.t += 2 * 3600
+        self.assertEqual(self.request(relay, rid="1" * 32)[0], 402)
+        self.assertEqual(self.send(relay=relay, days=30)[0], 200)   # the renewal
+        self.assertEqual(self.request(relay, rid="2" * 32)[1]["state"], "queued")
+
+    def test_one_subscription_covers_so_many_machines(self):
+        relay = self.make(machines=2)
+        channels = [CH, "1" * 32, "2" * 32]
+        for ch in channels[1:]:
+            LimitsTest.paired(relay, ch, agent=AGENT, phone=PHONE)
+        self.assertEqual(self.send(relay=relay, ch=channels[0])[0], 200)
+        self.assertEqual(self.send(relay=relay, ch=channels[1])[0], 200)
+        self.assertEqual(self.send(relay=relay, ch=channels[2]),
+                         (403, {"error": "machine_limit", "limit": 2}))
+        self.assertEqual(self.send(relay=relay, ch=channels[1])[0], 200)   # already counted
+        self.assertEqual(self.request(relay, ch=channels[2])[0], 402)
+        # Unpairing a machine frees its place.
+        relay.revoke(channels[0], AGENT)
+        self.assertEqual(self.send(relay=relay, ch=channels[2])[0], 200)
+        self.assertEqual(self.request(relay, ch=channels[2])[1]["state"], "queued")
+
+    def test_a_channel_moves_to_another_subscription(self):
+        relay = self.make(machines=1)
+        self.send(relay=relay)
+        self.assertEqual(self.send(relay=relay, originalTransactionId="2000000999")[0], 200)
+        LimitsTest.paired(relay, "1" * 32, agent=AGENT, phone=PHONE)
+        # The first subscription's only place is free again.
+        self.assertEqual(self.send(relay=relay, ch="1" * 32)[0], 200)
+
+    def test_subscriptions_survive_a_restart(self):
+        self.send()
+        again = R.Relay(self.state, None, FakePush(), self.clock,
+                        entitlements=R.Entitlements(enabled=True, root=self.apple.root))
+        self.addCleanup(again.close)
+        self.assertEqual(self.request(again)[1]["state"], "queued")
+        self.assertNotIn(PHONE, saved_state(self.state))
+
+    def test_an_unused_ended_subscription_is_forgotten(self):
+        self.send(days=1)
+        self.relay.revoke(CH, AGENT)
+        self.clock.t += R.ENDED_KEEP_DAYS * DAY + 2 * DAY + R.SWEEP_EVERY
+        LimitsTest.channel(self.relay, "e" * 32)   # runs the sweep
+        self.assertEqual(self.relay.ents, {})
+
+    def test_off_checks_nothing(self):
+        relay = R.Relay(tempfile.mkdtemp(dir=self.dir.name), None, FakePush(), self.clock)
+        self.addCleanup(relay.close)
+        LimitsTest.paired(relay)
+        self.assertEqual(self.request(relay)[1]["state"], "queued")
+        self.assertEqual(self.send(relay=relay, jws="anything"),
+                         (200, {"ok": True, "expires": None, "required": False}))
+
+    # -- App Store Server Notifications v2 --
+
+    def notify(self, kind, relay=None, signed=100, data=None, **tx):
+        payload = {"notificationType": kind, "notificationUUID": "u", "version": "2.0",
+                   "signedDate": int((self.clock.t + signed) * 1000),
+                   "data": {"bundleId": "org.clavix.approve", "environment": "Production",
+                            "signedTransactionInfo": self.apple.sign(self.tx(signed=signed, **tx)),
+                            **(data or {})}}
+        return (relay or self.relay).appstore_notification({"signedPayload": self.apple.sign(payload)})
+
+    def test_notifications_renew_end_and_revoke(self):
+        self.send(days=1)
+        self.assertEqual(self.notify("DID_RENEW", days=31), (200, {"ok": True, "state": "active"}))
+        self.clock.t += 2 * DAY
+        self.assertEqual(self.request()[1]["state"], "queued")
+        # Ended: the grace no longer applies.
+        self.clock.t += 29 * DAY + 3600
+        self.assertEqual(self.request(rid="1" * 32)[1]["state"], "queued")   # in the grace
+        self.assertEqual(self.notify("EXPIRED", signed=0, days=-1 / 24)[1]["state"], "ended")
+        self.assertEqual(self.request(rid="2" * 32)[0], 402)
+
+    def test_a_refund_revokes_and_an_older_jws_does_not_bring_it_back(self):
+        self.send(days=30)
+        self.assertEqual(self.notify("REFUND", revocationDate=int(self.clock.t * 1000))[1]["state"],
+                         "revoked")
+        self.assertEqual(self.request()[0], 402)
+        self.assertEqual(self.send(days=30)[0], 402)   # the phone's cached JWS, older
+        self.assertEqual(self.notify("REVOKE", signed=200)[1]["state"], "revoked")
+
+    def test_notifications_that_change_nothing(self):
+        self.assertEqual(self.notify("DID_RENEW"), (200, {"ok": True, "state": "unknown"}))
+        self.assertEqual(self.notify("TEST"), (200, {"ok": True, "state": "ignored"}))
+        self.assertEqual(self.notify("DID_RENEW", data={"environment": "Sandbox"}),
+                         (200, {"ok": True, "state": "ignored"}))
+        self.send(days=30, signed=250)
+        self.assertEqual(self.notify("EXPIRED", signed=100), (200, {"ok": True, "state": "stale"}))
+        self.assertEqual(self.request()[1]["state"], "queued")
+
+    def test_a_notification_is_verified_like_the_phones_jws(self):
+        other = FakeApple()
+        payload = {"notificationType": "REFUND", "signedDate": int(self.clock.t * 1000),
+                   "data": {"bundleId": "org.clavix.approve", "environment": "Production",
+                            "signedTransactionInfo": other.sign(self.tx())}}
+        self.assertEqual(self.relay.appstore_notification({"signedPayload": other.sign(payload)})[0], 400)
+        # A genuine envelope around a transaction from another chain.
+        self.assertEqual(self.relay.appstore_notification(
+            {"signedPayload": self.apple.sign(payload)})[0], 400)
+        self.assertEqual(self.notify("REFUND", data={"bundleId": "org.example.other"})[0], 400)
+        self.assertEqual(self.relay.appstore_notification({})[0], 400)
+        off = R.Relay(tempfile.mkdtemp(dir=self.dir.name), None, FakePush(), self.clock)
+        self.addCleanup(off.close)
+        self.assertEqual(off.appstore_notification({"signedPayload": "x"})[0], 404)
+
+    # -- settings --
+
+    def test_settings_come_from_the_environment(self):
+        e = R.Entitlements.from_env({}, root=self.apple.root)
+        self.assertEqual((e.enabled, e.bundle_id, e.products, e.sandbox, e.machines, e.grace_hours),
+                         (False, "org.clavix.approve", R.APPSTORE_PRODUCTS, False, 10, 48))
+        e = R.Entitlements.from_env({
+            "RELAY_ENTITLEMENT": "on", "RELAY_APPSTORE_BUNDLE_ID": "org.example.app",
+            "RELAY_APPSTORE_PRODUCTS": " a.b , c.d ", "RELAY_APPSTORE_SANDBOX": "on",
+            "RELAY_MACHINES_PER_SUBSCRIPTION": "3", "RELAY_ENTITLEMENT_GRACE_HOURS": "0"},
+            root=self.apple.root)
+        self.assertEqual((e.enabled, e.bundle_id, e.products, e.sandbox, e.machines, e.grace),
+                         (True, "org.example.app", ("a.b", "c.d"), True, 3, 0))
+        for env in ({"RELAY_ENTITLEMENT": "maybe"}, {"RELAY_APPSTORE_SANDBOX": "2"},
+                    {"RELAY_MACHINES_PER_SUBSCRIPTION": "0"}, {"RELAY_ENTITLEMENT_GRACE_HOURS": "-1"},
+                    {"RELAY_ENTITLEMENT_GRACE_HOURS": "x"}, {"RELAY_APPSTORE_PRODUCTS": ","},
+                    {"RELAY_APPSTORE_BUNDLE_ID": "a b"}):
+            with self.assertRaises(ValueError, msg=env):
+                R.Entitlements.from_env(env, root=self.apple.root)
+
+
+Relay401 = (401, {"error": "unauthorized"})
+
+
+class EntitlementHttpTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.apple = fake_apple()
+        server = R.serve("127.0.0.1", 0, os.path.join(self.dir.name, "state"), None,
+                         self.dir.name, "mailto:test@example.com", False, serve_web=False,
+                         entitlements=R.Entitlements(enabled=True, root=self.apple.root))
+        self.base = f"http://127.0.0.1:{server.server_address[1]}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+    call = HttpTest.call
+
+    def test_the_route_the_402_and_the_notifications_over_http(self):
+        now = time.time()
+        self.call("POST", "/api/channels", body={
+            "ch": CH, "agent_auth": R.digest(AGENT), "pair_auth": R.digest(PAIR), "hello": "hi"})
+        self.call("POST", f"/api/ch/{CH}/pair", token=PAIR, body={
+            "signer": SIGNER, "signer_auth": R.digest(PHONE), "msg": "answer"})
+        request = {"id": RID, "to": SIGNER, "exp": now + 30, "msg": "sealed"}
+        status, _, body = self.call("POST", f"/api/ch/{CH}/requests", token=AGENT, body=request)
+        self.assertEqual((status, json.loads(body)), (402, {"error": "subscription_required"}))
+        tx = {"originalTransactionId": OTID, "bundleId": "org.clavix.approve", "productId": MONTHLY,
+              "expiresDate": int((now + 30 * DAY) * 1000), "environment": "Production",
+              "signedDate": int(now * 1000)}
+        path = f"/api/ch/{CH}/dev/{SIGNER}/entitlement"
+        self.assertEqual(self.call("GET", path, token=PHONE)[0], 404)   # POST only
+        status, _, body = self.call("POST", path, token=PHONE, body={"jws": self.apple.sign(tx)})
+        self.assertEqual((status, json.loads(body)),
+                         (200, {"ok": True, "expires": int(now) + 30 * DAY, "required": True}))
+        status, _, body = self.call("POST", f"/api/ch/{CH}/requests", token=AGENT, body=request)
+        self.assertEqual((status, json.loads(body)["state"]), (200, "queued"))
+        # Apple's notification, larger than an ordinary body may be.
+        note = {"notificationType": "REFUND", "signedDate": int(now * 1000) + 1,
+                "data": {"bundleId": "org.clavix.approve", "environment": "Production",
+                         "signedTransactionInfo": self.apple.sign(
+                             {**tx, "signedDate": int(now * 1000) + 1,
+                              "revocationDate": int(now * 1000)}),
+                         "padding": "x" * R.MAX_BODY}}
+        status, _, body = self.call("POST", "/api/appstore/notifications",
+                                    body={"signedPayload": self.apple.sign(note)})
+        self.assertEqual((status, json.loads(body)), (200, {"ok": True, "state": "revoked"}))
+        status, _, body = self.call("POST", f"/api/ch/{CH}/requests", token=AGENT,
+                                    body={**request, "id": "1" * 32})
+        self.assertEqual(status, 402)
 
 
 if __name__ == "__main__":

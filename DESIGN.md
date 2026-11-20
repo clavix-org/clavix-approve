@@ -205,6 +205,51 @@ an explicit "destination unknown" warning.
   covers one host for the whole run. A **bounded grant** ("these N
   named hosts, for 15 minutes") is deferred; see "Open questions".
 
+## Subscriptions (hosted relay)
+
+**Model, decided.** Individuals subscribe in the iOS app through
+StoreKit 2: `org.clavix.approve.personal.monthly` and
+`org.clavix.approve.personal.yearly`, with a 14-day free trial as
+introductory offer. One subscription covers up to 10 machines (channels).
+Self-hosted relays stay free and unrestricted: the check is off unless the
+relay is started with `RELAY_ENTITLEMENT=on`. Teams, sold on the website
+with licence keys, come later.
+
+**How the relay enforces it.** Creating a channel and pairing stay free,
+so that the user pairs first and subscribes after. The phone sends the
+JWS StoreKit 2 gives it for the subscription
+(`Transaction.jwsRepresentation`) at launch and after each renewal; the
+relay verifies it offline — ES256, x5c chain up to Apple Root CA - G3
+built into the relay, Apple's marker extensions, bundle id, product,
+environment, expiry, no revocation — and links the channel to the
+subscription's `originalTransactionId`, within 10 channels per
+subscription. A request the agent posts on a channel with no current
+subscription gets `402`. A 48-hour grace after expiry covers a renewal the
+phone has not re-sent yet. App Store Server Notifications v2 update the
+subscription when it renews, expires, is refunded or revoked, so a refund
+takes effect without waiting for the phone. Details: `PROTOCOL.md`,
+"Subscriptions".
+
+Why offline verification rather than Apple's App Store Server API: no
+Apple credentials on the relay, no network call on the request path, and
+nothing to fail when Apple is unreachable. The cost: a refund is learnt
+from the notification (or the expiry), not at once.
+
+What the relay stores per subscription: the `originalTransactionId`, the
+product, the expiry, the environment, a status and the time of the latest
+JWS — no Apple ID, no name, no receipt. See `THREAT_MODEL.md`.
+
+**Agent side.** A `402` is an error of its own, never retried: the agent
+logs « abonnement requis : ouvrez Clavix Approve sur l'iPhone » and fails
+further requests at once for 30 s without contacting the relay, since a
+proxy in front bans an address after a burst of 4xx answers.
+
+**Teams, later.** Entitlements are keyed `<kind>:<id>`; the App Store is
+`appstore:<originalTransactionId>`. A team licence would be another kind
+(`licence:<key id>`) with its own seat count, posted by the agent or the
+device and linked to channels the same way; the enforcement does not
+change. Not implemented.
+
 ## Failure modes
 
 | Situation | Behaviour |
@@ -214,6 +259,7 @@ an explicit "destination unknown" warning.
 | Phone lost or replaced | revoke the pairing (`clavix-agent unpair`) and the public key on servers; re-pair. Access falls back to the user's other keys — the feature must never be the only way in |
 | Headless machine compromised | attacker can send requests and read approved sessions (see below); cannot sign without the phone, cannot forge the destination shown |
 | Relay compromised | can drop or delay; cannot read, forge or replay (request ids, expiry, and the SSH session id is unique per connection) |
+| Hosted relay, subscription lapsed | requests fail at once (`402`) after a 48-hour grace; the agent logs « abonnement requis : ouvrez Clavix Approve sur l'iPhone ». Pairings are kept |
 
 ## Threat-model changes
 
@@ -341,8 +387,9 @@ state survives long idle periods. Phase 0 exists to answer those.
   if per-signature approval proves too heavy in daily use.
 - **Product boundary.** Phone-held keys are not vault items. Is this a
   Clavix feature or a companion product sharing the protocol core?
-- **Hosted relay.** Do we run a public relay, or ship self-hosting
-  only? A public one is a service to operate and a metadata sink.
+- **Hosted relay.** Decided: a hosted relay for subscribers (see
+  "Subscriptions"), and self-hosting stays free. It is a service to
+  operate and a metadata sink.
 - **Enrolment (open with limits; accounts deferred).** A relay runs with
   open enrolment (anyone may create a channel) or closed enrolment (one
   shared secret, as the development instance does). Either way the
@@ -351,9 +398,9 @@ state survives long idle periods. Phase 0 exists to answer those.
   per device, concurrent long-polls, message sizes and a global byte
   budget; idle channels expire after 90 days and the global channel cap
   is only a safety net. Every limit is an environment variable of the
-  relay (README, "Running the relay"). Still missing for a paid offer:
-  accounts with quotas, enrolment credentials issued, listed and
-  withdrawn one by one, and App Attest on the iOS side.
+  relay (README, "Running the relay"). The paid offer is enforced by
+  subscriptions ("Subscriptions"), not by accounts. Still missing:
+  team licences, and App Attest on the iOS side.
 - **Audit scope.** Pairing, the sealed channel and the phone-side
   verification are new security-critical code; `AUDIT_SCOPE.md` needs
   an entry before phase 1 ships.
