@@ -82,9 +82,11 @@ CI runs both on macOS (`.github/workflows/ci.yml`, job `ios`).
    team ID in it. Signing settings live there, out of the repository: do
    not pick the team in Xcode's Signing & Capabilities tab, which would
    write it into the project file.
-   With a free Personal Team, also uncomment the two lines that switch to
-   `org.clavix.approve.personal` without push: an app ID taken by a free
-   team could block the real one for the paid team later.
+   With a paid membership, the team ID is all it takes: the app builds as
+   `org.clavix.approve`, with push.
+   Contributors with only a free Personal Team also uncomment the two lines
+   that switch to `org.clavix.approve.personal` without push (a free team
+   cannot use push, and must not register the real app ID).
 3. Connect the iPhone, enable Developer Mode on it, Run.
 
 ## Wake-up
@@ -157,4 +159,3 @@ not by the App Store: the relay refuses its JWS, which is expected.
 
 - A notification extension that would show the destination on the lock
   screen.
-- The paid team, hence push on the real bundle id (`org.clavix.approve`).
