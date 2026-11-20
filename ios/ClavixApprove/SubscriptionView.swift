@@ -1,14 +1,18 @@
-// The subscription screens: the « Abonnement » sections of Réglages, the
-// same on their own screen, and the banner of the main screen. Only the
-// hosted relay asks for a subscription; the banner never shows for
-// machines paired through another relay.
+// The subscription screens: the « Abonnement » sections of Réglages and
+// the banner of the main screen. Only the hosted relay asks for a
+// subscription; the banner never shows for machines paired through
+// another relay.
 
 import ClavixCore
 import StoreKit
 import SwiftUI
 
-/// The « Abonnement » sections, in Réglages and on their own screen.
+/// The « Abonnement » sections of Réglages.
 struct SubscriptionSection: View {
+    /// The id of the « Abonnement » section, which the main screen's banner
+    /// scrolls to: its status, then the plans just below.
+    static let sectionID = "subscription"
+
     @EnvironmentObject private var model: Model
     @EnvironmentObject private var subscriptions: Subscriptions
     @Environment(\.purchase) private var purchase
@@ -25,6 +29,11 @@ struct SubscriptionSection: View {
         model.pairings.filter { RelaySubscription.needed(by: $0) && !model.notRequired.contains(EntitlementSync.key($0)) }.count
     }
     private var isActive: Bool { subscriptions.status?.isActive == true }
+    /// The relay refuses the requests of a paired machine: same test as the main screen's banner.
+    private var refused: Bool {
+        RelaySubscription.shouldPrompt(status: subscriptions.status, pairings: model.pairings,
+                                       notRequired: model.notRequired)
+    }
     /// « 14 jours d’essai gratuit », as App Store Connect sets it, when this Apple ID may still take it.
     private var trial: String? {
         guard subscriptions.trialEligible, !isActive else { return nil }
@@ -34,7 +43,18 @@ struct SubscriptionSection: View {
     var body: some View {
         Section {
             LabeledContent("État") {
-                Text(statusText).bold()
+                if refused {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(statusText)
+                    }
+                    .bold()
+                    .foregroundStyle(.red)
+                    .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("\(statusText) : le relais refuse les demandes")
+                } else {
+                    Text(statusText).bold()
+                }
             }
             if hostedCount > 0 {
                 LabeledContent("Machines sur le relais Clavix") {
@@ -63,6 +83,7 @@ struct SubscriptionSection: View {
                  ? "Inutile pour les machines appairées avec votre propre relais : seul le relais Clavix (approve.clavix.org) demande un abonnement. \(model.machineLimit) machines max par abonnement."
                  : "Requis pour les machines appairées via le relais Clavix (approve.clavix.org), pas pour celles de votre propre relais. \(model.machineLimit) machines max par abonnement.")
         }
+        .id(Self.sectionID)
 
         Section {
             if subscriptions.products.isEmpty {
@@ -93,12 +114,12 @@ struct SubscriptionSection: View {
                     Label(message, systemImage: "info.circle")
                 }
                 Text(legalText)
-                HStack(spacing: 16) {
-                    Link("Politique de confidentialité", destination: Links.privacy)
-                    Link("Conditions d’utilisation (CLUF)", destination: Links.appleEULA)
-                }
+                // One link per line: side by side, each wrapped on two lines.
+                Link("Politique de confidentialité", destination: Links.privacy)
+                Link("Conditions d’utilisation (CLUF)", destination: Links.appleEULA)
             }
         }
+
     }
 
     @ViewBuilder private func plan(_ product: Product) -> some View {
@@ -176,45 +197,43 @@ struct SubscriptionSection: View {
     }
 }
 
-/// The subscription on its own screen, from the main screen's banner.
-struct SubscriptionView: View {
-    var body: some View {
-        Form { SubscriptionSection() }
-            .navigationTitle("Abonnement")
-            .navigationBarTitleDisplayMode(.inline)
-    }
-}
-
 /// Shown on the main screen when nothing is in force and a machine is
-/// paired through the hosted relay: its requests do not come without one.
+/// paired through the hosted relay: the relay refuses its requests (402)
+/// before they reach this iPhone, so ssh fails on the machine.
 struct SubscriptionBanner: View {
     @EnvironmentObject private var subscriptions: Subscriptions
+    /// Set by « Voir les formules »: the main screen then opens Réglages on
+    /// the plans. A NavigationLink in a list row would add a chevron.
+    @Binding var showPlans: Bool
 
     private var offersTrial: Bool { subscriptions.status == .never || subscriptions.trialEligible }
 
     var body: some View {
-        NavigationLink {
-            SubscriptionView()
-        } label: {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "sparkles")
-                    .font(.title3)
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 36)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(offersTrial
-                         ? "Abonnement requis pour le relais Clavix : 14 jours d’essai gratuit"
-                         : "Abonnement requis pour le relais Clavix")
-                        .font(.subheadline.weight(.semibold))
-                    Text("Sans abonnement, les machines appairées via approve.clavix.org n’envoient pas de demandes à cet iPhone. Celles de votre propre relais n’en ont pas besoin.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    Text("Voir l’abonnement")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
-                }
+        VStack(alignment: .leading, spacing: 10) {
+            Label {
+                Text("Abonnement requis : le relais refuse les demandes de vos machines")
+                    .font(.subheadline.weight(.semibold))
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
             }
-            .padding(.vertical, 4)
+            Text("Sans abonnement, les machines appairées via approve.clavix.org n’envoient pas de demandes à cet iPhone. Celles de votre propre relais n’en ont pas besoin."
+                 + (offersTrial ? " 14 jours d’essai gratuit." : ""))
+                .font(.footnote)
+                .opacity(0.9)
+            Button {
+                showPlans = true
+            } label: {
+                Text("Voir les formules")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(.white, in: Capsule())
+            }
+            .buttonStyle(.plain)
         }
+        .foregroundStyle(.white)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .contain)
     }
 }
