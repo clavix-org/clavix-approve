@@ -484,13 +484,14 @@ struct PublicKeyView: View {
 struct RequestsView: View {
     @EnvironmentObject private var model: Model
     @EnvironmentObject private var subscriptions: Subscriptions
+    @State private var showPlans = false
 
     var body: some View {
         List {
             if RelaySubscription.shouldPrompt(status: subscriptions.status, pairings: model.pairings,
                                               notRequired: model.notRequired) {
-                Section { SubscriptionBanner() }
-                    .listRowBackground(Color.accentColor.opacity(0.12))
+                Section { SubscriptionBanner(showPlans: $showPlans) }
+                    .listRowBackground(Color.red)
             }
             Section {
                 ForEach(model.pairings) { p in MachineCard(pairing: p) }
@@ -518,6 +519,7 @@ struct RequestsView: View {
         }
         .listSectionSpacing(.compact)
         .refreshable { model.start() }
+        .navigationDestination(isPresented: $showPlans) { SettingsView(showPlans: true) }
     }
 }
 
@@ -731,8 +733,22 @@ struct Countdown: View {
 struct SettingsView: View {
     @EnvironmentObject private var model: Model
     @State private var forgetting: PairingRecord?
+    /// Opened from the main screen's banner: scroll to the plans.
+    var showPlans = false
 
     var body: some View {
+        ScrollViewReader { proxy in
+            form
+                .task {
+                    guard showPlans else { return }
+                    // After the first layout, or the section is not there yet.
+                    try? await Task.sleep(for: .milliseconds(300))
+                    withAnimation { proxy.scrollTo(SubscriptionSection.sectionID, anchor: .top) }
+                }
+        }
+    }
+
+    private var form: some View {
         Form {
             if let line = model.publicKeyLine {
                 Section {
