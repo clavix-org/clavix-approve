@@ -10,6 +10,9 @@ struct Remembered: Codable {
     var pins: [String: String] = [:]
     var lastRelay: URL?
     var journal: [JournalEntry] = []
+    /// Pairings (`EntitlementSync.key`) whose relay answered that it checks
+    /// no subscription. Optional: files written before it still decode.
+    var notRequired: Set<String>?
 }
 
 struct JournalEntry: Codable, Identifiable, Hashable {
