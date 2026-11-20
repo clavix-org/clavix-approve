@@ -77,11 +77,13 @@ fn state_dir() -> Result<PathBuf, String> {
 
 fn load_state() -> Result<State, String> {
     let dir = state_dir()?;
-    state::load(&dir).map_err(|e| {
-        format!(
+    state::load(&dir).map_err(|e| match e.kind() {
+        // Paired, but the file is not private: say so, not "not paired".
+        std::io::ErrorKind::PermissionDenied => format!("cannot use the pairing: {e}"),
+        _ => format!(
             "not paired yet ({}: {e}); run `clavix-agent pair`",
             dir.display()
-        )
+        ),
     })
 }
 

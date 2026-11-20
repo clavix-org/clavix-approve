@@ -82,6 +82,14 @@ pub enum Error {
     /// The relay no longer knows this pairing, or this device: revoked
     /// from the device, or the relay lost its state. Pair again.
     Revoked,
+    /// The relay refused to create the channel (HTTP 401 on
+    /// [`ApproveOffer::open`]): the enrolment secret is wrong, or the relay
+    /// does not admit new channels from this client. Not a revocation:
+    /// there was no pairing yet.
+    Rejected,
+    /// Nobody entered the pairing code before the window closed
+    /// ([`ApproveOffer::wait`]). Start a new pairing.
+    Expired,
     /// The relay could not be reached or answered something unexpected.
     Relay(RelayError),
     /// Bad input, a corrupt stored channel, or an answer that is not
@@ -93,6 +101,10 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Revoked => write!(f, "the relay no longer knows this pairing"),
+            Self::Rejected => f.write_str(
+                "the relay refused to open a pairing (wrong enrolment secret, or enrolment closed)",
+            ),
+            Self::Expired => f.write_str("nobody entered the pairing code in time"),
             Self::Relay(e) => e.fmt(f),
             Self::Invalid(reason) => f.write_str(reason),
         }
@@ -115,6 +127,7 @@ impl From<PairingError> for Error {
         match e {
             PairingError::Relay(e) => e.into(),
             PairingError::Gone => Self::Revoked,
+            PairingError::Expired => Self::Expired,
             e => Self::Invalid(e.to_string()),
         }
     }
@@ -222,7 +235,15 @@ impl ApproveOffer {
     pub async fn open(relay: &str, enroll_secret: &str, label: &str) -> Result<Self, Error> {
         let client = RelayClient::new(relay)?;
         let offer = Offer::new_in(Mode::Approve);
-        offer.open(&client, enroll_secret, label).await?;
+        offer
+            .open(&client, enroll_secret, label)
+            .await
+            .map_err(|e| match e {
+                // No channel yet, so nothing to revoke: the relay refused
+                // the enrolment.
+                PairingError::Relay(RelayError::Status(401)) => Error::Rejected,
+                e => e.into(),
+            })?;
         Ok(Self {
             offer,
             client,
@@ -402,6 +423,34 @@ impl Withdraw {
     }
 }
 
+/// Owned by an approval future while it runs. When the future ends it
+/// forgets the request; when it is dropped before the end (the caller
+/// gave up, timed out, or its task was aborted), it also withdraws the
+/// request from the relay, in a background task, so that the devices stop
+/// offering it.
+struct InFlight {
+    requester: Requester,
+    id: String,
+    pending: Arc<Pending>,
+    withdraw: bool,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.requester.pending.lock() {
+            if map
+                .get(&self.id)
+                .is_some_and(|p| Arc::ptr_eq(p, &self.pending))
+            {
+                map.remove(&self.id);
+            }
+        }
+        if self.withdraw {
+            self.requester.withdraw_pending(&self.pending);
+        }
+    }
+}
+
 /// The outcome of an approval request, to await.
 pub type ApprovalFuture = Pin<Box<dyn Future<Output = Result<Outcome, Error>> + Send>>;
 
@@ -496,14 +545,15 @@ impl Requester {
         (
             handle,
             Box::pin(async move {
+                let mut guard = InFlight {
+                    requester: this.clone(),
+                    id: request.id.clone(),
+                    pending: pending.clone(),
+                    withdraw: true,
+                };
                 let outcome = this.run(&request, &pending, rx).await;
-                let mut map = this.pending.lock().unwrap();
-                if map
-                    .get(&request.id)
-                    .is_some_and(|p| Arc::ptr_eq(p, &pending))
-                {
-                    map.remove(&request.id);
-                }
+                // `run` took every request off the relay itself.
+                guard.withdraw = false;
                 outcome
             }),
         )
@@ -906,5 +956,83 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
         assert_eq!(again, ok);
         let _ = unhex;
+    }
+
+    /// A channel with one device, on the relay at `relay`.
+    fn channel_on(relay: &str) -> ApproveChannel {
+        let v = proof_vector();
+        let ed = key_of(v["keys"][0]["approve"].as_str().unwrap())
+            .to_openssh()
+            .unwrap();
+        let phone = Identity::generate();
+        ApproveChannel {
+            relay: relay.into(),
+            ch: "ab".repeat(16),
+            token: "t".into(),
+            label: "desk".into(),
+            kem_private: b64u(&Identity::generate().secrets().0),
+            sig_private: b64u(&[7u8; 32]),
+            devices: vec![ApproveDevice {
+                id: "cd".repeat(8),
+                approve_key: format!("{ed} phone"),
+                kem_public: b64u(phone.kem_public()),
+                sig_public: b64u(&phone.sig_public()),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_given_up_on_is_withdrawn_from_the_relay() {
+        let (base, calls) = crate::test_relay::serve(|call| {
+            let state = if call.ends_with("/cancel") {
+                "cancelled"
+            } else if call.starts_with("POST ") {
+                "queued"
+            } else {
+                "pending"
+            };
+            (200, json!({ "state": state }).to_string())
+        })
+        .await;
+        let requester = Requester::new(&channel_on(&base)).unwrap();
+        let request = ApprovalRequest::new(b"key".to_vec(), b"data".to_vec());
+        let (_withdraw, outcome) = requester.request_approval(&request);
+        // The caller stops waiting without withdrawing: the future is
+        // dropped.
+        assert!(tokio::time::timeout(Duration::from_millis(400), outcome)
+            .await
+            .is_err());
+        let cancel = crate::test_relay::until_cancelled(&calls).await;
+        assert_eq!(cancel.len(), 1, "{:?}", calls.lock().unwrap());
+        // And forgotten here.
+        assert!(requester.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_enrolment_is_not_a_revocation() {
+        let (base, _calls) =
+            crate::test_relay::serve(|_| (401, json!({ "error": "unauthorized" }).to_string()))
+                .await;
+        let refused = ApproveOffer::open(&base, "wrong-secret", "desk").await;
+        assert_eq!(refused.err(), Some(Error::Rejected));
+        assert!(Error::Rejected.to_string().contains("enrolment"));
+    }
+
+    #[test]
+    fn pairing_errors_are_typed() {
+        assert_eq!(Error::from(PairingError::Expired), Error::Expired);
+        assert_eq!(
+            Error::Expired.to_string(),
+            "nobody entered the pairing code in time"
+        );
+        assert_eq!(Error::from(PairingError::Gone), Error::Revoked);
+        assert_eq!(
+            Error::from(PairingError::Relay(RelayError::Status(401))),
+            Error::Revoked
+        );
+        assert_eq!(
+            Error::from(PairingError::Refused("full".into())),
+            Error::Invalid("full".into())
+        );
     }
 }
