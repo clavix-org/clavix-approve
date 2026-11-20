@@ -122,6 +122,7 @@ import re
 import sqlite3
 import struct
 import sys
+import signal
 import threading
 import time
 import urllib.error
@@ -1984,7 +1985,18 @@ def main():
         f"page {'served' if serve_web else 'not served'}, APNs {'on' if apns else 'off'}, "
         f"subscriptions {'required' if entitlements.enabled else 'not checked'}"
         f"{' (Sandbox accepted)' if entitlements.enabled and entitlements.sandbox else ''}")
+    # As PID 1 in a container, SIGTERM has no default action: without a
+    # handler `docker stop` waits its grace period, then SIGKILLs (exit 137).
+    # shutdown() blocks until serve_forever() returns, hence the thread.
+    def stop(signum, _frame):
+        log(f"{signal.Signals(signum).name}: stopping")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
     server.serve_forever()
+    server.server_close()
+    server.relay.close()
+    log("stopped")
 
 
 if __name__ == "__main__":
