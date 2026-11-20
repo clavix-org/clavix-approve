@@ -76,6 +76,8 @@ Limits (environment, positive integers; see Limits below for each default):
   RELAY_MAX_CHANNELS          global safety cap on channels (100000)
   RELAY_CHANNEL_IDLE_DAYS     a channel unused that long is deleted (90)
   RELAY_MAX_DEVICES           devices paired on one channel (4)
+  RELAY_CHANNELS_PER_DEVICE   channels one device's push token serves: one
+                              phone paired with that many machines (32)
   RELAY_REQUESTS_PER_MINUTE   requests one channel may post per minute (60)
   RELAY_MAX_PENDING           live requests waiting on one channel (8)
   RELAY_MAX_ENTRIES           requests stored on one channel, answered,
@@ -221,6 +223,7 @@ class Limits:
     max_channels: int = 100_000
     channel_idle_days: int = 90
     max_devices: int = MAX_SIGNERS
+    channels_per_device: int = 32
     requests_per_minute: int = 60
     max_pending: int = MAX_PENDING
     max_entries: int = 32
@@ -910,11 +913,13 @@ class Relay:
         self.saved_active = {ch: c.get("last_active", 0) for ch, c in self.channels.items()}
         self.pending = {}   # channel -> {request id -> entry}; memory only
         self.pending_bytes = 0
-        self.subs = {}      # sub_key -> (channel, signer): one device, one channel
+        # sub_key -> {(channel, signer): None}, oldest registration first:
+        # one phone paired with several machines is woken for each of them.
+        self.subs = {}
         for ch, c in self.channels.items():
             for sid, s in c["signers"].items():
                 if s.get("sub"):
-                    self.subs[sub_key(s["sub"])] = (ch, sid)
+                    self.subs.setdefault(sub_key(s["sub"]), {})[(ch, sid)] = None
         # Subscriptions: eid -> row, channel -> eid, and channels per eid.
         self.ents, self.links = self.store.load_entitlements()
         self.linked = collections.Counter(self.links.values())
@@ -980,23 +985,29 @@ class Relay:
             self.pending.pop(ch, None)
 
     def _set_sub(self, ch, sid, sub):
-        """Give a signer its subscription. A device belongs to one channel:
-        the latest registration takes it from any other."""
+        """Give a signer its subscription. One device (one push token) may
+        serve several channels, one per machine it is paired with, up to
+        `channels_per_device`: past it, the oldest registration loses it.
+        The push budget stays per device across them (`_push_allowed`)."""
         signer = self.channels[ch]["signers"][sid]
         old = signer.get("sub")
-        if old and self.subs.get(sub_key(old)) == (ch, sid):
-            del self.subs[sub_key(old)]
+        if old:
+            holders = self.subs.get(sub_key(old), {})
+            holders.pop((ch, sid), None)
+            if not holders:
+                self.subs.pop(sub_key(old), None)
         signer["sub"] = sub
         if sub:
-            other = self.subs.get(sub_key(sub))
-            if other and other != (ch, sid):
-                och, osid = other
+            holders = self.subs.setdefault(sub_key(sub), {})
+            holders[(ch, sid)] = None   # (re)registered: now the newest
+            while len(holders) > self.limits.channels_per_device:
+                och, osid = next(iter(holders))
+                del holders[(och, osid)]
                 prev = self.channels.get(och, {}).get("signers", {}).get(osid)
                 if prev is not None:
                     prev["sub"] = None
                     self._save(och)
-                log(f"channel {och[:8]}: push target moved to channel {ch[:8]}")
-            self.subs[sub_key(sub)] = (ch, sid)
+                log(f"channel {och[:8]}: push target dropped, its device serves too many channels")
 
     def _drop_channel(self, ch):
         c = self.channels.get(ch)

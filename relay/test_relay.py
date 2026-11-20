@@ -1011,16 +1011,35 @@ class LimitsTest(unittest.TestCase):
         self.paired(relay, "2" * 32, phone="phone2")
         self.subscribe(relay, "1" * 32)
         self.assertTrue(self.request(relay, "1" * 32, ch="1" * 32)[1]["push"])
-        # The same device token registered on another channel moves there...
+        # The same device token registered on another channel serves both:
+        # one phone, two machines...
         self.subscribe(relay, "2" * 32, "phone2")
-        self.assertIsNone(relay.channels["1" * 32]["signers"][SIGNER]["sub"])
+        self.assertEqual(relay.channels["1" * 32]["signers"][SIGNER]["sub"]["apns"], TOKEN)
         self.assertEqual(relay.channels["2" * 32]["signers"][SIGNER]["sub"]["apns"], TOKEN)
-        self.assertNotIn(TOKEN, saved_state(self.dir.name).split("\n")[0])
-        self.assertFalse(self.request(relay, "2" * 32, ch="1" * 32)[1]["push"])
-        # ...and keeps its own push budget: no second push within 10 s.
+        # ...with one push budget for the device: no second push within 10 s.
         self.assertFalse(self.request(relay, "3" * 32, ch="2" * 32)[1]["push"])
         self.clock.t += 11
         self.assertTrue(self.request(relay, "4" * 32, ch="2" * 32)[1]["push"])
+        self.clock.t += 11
+        self.assertTrue(self.request(relay, "5" * 32, ch="1" * 32)[1]["push"])
+
+    def test_one_device_token_serves_so_many_channels(self):
+        relay = self.make(channels_per_device=2, requests_per_minute=1000)
+        chans = [str(i) * 32 for i in (1, 2, 3)]
+        for i, ch in enumerate(chans):
+            self.paired(relay, ch, phone=f"phone{i}")
+            self.subscribe(relay, ch, f"phone{i}")
+        subs = [relay.channels[ch]["signers"][SIGNER]["sub"] for ch in chans]
+        # The oldest registration gave way; re-registering makes it newest.
+        self.assertIsNone(subs[0])
+        self.assertEqual([s["apns"] for s in subs[1:]], [TOKEN, TOKEN])
+        self.subscribe(relay, chans[0], "phone0")
+        self.assertIsNone(relay.channels[chans[1]]["signers"][SIGNER]["sub"])
+        # Survives a restart: the map is rebuilt from the saved channels.
+        again = R.Relay(self.dir.name, None, self.push, self.clock, R.Limits(channels_per_device=2))
+        self.addCleanup(again.close)
+        self.assertEqual(set(again.subs[R.sub_key(subs[2])]),
+                         {(chans[0], SIGNER), (chans[2], SIGNER)})
 
     def test_poc_junk_token_cannot_make_the_relay_hammer_apns(self):
         """Audit M3: a junk (or someone else's) token and a request loop

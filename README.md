@@ -130,6 +130,7 @@ Limits, all positive integers:
 | `RELAY_MAX_CHANNELS` | `100000` | global safety cap; past it, creation answers `full` |
 | `RELAY_CHANNEL_IDLE_DAYS` | `90` | a channel unused that long is deleted, paired or not |
 | `RELAY_MAX_DEVICES` | `4` | devices on one channel |
+| `RELAY_CHANNELS_PER_DEVICE` | `32` | channels one device's push token serves (one phone, that many machines); past it the oldest loses push |
 | `RELAY_REQUESTS_PER_MINUTE` | `60` | requests one channel may post |
 | `RELAY_MAX_PENDING` | `8` | live requests on one channel (`busy` past it) |
 | `RELAY_MAX_ENTRIES` | `32` | requests kept on one channel, answered, cancelled and expired ones included |
