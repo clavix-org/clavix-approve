@@ -733,6 +733,9 @@ struct Countdown: View {
 struct SettingsView: View {
     @EnvironmentObject private var model: Model
     @State private var forgetting: PairingRecord?
+    /// The remembered server being renamed (its fingerprint), and the name typed.
+    @State private var renaming: String?
+    @State private var renameText = ""
     /// Opened from the main screen's banner: scroll to the plans.
     var showPlans = false
 
@@ -787,7 +790,13 @@ struct SettingsView: View {
                         Label(name, systemImage: "server.rack").bold()
                         Text(fp).font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary)
                     }
-                    .swipeActions { Button("Oublier", role: .destructive) { model.forget(pin: fp) } }
+                    .swipeActions {
+                        Button("Oublier", role: .destructive) { model.forget(pin: fp) }
+                        Button("Renommer") { renameText = name; renaming = fp }.tint(.accentColor)
+                    }
+                    .contextMenu {
+                        Button("Renommer", systemImage: "pencil") { renameText = name; renaming = fp }
+                    }
                 }
             }
             Section("Journal") {
@@ -827,6 +836,16 @@ struct SettingsView: View {
             }
         } message: {
             Text("Elle ne pourra plus rien demander à cet iPhone. Pour la retrouver, il faudra appairer à nouveau.")
+        }
+        .alert("Renommer ce serveur",
+               isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Nom", text: $renameText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Renommer") { if let fp = renaming { model.rename(pin: fp, to: renameText) } }
+            Button("Annuler", role: .cancel) {}
+        } message: {
+            Text("Seul le nom change : l’empreinte du serveur reste celle que vous aviez vérifiée.")
         }
     }
 

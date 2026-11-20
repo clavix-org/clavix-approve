@@ -80,6 +80,16 @@ final class Model: ObservableObject {
         Store.save(remembered)
     }
 
+    /// Give a remembered server another name. The fingerprint, which is
+    /// what the app checks, does not change.
+    func rename(pin fingerprint: String, to newName: String) {
+        let name = String(newName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        guard !name.isEmpty, let old = remembered.pins[fingerprint], old != name else { return }
+        remembered.pins[fingerprint] = name
+        Store.save(remembered)
+        journal("Hôte renommé : \(old) → \(name)")
+    }
+
     func forget(pin fingerprint: String) {
         guard let name = remembered.pins.removeValue(forKey: fingerprint) else { return }
         Store.save(remembered)
