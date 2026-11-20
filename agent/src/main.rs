@@ -22,8 +22,8 @@ clavix-agent — SSH agent without a key; signatures are approved on a paired de
 
 Usage:
   clavix-agent pair --relay URL [--label NAME] [--yes]
-      Pair with a device. Needs the relay's enrolment secret in the
-      CLAVIX_ENROLL_SECRET environment variable. Prints a code to enter on
+      Pair with a device. A relay with closed enrolment also needs its
+      enrolment secret in CLAVIX_ENROLL_SECRET. Prints a code to enter on
       the device, then verification digits to compare with the device's
       (--yes: do not ask), then the SSH public key to install on servers.
       A previous pairing is revoked once the new one is confirmed.
@@ -137,8 +137,8 @@ async fn pair(args: &[String]) -> Result<(), String> {
     let opts = options(&args, &["relay", "label"])?;
     let relay = opts.get("relay").ok_or("pair needs --relay URL")?;
     let label = opts.get("label").cloned().unwrap_or_else(default_label);
-    let enroll = std::env::var("CLAVIX_ENROLL_SECRET")
-        .map_err(|_| "set CLAVIX_ENROLL_SECRET to the relay's enrolment secret")?;
+    // Only a relay with closed enrolment checks it; an open one ignores it.
+    let enroll = std::env::var("CLAVIX_ENROLL_SECRET").unwrap_or_default();
     let dir = state_dir()?;
     let client = RelayClient::new(relay)?;
 
