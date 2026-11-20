@@ -16,3 +16,5 @@ xcuserdata/
 *.xcuserstate
 .swiftpm/
 ios/Local.xcconfig
+ios/Local.xcconfig.*
+!ios/Local.xcconfig.example
